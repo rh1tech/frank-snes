@@ -74,6 +74,7 @@ typedef enum {
     MAIN_VIDEO,
     MAIN_AUDIO,
     MAIN_SEP4,
+    MAIN_RESTART,
     MAIN_BACK_ROM,
     MAIN_BACK_GAME,
     MAIN_ITEM_COUNT
@@ -430,8 +431,9 @@ static bool is_separator_main(int item) {
 static bool is_hidden_main(int item) {
     /* Hide "Back to Game" when not in a game */
     if (!menu_in_game && item == MAIN_BACK_GAME) return true;
-    /* Hide save/load when not in a game */
-    if (!menu_in_game && (item == MAIN_SAVE_GAME || item == MAIN_LOAD_GAME || item == MAIN_SEP3)) return true;
+    /* Hide save/load and restart when not in a game */
+    if (!menu_in_game && (item == MAIN_SAVE_GAME || item == MAIN_LOAD_GAME ||
+                          item == MAIN_SEP3 || item == MAIN_RESTART)) return true;
     return false;
 }
 
@@ -455,6 +457,7 @@ static const char *main_label(int item) {
         case MAIN_BUTTONS:   return "BUTTON MAPPING...";
         case MAIN_VIDEO:     return "VIDEO SETTINGS...";
         case MAIN_AUDIO:     return "AUDIO SETTINGS...";
+        case MAIN_RESTART:   return "RESTART GAME";
         case MAIN_BACK_GAME: return "BACK TO GAME";
         case MAIN_BACK_ROM:  return menu_in_game ? "CHANGE ROM" : "BACK";
         default:             return "";
@@ -1250,6 +1253,11 @@ settings_result_t settings_menu_show(uint8_t *screen_buffer, bool in_game) {
                     g_settings = edit;
                     settings_save();
                     result = SETTINGS_RESULT_EXIT;
+                    break;
+                } else if (selected == MAIN_RESTART) {
+                    g_settings = edit;
+                    settings_save();
+                    result = SETTINGS_RESULT_RESTART;
                     break;
                 } else if (selected == MAIN_BACK_ROM) {
                     g_settings = edit;

@@ -448,6 +448,9 @@ static uint16_t hid_to_kbd_state_bit(uint8_t keycode) {
         // F12 -> Settings menu (alternative)
         case 0x45: return (1 << 13); // F12 -> KBD_STATE_F12
 
+        // F11 -> back to ROM selector during gameplay
+        case 0x44: return (1 << 14); // F11 -> KBD_STATE_F11
+
         default: return 0;
     }
 }
@@ -459,6 +462,19 @@ uint16_t usbhid_get_kbd_state(void) {
             state |= hid_to_kbd_state_bit(prev_kbd_report.keycode[i]);
     }
     return state;
+}
+
+int usbhid_ctrl_alt_del_pressed(void) {
+    /* tinyusb modifier masks:
+     *   LEFTCTRL=0x01, RIGHTCTRL=0x10, LEFTALT=0x04, RIGHTALT=0x40. */
+    uint8_t m = prev_kbd_report.modifier;
+    bool ctrl = (m & 0x11) != 0;
+    bool alt  = (m & 0x44) != 0;
+    if (!ctrl || !alt) return 0;
+    for (int i = 0; i < 6; i++) {
+        if (prev_kbd_report.keycode[i] == 0x4C) return 1;  // HID Delete
+    }
+    return 0;
 }
 
 // Per-slot gamepad API

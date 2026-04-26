@@ -87,6 +87,7 @@ extern char g_rom_name[64];
 typedef enum {
     SETTINGS_RESULT_EXIT,         // Back to game / back to ROM selector
     SETTINGS_RESULT_ROM_SELECT,   // Return to ROM selector (no reboot)
+    SETTINGS_RESULT_RESTART,      // Soft-reset the currently running ROM
 } settings_result_t;
 
 /**

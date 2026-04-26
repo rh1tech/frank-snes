@@ -84,11 +84,28 @@ static unsigned char hid_to_snes(uint8_t code) {
         // F12 = Settings menu (alternative)
         case 0x45: return SNES_KEY_F12;    // F12
 
+        // F11 = back to ROM selector during gameplay
+        case 0x44: return SNES_KEY_F11;    // F11
+
         default: return 0;
     }
 }
 
+/* Raw modifier byte + Del key tracking for the Ctrl+Alt+Del chord.
+ * Kept outside the KBD_STATE_ bitmask because Del has no dedicated bit
+ * and the chord is only consulted from the gameplay loop. */
+static volatile uint8_t  g_kbd_modifier  = 0;
+static volatile bool     g_kbd_del_held  = false;
+
 static void key_handler(hid_keyboard_report_t *curr, hid_keyboard_report_t *prev) {
+    /* Mirror modifier byte + Del state for Ctrl+Alt+Del detection. */
+    g_kbd_modifier = curr->modifier;
+    bool del_held = false;
+    for (int i = 0; i < 6; i++) {
+        if (curr->keycode[i] == 0x4C) { del_held = true; break; }
+    }
+    g_kbd_del_held = del_held;
+
     // Check keys - new key presses
     for (int i = 0; i < 6; i++) {
         if (curr->keycode[i] != 0) {
@@ -144,6 +161,7 @@ static uint16_t key_to_state_bit(uint8_t key) {
         case SNES_KEY_SELECT: return KBD_STATE_SELECT;
         case SNES_KEY_ESC:    return KBD_STATE_ESC;
         case SNES_KEY_F12:   return KBD_STATE_F12;
+        case SNES_KEY_F11:   return KBD_STATE_F11;
         default: return 0;
     }
 }
@@ -182,4 +200,13 @@ extern "C" int ps2kbd_get_key(int* pressed, unsigned char* key) {
 
 extern "C" uint16_t ps2kbd_get_state(void) {
     return g_kbd_state;
+}
+
+extern "C" int ps2kbd_ctrl_alt_del_pressed(void) {
+    /* tinyusb modifier masks:
+     *   LEFTCTRL=0x01, RIGHTCTRL=0x10, LEFTALT=0x04, RIGHTALT=0x40. */
+    uint8_t m = g_kbd_modifier;
+    bool ctrl = (m & 0x11) != 0;
+    bool alt  = (m & 0x44) != 0;
+    return (ctrl && alt && g_kbd_del_held) ? 1 : 0;
 }

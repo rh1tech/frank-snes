@@ -864,6 +864,37 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         usbhid_task();
 #endif
 
+        /* F11 = back to ROM selector. Edge-triggered so holding F11 past
+         * the selector return doesn't immediately fire again. */
+        {
+            uint16_t kbd_state = ps2kbd_get_state();
+#ifdef USB_HID_ENABLED
+            kbd_state |= usbhid_get_kbd_state();
+#endif
+            static bool prev_f11 = false;
+            bool f11 = (kbd_state & KBD_STATE_F11) != 0;
+            if (f11 && !prev_f11) {
+                prev_f11 = true;
+                return true;  /* signal main loop: back to ROM selector */
+            }
+            prev_f11 = f11;
+        }
+
+        /* Ctrl+Alt+Del = soft-reset the currently loaded ROM (same effect
+         * as Settings → Restart Game). Edge-triggered on the chord so one
+         * press fires exactly one reset. */
+        {
+            bool cad = ps2kbd_ctrl_alt_del_pressed() != 0;
+#ifdef USB_HID_ENABLED
+            cad = cad || usbhid_ctrl_alt_del_pressed() != 0;
+#endif
+            static bool prev_cad = false;
+            if (cad && !prev_cad) {
+                S9xSoftReset();
+            }
+            prev_cad = cad;
+        }
+
         // Check for settings menu hotkey BEFORE emulation runs,
         // so the game never processes buttons on the hotkey frame.
         if (settings_check_hotkey()) {
@@ -887,6 +918,14 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                 __dmb();
                 menu_active = false;
                 return true;
+            }
+
+            if (sresult == SETTINGS_RESULT_RESTART) {
+                // Soft reset: simulate the SNES Reset button. Keeps the
+                // ROM loaded but re-initialises CPU/PPU/APU so gameplay
+                // starts from the title screen. CRT/settings get
+                // re-applied below along with the normal menu-exit path.
+                S9xSoftReset();
             }
 
             // Wait for all buttons to be released before resuming emulation
