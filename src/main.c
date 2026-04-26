@@ -82,8 +82,22 @@ uint8_t __attribute__((aligned(4))) SCREEN[2][SNES_WIDTH * SNES_HEIGHT];
 static uint8_t __attribute__((aligned(4))) ZBuffer[SNES_WIDTH * SNES_HEIGHT];
 static uint8_t __attribute__((aligned(4))) SubZBuffer[SNES_WIDTH * SNES_HEIGHT];
 
-// Separate sub-screen buffer for transparency (allocated in PSRAM)
-static uint8_t *SubScreenBuffer = NULL;
+// Separate sub-screen buffer for transparency.  Lives in the PSRAM
+// scratch region (first 512 KB, reserved by psram_allocator and not
+// touched by psram_malloc / psram_reset), so it survives across
+// ROM launches and doesn't compete with ROM / RAM / VRAM allocations.
+//
+// Before this, the pointer was psram_malloc()'d inside a session on
+// cold boot.  On a 6 MB SuperFX ROM (DOOM) that allocation plus the
+// emulator's state used the last of permanent PSRAM, and S9xInitGFX's
+// later 22 KB calloc() for LocalState silently returned NULL — which
+// left GFX.OBJLines dereferencing NULL and the emulator rendering one
+// stray scanline on the first launch.  Going back to the selector and
+// re-launching leaked the old SubScreenBuffer pointer, which happened
+// to save exactly enough PSRAM for LocalState to succeed on the
+// second launch.
+#define SUB_SCREEN_OFFSET (256 * 1024)  /* into 512 KB scratch region */
+static uint8_t *SubScreenBuffer = (uint8_t *)(0x11000000 + SUB_SCREEN_OFFSET);
 
 // Current display buffer (double buffering) - accessed by HDMI driver
 volatile uint32_t current_buffer = 0;
@@ -223,16 +237,11 @@ bool S9xInitDisplay(void) {
     GFX.ZPitch = SNES_WIDTH;
     GFX.Screen = SCREEN[current_buffer];
 
-    // Allocate separate sub-screen buffer in PSRAM for transparency
-    if (!SubScreenBuffer) {
-        SubScreenBuffer = (uint8_t *)psram_malloc(SNES_WIDTH * SNES_HEIGHT);
-        if (SubScreenBuffer)
-            memset(SubScreenBuffer, 0, SNES_WIDTH * SNES_HEIGHT);
-    }
-    if (g_settings.transparency_enabled && SubScreenBuffer)
-        GFX.SubScreen = SubScreenBuffer;
-    else
-        GFX.SubScreen = GFX.Screen;
+    // SubScreenBuffer lives in the PSRAM scratch region (see declaration
+    // above) — always valid, no allocation needed.  Zero it so a stale
+    // sub-screen from the previous ROM doesn't leak into color math.
+    memset(SubScreenBuffer, 0, SNES_WIDTH * SNES_HEIGHT);
+    GFX.SubScreen = g_settings.transparency_enabled ? SubScreenBuffer : GFX.Screen;
 
     GFX.ZBuffer = (uint8_t *)ZBuffer;
     GFX.SubZBuffer = (uint8_t *)SubZBuffer;
@@ -471,7 +480,9 @@ static inline void snes9x_init(void) {
     S9xInitMemory();
     S9xInitAPU();
     S9xInitSound(0, 0);
-    S9xInitGFX();
+    if (!S9xInitGFX()) {
+        LOG("FATAL: S9xInitGFX failed (out of memory)\n");
+    }
     S9xSetPlaybackRate(Settings.SoundPlaybackRate);
     IPPU.RenderThisFrame = 1;
 }
