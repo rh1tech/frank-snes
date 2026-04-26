@@ -1481,6 +1481,49 @@ static int search_dialog_show(void) {
         present();
         sleep_ms(16);
 
+        /* Consume raw ASCII from real keyboards (PS/2 + USB). Typing
+         * updates the query directly without touching the on-screen
+         * keyboard state. */
+        int raw;
+        bool query_changed = false;
+        while ((raw = ps2kbd_get_raw_char()) >= 0) {
+            if (raw == '\b') {
+                if (qlen > 0) query[--qlen] = '\0';
+                query_changed = true;
+            } else if (raw == ' ' || (raw >= '0' && raw <= '9') ||
+                       (raw >= 'a' && raw <= 'z') || (raw >= 'A' && raw <= 'Z')) {
+                if (qlen < SEARCH_MAX_QUERY) {
+                    char c = (char)raw;
+                    if (c >= 'a' && c <= 'z') c -= 32;
+                    query[qlen++] = c;
+                    query[qlen] = '\0';
+                    query_changed = true;
+                }
+            }
+        }
+#ifdef USB_HID_ENABLED
+        while ((raw = usbhid_get_raw_char()) >= 0) {
+            if (raw == '\b') {
+                if (qlen > 0) query[--qlen] = '\0';
+                query_changed = true;
+            } else if (raw == ' ' || (raw >= '0' && raw <= '9') ||
+                       (raw >= 'a' && raw <= 'z') || (raw >= 'A' && raw <= 'Z')) {
+                if (qlen < SEARCH_MAX_QUERY) {
+                    char c = (char)raw;
+                    if (c >= 'a' && c <= 'z') c -= 32;
+                    query[qlen++] = c;
+                    query[qlen] = '\0';
+                    query_changed = true;
+                }
+            }
+        }
+#endif
+        if (query_changed) {
+            search_find_results(query, results, &result_count);
+            result_sel = 0;
+            in_results = false;
+        }
+
         int buttons = read_selector_buttons();
         int pressed = buttons & ~prev_buttons;
         if (buttons != 0 && buttons == prev_buttons) {

@@ -118,6 +118,32 @@ static void process_mouse_report(hid_mouse_report_t const *report);
 static void process_gamepad_report(int slot, uint8_t const *report, uint16_t len);
 static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len);
 
+/* Raw ASCII ring buffer for text input (search dialog typing) */
+#define USB_RAW_CHAR_QUEUE_SIZE 16
+static uint8_t usb_raw_char_queue[USB_RAW_CHAR_QUEUE_SIZE];
+static volatile int usb_raw_char_head = 0;
+static volatile int usb_raw_char_tail = 0;
+
+static void usb_raw_char_push(uint8_t ch) {
+    int next = (usb_raw_char_head + 1) & (USB_RAW_CHAR_QUEUE_SIZE - 1);
+    if (next != usb_raw_char_tail) {
+        usb_raw_char_queue[usb_raw_char_head] = ch;
+        usb_raw_char_head = next;
+    }
+}
+
+static uint8_t usb_hid_to_ascii(uint8_t code, uint8_t modifier) {
+    int shift = (modifier & (KEYBOARD_MODIFIER_LEFTSHIFT | KEYBOARD_MODIFIER_RIGHTSHIFT)) != 0;
+    if (code >= 0x04 && code <= 0x1D)
+        return shift ? ('A' + (code - 0x04)) : ('a' + (code - 0x04));
+    if (code >= 0x1E && code <= 0x26)
+        return '1' + (code - 0x1E);
+    if (code == 0x27) return '0';
+    if (code == 0x2C) return ' ';
+    if (code == 0x2A) return '\b';
+    return 0;
+}
+
 //--------------------------------------------------------------------
 // Process keyboard report
 //--------------------------------------------------------------------
@@ -146,8 +172,11 @@ static void process_kbd_report(hid_keyboard_report_t const *report, hid_keyboard
     }
     for (int i = 0; i < 6; i++) {
         uint8_t keycode = report->keycode[i];
-        if (keycode && !find_keycode_in_report(prev_report, keycode))
+        if (keycode && !find_keycode_in_report(prev_report, keycode)) {
             queue_key_action(keycode, 1);
+            uint8_t ch = usb_hid_to_ascii(keycode, report->modifier);
+            if (ch) usb_raw_char_push(ch);
+        }
     }
 }
 
@@ -462,6 +491,13 @@ uint16_t usbhid_get_kbd_state(void) {
             state |= hid_to_kbd_state_bit(prev_kbd_report.keycode[i]);
     }
     return state;
+}
+
+int usbhid_get_raw_char(void) {
+    if (usb_raw_char_head == usb_raw_char_tail) return -1;
+    uint8_t ch = usb_raw_char_queue[usb_raw_char_tail];
+    usb_raw_char_tail = (usb_raw_char_tail + 1) & (USB_RAW_CHAR_QUEUE_SIZE - 1);
+    return ch;
 }
 
 int usbhid_ctrl_alt_del_pressed(void) {

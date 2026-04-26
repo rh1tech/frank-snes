@@ -44,6 +44,12 @@ void ps2kbd_tick(void);
 int ps2kbd_get_key(int* pressed, unsigned char* key);
 uint16_t ps2kbd_get_state(void);  // Get current keyboard state bitmask
 
+/* Pop the next queued raw ASCII character from keyboard input.
+ * Returns a-z (plus shifted A-Z), 0-9, space, or '\b' for Backspace.
+ * Returns -1 when the queue is empty. Used by the search dialog so
+ * users with a real keyboard can type instead of using the OSK. */
+int ps2kbd_get_raw_char(void);
+
 /* Returns non-zero while Ctrl+Alt+Del are all currently held.
  * Del is not exposed in the KBD_STATE bitmask; this chord is only used
  * to soft-reset a running ROM. */
