@@ -222,6 +222,17 @@ static inline uint32_t rgb_dist2(uint32_t a, uint32_t b) {
     return (uint32_t)(dr * dr + dg * dg + db * db);
 }
 
+/* Distance of current substitute[r] to reserved target palette[base+r].
+ * Kept in sync with hdmi_color_substitute[] so incremental updates can
+ * decide whether a newly-changed palette entry is a closer match without
+ * re-scanning the whole palette. */
+static uint32_t hdmi_substitute_dist[4] = {
+    0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu
+};
+
+/* Full recompute — O(4 * 256).  Called once at init and whenever a reserved
+ * palette entry (251-254) changes, since the old cached distance for that
+ * slot is no longer valid. */
 static void hdmi_recompute_color_substitute(void) {
     const int base = BASE_HDMI_CTRL_INX;
     for (int i = 0; i < 4; i++) {
@@ -242,6 +253,31 @@ static void hdmi_recompute_color_substitute(void) {
         }
 
         hdmi_color_substitute[i] = best;
+        hdmi_substitute_dist[i] = best_d;
+    }
+}
+
+/* Incremental update — O(4).  When a non-reserved palette entry j changes,
+ * check whether it's now a better match than the current substitute for
+ * each reserved slot.  Cheap enough to run on every palette write. */
+static void hdmi_update_color_substitute_one(uint8_t j) {
+    const int base = BASE_HDMI_CTRL_INX;
+    if (j >= base && j <= base + 3) return; // handled by full recompute elsewhere
+    const uint32_t cand = palette[j] & 0x00ffffff;
+    for (int i = 0; i < 4; i++) {
+        /* If our cached best is this very entry and it moved away, we'd
+         * need a full rescan to find the next-best.  Cheapest safe path:
+         * if j was the current substitute, force full recompute. */
+        if (hdmi_color_substitute[i] == j) {
+            hdmi_recompute_color_substitute();
+            return;
+        }
+        const uint32_t target = palette[base + i] & 0x00ffffff;
+        const uint32_t d = rgb_dist2(target, cand);
+        if (d < hdmi_substitute_dist[i]) {
+            hdmi_substitute_dist[i] = d;
+            hdmi_color_substitute[i] = j;
+        }
     }
 }
 
@@ -704,6 +740,15 @@ void graphics_set_palette_hdmi(uint8_t i, uint32_t color888) {
     // (This is safe because S9xFixColourBrightness is called between frames)
     color888 &= 0x00ffffff;
     palette[i] = color888;
+
+    // Keep substitute map for reserved indices 251-254 in sync.
+    // Cheap: O(4) when a normal entry changes, O(4*256) only when the
+    // target itself moves (reserved index 251-254 changed).
+    if (i >= BASE_HDMI_CTRL_INX && i <= BASE_HDMI_CTRL_INX + 3) {
+        hdmi_recompute_color_substitute();
+    } else {
+        hdmi_update_color_substitute_one(i);
+    }
 
     // Don't write to hardware palette for HDMI control indices (251-254), but allow 255 (bgcolor)
     if ((i >= BASE_HDMI_CTRL_INX) && (i != 255)) return;

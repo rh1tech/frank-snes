@@ -871,15 +871,15 @@ static void DrawOBJS(bool OnMain, uint8_t D)
 
 #ifdef FRANK_SNES_FAST_MODE
    /* FAST MODE: Adaptive sprite reduction.
-    * Normal: 16 sprites/scanline on every line (full quality).
-    * Heavy (prev frame obj > 2ms): interlace + 8 sprites/line.
-    * This makes effects like Contra III's beam nearly invisible
-    * but keeps the game running smoothly. */
+    * Normal: 32 sprites/scanline (SNES hardware max).  Some games use
+    * up to 32 sprites per line for HUD frames (e.g. Addams Family Values)
+    * and capping at 16 drops the HUD decorations.
+    * Heavy (prev frame obj > 2ms): interlace + 16 sprites/line. */
    #define OBJ_INTERLACE_THRESH_US 2000
    static uint32_t _obj_interlace_phase = 0;
    static bool _obj_interlace_active = false;
    bool _do_interlace = _obj_interlace_active;
-   int32_t _max_sprites = _do_interlace ? 8 : 16;
+   int32_t _max_sprites = _do_interlace ? 16 : 32;
    uint32_t _obj_phase = _obj_interlace_phase;
    if (_do_interlace)
       _obj_interlace_phase ^= 1;
