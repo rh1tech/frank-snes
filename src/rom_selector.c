@@ -20,6 +20,7 @@
 #include "ps2kbd/ps2kbd_wrapper.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifdef USB_HID_ENABLED
 #include "usbhid/usbhid.h"
@@ -226,6 +227,22 @@ static void fb_text_center(int y, const char *s, uint8_t color) {
     fb_text(x, y, s, color);
 }
 
+/* Render text with a 1-pixel offset shadow so it stays legible over
+ * animated backgrounds without darkening the whole region. */
+static void fb_text_center_shadow(int y, const char *s, uint8_t fg_color, uint8_t shadow_color) {
+    int x = (SCREEN_W - (int)strlen(s) * 6) / 2;
+    fb_text(x + 1, y + 1, s, shadow_color);
+    fb_text(x,     y,     s, fg_color);
+}
+
+/* Map 3-bit r/g/b (0..7) into the 6x6x6 cube palette (0..5 each channel). */
+static inline uint8_t cube_rgb(int r, int g, int b) {
+    r = (r * 5) / 7;
+    g = (g * 5) / 7;
+    b = (b * 5) / 7;
+    return (uint8_t)(PAL_CUBE_BASE + r * 36 + g * 6 + b);
+}
+
 /* ─── CRC32 ───────────────────────────────────────────────────────── */
 
 static uint32_t crc32_table[256];
@@ -278,12 +295,36 @@ static bool is_snes_ext(const char *fname) {
             strcasecmp(ext, ".fig") == 0);
 }
 
-static int scan_roms(void) {
+static int strcasecmp_rom(const void *a, const void *b) {
+    const rom_entry_t *ra = (const rom_entry_t *)a;
+    const rom_entry_t *rb = (const rom_entry_t *)b;
+    const char *sa = ra->filename, *sb = rb->filename;
+    for (;; sa++, sb++) {
+        int ca = (*sa >= 'a' && *sa <= 'z') ? *sa - 32 : *sa;
+        int cb = (*sb >= 'a' && *sb <= 'z') ? *sb - 32 : *sb;
+        if (ca != cb) return ca - cb;
+        if (ca == 0) return 0;
+    }
+}
+
+/* Scan result — distinguishes "SD not mounted" / "no /snes" / "no roms" */
+typedef enum {
+    ROM_SCAN_OK,
+    ROM_SCAN_NO_SD,
+    ROM_SCAN_NO_SNES_DIR,
+    ROM_SCAN_NO_ROMS,
+} rom_scan_result_t;
+
+static rom_scan_result_t scan_result = ROM_SCAN_NO_SD;
+
+static int scan_roms(bool *out_dir_ok) {
     rom_count = 0;
+    if (out_dir_ok) *out_dir_ok = false;
     static DIR dir;
     if (f_opendir(&dir, "/snes") != FR_OK) {
         if (f_opendir(&dir, "/SNES") != FR_OK) return 0;
     }
+    if (out_dir_ok) *out_dir_ok = true;
     static FILINFO fno;
     while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0' && rom_count < MAX_ROMS) {
         if (fno.fattrib & AM_DIR) continue;
@@ -294,6 +335,8 @@ static int scan_roms(void) {
         rom_count++;
     }
     f_closedir(&dir);
+    if (rom_count > 1)
+        qsort(rom_list, rom_count, sizeof(rom_entry_t), strcasecmp_rom);
     return rom_count;
 }
 
@@ -800,9 +843,9 @@ static void draw_selector_text(int selected) {
     }
 
     if (info_state == INFO_SHOWN)
-        fb_text_center(SCREEN_H - 14, "< DOWN >   A: START", PAL_GRAY);
+        fb_text_center(SCREEN_H - 14, "DOWN   A:START", PAL_GRAY);
     else if (info_state == INFO_HIDDEN)
-        fb_text_center(SCREEN_H - 14, "< LEFT/RIGHT/UP >   A: START", PAL_GRAY);
+        fb_text_center(SCREEN_H - 14, "A:START SEL+A:FIND SEL+START:BROWSE", PAL_GRAY);
 }
 
 static void draw_scene(int selected, uint32_t frame_count) {
@@ -830,14 +873,16 @@ static void draw_scene(int selected, uint32_t frame_count) {
 
 /* ─── Input ───────────────────────────────────────────────────────── */
 
-#define BTN_LEFT  0x01
-#define BTN_RIGHT 0x02
-#define BTN_A     0x04
-#define BTN_START 0x08
-#define BTN_UP    0x10
-#define BTN_DOWN  0x20
-#define BTN_SEL   0x40
-#define BTN_F12   0x80
+#define BTN_LEFT  0x0001
+#define BTN_RIGHT 0x0002
+#define BTN_A     0x0004
+#define BTN_START 0x0008
+#define BTN_UP    0x0010
+#define BTN_DOWN  0x0020
+#define BTN_SEL   0x0040
+#define BTN_F12   0x0080
+#define BTN_B     0x0100
+#define BTN_ESC   0x0200   /* ESC (distinct from F12 so file browser can tell them apart) */
 
 static int read_selector_buttons(void) {
     nespad_read();
@@ -849,6 +894,7 @@ static int read_selector_buttons(void) {
     if (pad & DPAD_UP)     buttons |= BTN_UP;
     if (pad & DPAD_DOWN)   buttons |= BTN_DOWN;
     if (pad & DPAD_A)      buttons |= BTN_A;
+    if (pad & DPAD_B)      buttons |= BTN_B;
     if (pad & DPAD_START)  buttons |= BTN_START;
     if (pad & DPAD_SELECT) buttons |= BTN_SEL;
     uint16_t kbd = ps2kbd_get_state();
@@ -860,9 +906,11 @@ static int read_selector_buttons(void) {
     if (kbd & KBD_STATE_UP)    buttons |= BTN_UP;
     if (kbd & KBD_STATE_DOWN)  buttons |= BTN_DOWN;
     if (kbd & KBD_STATE_A)     buttons |= BTN_A;
+    if (kbd & KBD_STATE_B)     buttons |= BTN_B;
     if (kbd & KBD_STATE_START) buttons |= BTN_START;
+    if (kbd & KBD_STATE_SELECT) buttons |= BTN_SEL;
     if (kbd & KBD_STATE_F12)   buttons |= BTN_F12;
-    if (kbd & KBD_STATE_ESC)   buttons |= BTN_F12;
+    if (kbd & KBD_STATE_ESC)   buttons |= BTN_ESC;
 #ifdef USB_HID_ENABLED
     usbhid_task();
     if (usbhid_gamepad_connected()) {
@@ -873,12 +921,718 @@ static int read_selector_buttons(void) {
         if (gp.dpad & 0x04) buttons |= BTN_LEFT;
         if (gp.dpad & 0x08) buttons |= BTN_RIGHT;
         if (gp.buttons & 0x01) buttons |= BTN_A;
-        if (gp.buttons & 0x02) buttons |= BTN_A;
+        if (gp.buttons & 0x02) buttons |= BTN_B;
         if (gp.buttons & 0x40) buttons |= BTN_START;
         if (gp.buttons & 0x80) buttons |= BTN_SEL;
     }
 #endif
     return buttons;
+}
+
+/* ─── File browser mode ──────────────────────────────────────────── */
+
+#define FB_MAX_ENTRIES  256
+#define FB_VISIBLE_LINES 20
+#define FB_LIST_Y        31
+#define FB_LINE_H         9
+#define FB_NAME_X         4
+
+typedef struct {
+    char name[256];
+    bool is_dir;
+    uint32_t size;
+} fb_entry_t;
+
+/* Allocated in PSRAM alongside rom_list/rom_meta/img_buf */
+static fb_entry_t *fb_entries;
+static int fb_entry_count;
+
+static bool is_snes_file_name(const char *name) {
+    size_t len = strlen(name);
+    if (len < 5) return false;
+    const char *ext = name + len - 4;
+    return (strcasecmp(ext, ".smc") == 0 ||
+            strcasecmp(ext, ".sfc") == 0 ||
+            strcasecmp(ext, ".fig") == 0);
+}
+
+static int strcasecmp_fb(const void *a, const void *b) {
+    const fb_entry_t *ea = (const fb_entry_t *)a;
+    const fb_entry_t *eb = (const fb_entry_t *)b;
+    /* Directories before files */
+    if (ea->is_dir != eb->is_dir) return ea->is_dir ? -1 : 1;
+    const char *sa = ea->name, *sb = eb->name;
+    for (;; sa++, sb++) {
+        int ca = (*sa >= 'a' && *sa <= 'z') ? *sa - 32 : *sa;
+        int cb = (*sb >= 'a' && *sb <= 'z') ? *sb - 32 : *sb;
+        if (ca != cb) return ca - cb;
+        if (ca == 0) return 0;
+    }
+}
+
+static int fb_scan_dir(const char *path) {
+    fb_entry_count = 0;
+    DIR dir;
+    if (f_opendir(&dir, path) != FR_OK) return 0;
+
+    /* ".." entry to go up unless at root */
+    int sort_start = 0;
+    if (strlen(path) > 1) {
+        strcpy(fb_entries[0].name, "..");
+        fb_entries[0].is_dir = true;
+        fb_entries[0].size = 0;
+        fb_entry_count = 1;
+        sort_start = 1;
+    }
+
+    FILINFO fno;
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0'
+           && fb_entry_count < FB_MAX_ENTRIES) {
+        if (fno.fname[0] == '.') continue;
+        bool is_dir = (fno.fattrib & AM_DIR) != 0;
+        if (!is_dir && !is_snes_file_name(fno.fname)) continue;
+        strncpy(fb_entries[fb_entry_count].name, fno.fname,
+                sizeof(fb_entries[0].name) - 1);
+        fb_entries[fb_entry_count].name[sizeof(fb_entries[0].name) - 1] = '\0';
+        fb_entries[fb_entry_count].is_dir = is_dir;
+        fb_entries[fb_entry_count].size = (uint32_t)fno.fsize;
+        fb_entry_count++;
+    }
+    f_closedir(&dir);
+    if (fb_entry_count - sort_start > 1)
+        qsort(&fb_entries[sort_start], fb_entry_count - sort_start,
+              sizeof(fb_entry_t), strcasecmp_fb);
+    return fb_entry_count;
+}
+
+static void fb_text_trunc(int x, int y, const char *s, uint8_t color, int max_chars) {
+    int len = (int)strlen(s);
+    if (len <= max_chars) {
+        fb_text(x, y, s, color);
+    } else {
+        int cut = max_chars - 3;
+        if (cut < 0) cut = 0;
+        for (int i = 0; i < cut && s[i]; i++)
+            fb_char(x + i * 6, y, s[i], color);
+        for (int i = 0; i < 3 && cut + i < max_chars; i++)
+            fb_char(x + (cut + i) * 6, y, '.', color);
+    }
+}
+
+static void fb_draw_browser(const char *path, int selected, int scroll) {
+    fb_fill(PAL_BG);
+
+    /* Header: current path */
+    fb_text_trunc(10, 13, path, PAL_WHITE, (SCREEN_W - 20) / 6);
+    fb_hline(0, 22, SCREEN_W, PAL_GRAY);
+
+    /* File list */
+    int list_bottom = SCREEN_H - 24;
+    bool has_scrollbar = fb_entry_count > FB_VISIBLE_LINES;
+    int sb_x = SCREEN_W - 12;
+    int text_right = has_scrollbar ? sb_x - 2 : SCREEN_W - 4;
+
+    for (int i = 0; i < FB_VISIBLE_LINES && (scroll + i) < fb_entry_count; i++) {
+        int idx = scroll + i;
+        fb_entry_t *e = &fb_entries[idx];
+        int y = FB_LIST_Y + i * FB_LINE_H;
+        if (y + 7 > list_bottom) break;
+        uint8_t color = PAL_GRAY;
+
+        if (idx == selected) {
+            fb_rect(0, y - 1, text_right, FB_LINE_H, PAL_CART_DARK);
+            color = PAL_WHITE;
+        }
+
+        int name_x;
+        if (e->is_dir) {
+            fb_text(FB_NAME_X, y, "<DIR>", PAL_CART_LIGHT);
+            name_x = FB_NAME_X + 36;
+        } else {
+            char sz[6];
+            uint32_t kb = (e->size + 1023) / 1024;
+            if (kb < 1000)
+                snprintf(sz, sizeof(sz), "%4luK", (unsigned long)kb);
+            else
+                snprintf(sz, sizeof(sz), "%4luM", (unsigned long)(kb / 1024));
+            fb_text(FB_NAME_X, y, sz, PAL_CART_LIGHT);
+            name_x = FB_NAME_X + 36;
+        }
+        int name_max = (text_right - name_x) / 6;
+        fb_text_trunc(name_x, y, e->name, color, name_max);
+    }
+
+    /* Scrollbar */
+    if (has_scrollbar) {
+        int bar_h = list_bottom - FB_LIST_Y;
+        int thumb_h = bar_h * FB_VISIBLE_LINES / fb_entry_count;
+        if (thumb_h < 8) thumb_h = 8;
+        int max_scroll = fb_entry_count - FB_VISIBLE_LINES;
+        int thumb_y = FB_LIST_Y;
+        if (max_scroll > 0)
+            thumb_y += (bar_h - thumb_h) * scroll / max_scroll;
+        fb_rect(sb_x, FB_LIST_Y, 4, bar_h, PAL_CART_SLOT);
+        fb_rect(sb_x, thumb_y, 4, thumb_h, PAL_WHITE);
+    }
+
+    /* Footer */
+    fb_hline(0, SCREEN_H - 22, SCREEN_W, PAL_GRAY);
+    fb_text_center(SCREEN_H - 19, "A:OPEN B:BACK SEL+A:FIND", PAL_GRAY);
+}
+
+/* Persistent state across browser calls */
+static char fb_persist_path[MAX_ROM_PATH];
+static int  fb_persist_selected = 0;
+static int  fb_persist_scroll = 0;
+static bool fb_persist_valid = false;
+
+static void fb_save_path(const char *path) {
+    strncpy(fb_persist_path, path, sizeof(fb_persist_path) - 1);
+    fb_persist_path[sizeof(fb_persist_path) - 1] = '\0';
+    strncpy(g_settings.browser_path, path, sizeof(g_settings.browser_path) - 1);
+    g_settings.browser_path[sizeof(g_settings.browser_path) - 1] = '\0';
+}
+
+typedef enum {
+    FB_RESULT_BACK,          /* user pressed B/Select+Start → back to carousel */
+    FB_RESULT_SELECTED,      /* user picked a ROM → path written to out buffer */
+    FB_RESULT_CAROUSEL_IDX,  /* search hit in library → open carousel at *out_idx */
+} fb_result_t;
+
+static int search_dialog_show(void);
+
+static fb_result_t file_browser_show(char *out_path, size_t out_sz, int *out_idx) {
+    setup_selector_palette();
+    draw_buf = 0;
+    fb = SCREEN[draw_buf];
+
+    char cur_path[MAX_ROM_PATH];
+    bool cold_boot_restore = false;
+    bool persist_usable = false;
+
+    /* Seed from SD-saved path on first call (cold boot) */
+    if (!fb_persist_valid && g_settings.browser_path[0] != '\0') {
+        DIR check_dir;
+        if (f_opendir(&check_dir, g_settings.browser_path) == FR_OK) {
+            f_closedir(&check_dir);
+            strncpy(cur_path, g_settings.browser_path, sizeof(cur_path) - 1);
+            cur_path[sizeof(cur_path) - 1] = '\0';
+            cold_boot_restore = true;
+            persist_usable = true;
+        }
+    }
+
+    /* Subsequent calls: restore last in-session directory */
+    if (!persist_usable && fb_persist_valid) {
+        DIR check_dir;
+        if (f_opendir(&check_dir, fb_persist_path) == FR_OK) {
+            f_closedir(&check_dir);
+            strncpy(cur_path, fb_persist_path, sizeof(cur_path) - 1);
+            cur_path[sizeof(cur_path) - 1] = '\0';
+            persist_usable = true;
+        } else {
+            fb_persist_valid = false;
+        }
+    }
+    if (!persist_usable) {
+        strcpy(cur_path, "/snes");
+    }
+    /* Fall back to root if the chosen directory is missing */
+    {
+        DIR probe;
+        if (f_opendir(&probe, cur_path) != FR_OK) {
+            strcpy(cur_path, "/");
+        } else {
+            f_closedir(&probe);
+        }
+    }
+
+    fb_scan_dir(cur_path);
+
+    int selected = 0, scroll = 0;
+    if (cold_boot_restore && g_settings.browser_file[0] != '\0') {
+        for (int i = 0; i < fb_entry_count; i++) {
+            if (strcmp(fb_entries[i].name, g_settings.browser_file) == 0) {
+                selected = i;
+                break;
+            }
+        }
+        scroll = selected - FB_VISIBLE_LINES / 2;
+        if (scroll < 0) scroll = 0;
+        if (fb_entry_count > FB_VISIBLE_LINES && scroll > fb_entry_count - FB_VISIBLE_LINES)
+            scroll = fb_entry_count - FB_VISIBLE_LINES;
+    } else if (persist_usable && !cold_boot_restore) {
+        selected = fb_persist_selected;
+        scroll = fb_persist_scroll;
+        if (selected >= fb_entry_count) selected = fb_entry_count > 0 ? fb_entry_count - 1 : 0;
+        if (scroll > selected) scroll = selected;
+        if (fb_entry_count > FB_VISIBLE_LINES && scroll > fb_entry_count - FB_VISIBLE_LINES)
+            scroll = fb_entry_count - FB_VISIBLE_LINES;
+        if (scroll < 0) scroll = 0;
+    }
+    fb_persist_valid = true;
+
+    int prev_buttons = read_selector_buttons();
+    uint32_t hold_counter = 0;
+
+    while (1) {
+        fb_draw_browser(cur_path, selected, scroll);
+        present();
+        sleep_ms(16);
+
+        int buttons = read_selector_buttons();
+        int pressed = buttons & ~prev_buttons;
+        if (buttons != 0 && buttons == prev_buttons) {
+            hold_counter++;
+            if (hold_counter > 20 && (hold_counter % 3) == 0)
+                pressed = buttons & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT);
+        } else {
+            hold_counter = 0;
+        }
+        prev_buttons = buttons;
+
+        /* Select+Start: back to carousel (checked FIRST so it never leaks) */
+        bool sel_start = ((pressed & BTN_SEL) && (buttons & BTN_START)) ||
+                         ((pressed & BTN_START) && (buttons & BTN_SEL));
+        if (sel_start) {
+            g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
+            fb_save_path(cur_path);
+            fb_persist_selected = selected;
+            fb_persist_scroll = scroll;
+            settings_save();
+            return FB_RESULT_BACK;
+        }
+
+        /* B / ESC / F12: back to carousel */
+        if (pressed & (BTN_B | BTN_ESC | BTN_F12)) {
+            g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
+            fb_save_path(cur_path);
+            fb_persist_selected = selected;
+            fb_persist_scroll = scroll;
+            settings_save();
+            return FB_RESULT_BACK;
+        }
+
+        /* Select+A: search over indexed library. A hit switches back
+         * to the carousel at that index. */
+        bool sel_a = ((pressed & BTN_SEL) && (buttons & BTN_A)) ||
+                     ((pressed & BTN_A) && (buttons & BTN_SEL));
+        if (sel_a && rom_count > 0) {
+            int found = search_dialog_show();
+            if (found >= 0 && found < rom_count) {
+                g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
+                fb_save_path(cur_path);
+                fb_persist_selected = selected;
+                fb_persist_scroll = scroll;
+                settings_save();
+                if (out_idx) *out_idx = found;
+                return FB_RESULT_CAROUSEL_IDX;
+            }
+            setup_selector_palette();
+            prev_buttons = read_selector_buttons();
+            continue;
+        }
+
+        /* Navigation (with wrap on single-step Up/Down) */
+        if (pressed & BTN_UP) {
+            if (selected > 0) selected--;
+            else selected = fb_entry_count - 1;
+        }
+        if (pressed & BTN_DOWN) {
+            if (selected < fb_entry_count - 1) selected++;
+            else selected = 0;
+        }
+        if (pressed & BTN_LEFT) {
+            selected -= FB_VISIBLE_LINES;
+            if (selected < 0) selected = 0;
+        }
+        if (pressed & BTN_RIGHT) {
+            selected += FB_VISIBLE_LINES;
+            if (selected >= fb_entry_count) selected = fb_entry_count - 1;
+        }
+
+        /* Keep selection visible */
+        if (selected < scroll) scroll = selected;
+        if (selected >= scroll + FB_VISIBLE_LINES)
+            scroll = selected - FB_VISIBLE_LINES + 1;
+
+        /* A / Start: open directory or pick ROM */
+        if ((pressed & (BTN_A | BTN_START)) && fb_entry_count > 0) {
+            fb_entry_t *e = &fb_entries[selected];
+
+            if (e->is_dir) {
+                char new_path[MAX_ROM_PATH];
+                if (strcmp(e->name, "..") == 0) {
+                    strncpy(new_path, cur_path, sizeof(new_path) - 1);
+                    new_path[sizeof(new_path) - 1] = '\0';
+                    char *last_slash = strrchr(new_path, '/');
+                    if (last_slash && last_slash != new_path)
+                        *last_slash = '\0';
+                    else
+                        strcpy(new_path, "/");
+                } else {
+                    size_t plen = strlen(cur_path);
+                    if (plen == 1 && cur_path[0] == '/')
+                        snprintf(new_path, sizeof(new_path), "/%s", e->name);
+                    else
+                        snprintf(new_path, sizeof(new_path), "%s/%s", cur_path, e->name);
+                }
+                if (strlen(new_path) < sizeof(cur_path)) {
+                    strcpy(cur_path, new_path);
+                    fb_scan_dir(cur_path);
+                    selected = 0;
+                    scroll = 0;
+                }
+            } else if (is_snes_file_name(e->name)) {
+                size_t plen = strlen(cur_path);
+                if (plen == 1 && cur_path[0] == '/')
+                    snprintf(out_path, out_sz, "/%s", e->name);
+                else
+                    snprintf(out_path, out_sz, "%s/%s", cur_path, e->name);
+
+                /* Persist path + filename so cold boot restores the cursor */
+                strncpy(g_settings.browser_file, e->name, sizeof(g_settings.browser_file) - 1);
+                g_settings.browser_file[sizeof(g_settings.browser_file) - 1] = '\0';
+                fb_save_path(cur_path);
+                fb_persist_selected = selected;
+                fb_persist_scroll = scroll;
+                g_settings.selector_mode = SELECTOR_MODE_BROWSER;
+                settings_save();
+
+                /* Wait for button release so held Start/Select doesn't
+                 * trigger settings hotkey in gameplay. */
+                for (int i = 0; i < 60; i++) {
+                    if (read_selector_buttons() == 0) break;
+                    sleep_ms(16);
+                }
+                return FB_RESULT_SELECTED;
+            }
+        }
+    }
+}
+
+/* ─── Search dialog ──────────────────────────────────────────────── */
+
+#define SEARCH_MAX_QUERY   16
+#define SEARCH_MAX_RESULTS  5
+#define SEARCH_RESULT_NONE -1
+
+static const char *osk_rows[] = {
+    "0123456789",
+    "ABCDEFGHIJ",
+    "KLMNOPQRST",
+    "UVWXYZ <--",
+};
+#define OSK_ROWS      4
+#define OSK_CELL_W   14
+#define OSK_CELL_H   14
+#define OSK_PAD_X    ((SCREEN_W - 10 * OSK_CELL_W) / 2)
+
+static bool osk_is_backspace(int row, int col) {
+    return row == 3 && col >= 7;
+}
+static bool osk_is_space(int row, int col) {
+    return row == 3 && col == 6;
+}
+
+static bool str_contains_ci(const char *haystack, const char *needle) {
+    if (!needle[0]) return true;
+    int nlen = (int)strlen(needle);
+    int hlen = (int)strlen(haystack);
+    for (int i = 0; i <= hlen - nlen; i++) {
+        bool match = true;
+        for (int j = 0; j < nlen; j++) {
+            char hc = haystack[i + j];
+            char nc = needle[j];
+            if (hc >= 'a' && hc <= 'z') hc -= 32;
+            if (nc >= 'a' && nc <= 'z') nc -= 32;
+            if (hc != nc) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static void search_find_results(const char *query, int *results, int *result_count) {
+    *result_count = 0;
+    if (!query[0]) return;
+    for (int i = 0; i < rom_count && *result_count < SEARCH_MAX_RESULTS; i++) {
+        const char *title = rom_meta[i].title[0] ? rom_meta[i].title : rom_list[i].filename;
+        if (str_contains_ci(title, query))
+            results[(*result_count)++] = i;
+    }
+}
+
+#define SAFE_X 10
+#define SAFE_Y 10
+#define SAFE_W (SCREEN_W - 2 * SAFE_X)
+
+static void draw_search_screen(const char *query, int osk_row, int osk_col,
+                               int *results, int result_count, int result_sel,
+                               bool in_results) {
+    fb_fill(PAL_BG);
+
+    fb_text_center(SAFE_Y, "SEARCH", PAL_WHITE);
+    fb_hline(SAFE_X, SAFE_Y + 10, SAFE_W, PAL_GRAY);
+
+    int qx = OSK_PAD_X;
+    int qy = SAFE_Y + 15;
+    int qw = 10 * OSK_CELL_W;
+    fb_rect(qx - 1, qy - 1, qw + 2, 11, PAL_BLACK);
+    fb_hline(qx - 1, qy - 1, qw + 2, PAL_GRAY);
+    fb_hline(qx - 1, qy + 9, qw + 2, PAL_GRAY);
+    fb_vline(qx - 1, qy - 1, 11, PAL_GRAY);
+    fb_vline(qx + qw, qy - 1, 11, PAL_GRAY);
+    if (query[0])
+        fb_text(qx + 2, qy + 1, query, PAL_WHITE);
+
+    int osk_y0 = qy + 14;
+    for (int r = 0; r < OSK_ROWS; r++) {
+        const char *row_str = osk_rows[r];
+        int row_len = (int)strlen(row_str);
+        for (int c = 0; c < row_len; c++) {
+            int cx = OSK_PAD_X + c * OSK_CELL_W;
+            int cy = osk_y0 + r * OSK_CELL_H;
+
+            if (osk_is_backspace(r, c)) {
+                if (c == 7) {
+                    int bx = cx;
+                    int bw = 3 * OSK_CELL_W;
+                    bool bs_sel = !in_results && (r == osk_row && osk_col >= 7);
+                    if (bs_sel) {
+                        fb_hline(bx, cy + 1, bw - 1, PAL_WHITE);
+                        fb_hline(bx, cy + OSK_CELL_H - 1, bw - 1, PAL_WHITE);
+                        fb_vline(bx, cy + 1, OSK_CELL_H - 1, PAL_WHITE);
+                        fb_vline(bx + bw - 2, cy + 1, OSK_CELL_H - 1, PAL_WHITE);
+                    }
+                    fb_text(bx + (bw - 3 * 6) / 2, cy + 4, "DEL",
+                            bs_sel ? PAL_WHITE : PAL_GRAY);
+                }
+                continue;
+            }
+
+            bool selected = !in_results && (r == osk_row && c == osk_col);
+
+            if (osk_is_space(r, c)) {
+                if (selected) {
+                    fb_hline(cx, cy + 1, OSK_CELL_W - 1, PAL_WHITE);
+                    fb_hline(cx, cy + OSK_CELL_H - 1, OSK_CELL_W - 1, PAL_WHITE);
+                    fb_vline(cx, cy + 1, OSK_CELL_H - 1, PAL_WHITE);
+                    fb_vline(cx + OSK_CELL_W - 2, cy + 1, OSK_CELL_H - 1, PAL_WHITE);
+                }
+                fb_char(cx + (OSK_CELL_W - 5) / 2, cy + 4, '_',
+                        selected ? PAL_WHITE : PAL_GRAY);
+                continue;
+            }
+
+            if (selected) {
+                fb_hline(cx, cy + 1, OSK_CELL_W - 1, PAL_WHITE);
+                fb_hline(cx, cy + OSK_CELL_H - 1, OSK_CELL_W - 1, PAL_WHITE);
+                fb_vline(cx, cy + 1, OSK_CELL_H - 1, PAL_WHITE);
+                fb_vline(cx + OSK_CELL_W - 2, cy + 1, OSK_CELL_H - 1, PAL_WHITE);
+            }
+
+            fb_char(cx + (OSK_CELL_W - 5) / 2, cy + 4, row_str[c],
+                    selected ? PAL_WHITE : PAL_GRAY);
+        }
+    }
+
+    int sep_y = osk_y0 + OSK_ROWS * OSK_CELL_H + 4;
+    fb_hline(SAFE_X, sep_y, SAFE_W, PAL_GRAY);
+
+    int max_result_chars = (SAFE_W - 4) / 6;
+    int ry = sep_y + 4;
+    if (result_count == 0 && query[0]) {
+        fb_text_center(ry + 10, "NO RESULTS", PAL_GRAY);
+    } else {
+        for (int i = 0; i < result_count; i++) {
+            int idx = results[i];
+            const char *title = rom_meta[idx].title[0] ? rom_meta[idx].title : rom_list[idx].filename;
+            bool rsel = in_results && (i == result_sel);
+            if (rsel)
+                fb_rect(SAFE_X, ry - 1, SAFE_W, 11, PAL_CART_DARK);
+            fb_text_trunc(SAFE_X + 2, ry, title, rsel ? PAL_WHITE : PAL_GRAY, max_result_chars);
+            ry += 12;
+        }
+    }
+
+    int foot_y = SCREEN_H - SAFE_Y - 10;
+    fb_hline(SAFE_X, foot_y, SAFE_W, PAL_GRAY);
+    fb_text_center(foot_y + 3, "A:SEL  B:BACK  DOWN:RESULTS", PAL_GRAY);
+}
+
+static int search_dialog_show(void) {
+    char query[SEARCH_MAX_QUERY + 1];
+    query[0] = '\0';
+    int qlen = 0;
+
+    int osk_row = 1, osk_col = 0;
+    int results[SEARCH_MAX_RESULTS];
+    int result_count = 0;
+    int result_sel = 0;
+    bool in_results = false;
+
+    int prev_buttons = read_selector_buttons();
+    uint32_t hold_counter = 0;
+
+    while (1) {
+        draw_search_screen(query, osk_row, osk_col, results, result_count,
+                           result_sel, in_results);
+        present();
+        sleep_ms(16);
+
+        int buttons = read_selector_buttons();
+        int pressed = buttons & ~prev_buttons;
+        if (buttons != 0 && buttons == prev_buttons) {
+            hold_counter++;
+            if (hold_counter > 20 && (hold_counter % 3) == 0)
+                pressed = buttons & (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT);
+        } else {
+            hold_counter = 0;
+        }
+        prev_buttons = buttons;
+
+        if (pressed & (BTN_B | BTN_ESC | BTN_F12))
+            return SEARCH_RESULT_NONE;
+
+        if (in_results) {
+            if (pressed & BTN_UP) {
+                if (result_sel > 0) result_sel--;
+                else in_results = false;
+            }
+            if (pressed & BTN_DOWN) {
+                if (result_sel < result_count - 1) result_sel++;
+            }
+            if (pressed & (BTN_A | BTN_START)) {
+                if (result_count > 0) return results[result_sel];
+            }
+        } else {
+            if (pressed & BTN_UP) {
+                if (osk_row > 0) osk_row--;
+            }
+            if (pressed & BTN_DOWN) {
+                if (osk_row < OSK_ROWS - 1) {
+                    osk_row++;
+                } else if (result_count > 0) {
+                    in_results = true;
+                    result_sel = 0;
+                }
+            }
+            if (pressed & BTN_LEFT) {
+                if (osk_col > 0) osk_col--;
+            }
+            if (pressed & BTN_RIGHT) {
+                int row_len = (int)strlen(osk_rows[osk_row]);
+                if (osk_col < row_len - 1) osk_col++;
+            }
+
+            int row_len = (int)strlen(osk_rows[osk_row]);
+            if (osk_col >= row_len) osk_col = row_len - 1;
+
+            if (pressed & (BTN_A | BTN_START)) {
+                if (osk_is_backspace(osk_row, osk_col)) {
+                    if (qlen > 0) query[--qlen] = '\0';
+                } else if (osk_is_space(osk_row, osk_col)) {
+                    if (qlen < SEARCH_MAX_QUERY) {
+                        query[qlen++] = ' ';
+                        query[qlen] = '\0';
+                    }
+                } else {
+                    char ch = osk_rows[osk_row][osk_col];
+                    if (qlen < SEARCH_MAX_QUERY) {
+                        query[qlen++] = ch;
+                        query[qlen] = '\0';
+                    }
+                }
+                search_find_results(query, results, &result_count);
+                result_sel = 0;
+            }
+        }
+    }
+}
+
+/* ─── Progress bar ────────────────────────────────────────────────── */
+
+static void show_indexing_progress(const char *label, int current, int total) {
+    fb_fill(PAL_BG);
+    fb_text_center(104, label, PAL_WHITE);
+
+    int bar_w = 180;
+    int bar_h = 10;
+    int bar_x = (SCREEN_W - bar_w) / 2;
+    int bar_y = 122;
+    fb_rect(bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, PAL_GRAY);
+    fb_rect(bar_x, bar_y, bar_w, bar_h, PAL_BLACK);
+    int fill_w = (total > 0) ? (current * bar_w / total) : 0;
+    if (fill_w > 0)
+        fb_rect(bar_x, bar_y, fill_w, bar_h, PAL_WHITE);
+
+    char count_str[32];
+    snprintf(count_str, sizeof(count_str), "%d / %d", current, total);
+    fb_text_center(140, count_str, PAL_GRAY);
+
+    present();
+}
+
+/* ─── Main selector ───────────────────────────────────────────────── */
+
+/* ─── No-ROMs notice screen ───────────────────────────────────────── */
+
+/* Shown when /snes is missing or empty. Tells the user how to seed the SD
+ * card and waits for a button press before handing off to the file browser
+ * (which starts at root when /snes is missing). */
+static void rom_selector_no_roms_notice(void) {
+    setup_selector_palette();
+    draw_buf = 0;
+    fb = SCREEN[draw_buf];
+
+    const char *line1;
+    const char *line2;
+    if (scan_result == ROM_SCAN_NO_SNES_DIR) {
+        line1 = "NO /SNES DIRECTORY ON SD CARD";
+        line2 = "CREATE A /SNES FOLDER";
+    } else {
+        line1 = "NO .SMC/.SFC ROMS FOUND IN /SNES";
+        line2 = "COPY ROMS TO /SNES";
+    }
+
+    int prev_buttons = read_selector_buttons();
+    uint32_t frame = 0;
+
+    while (1) {
+        fb_fill(PAL_BG);
+
+        fb_text_center(40, "ROM LIBRARY EMPTY", PAL_WHITE);
+        fb_hline(10, 52, SCREEN_W - 20, PAL_GRAY);
+
+        fb_text_center(70, line1, PAL_GRAY);
+        fb_text_center(84, line2, PAL_GRAY);
+
+        fb_text_center(108, "OPTIONAL: COPY METADATA/", PAL_GRAY);
+        fb_text_center(120, "FOR COVER ART AND TITLES", PAL_GRAY);
+
+        fb_text_center(150, "OPENING FILE BROWSER...", PAL_CART_LIGHT);
+
+        if (((frame / 30) & 1) == 0)
+            fb_text_center(SCREEN_H - 40, "PRESS ANY BUTTON TO CONTINUE", PAL_WHITE);
+
+        present();
+        sleep_ms(16);
+
+        int buttons = read_selector_buttons();
+        int pressed = buttons & ~prev_buttons;
+        prev_buttons = buttons;
+        if (pressed) break;
+
+        frame++;
+        if (frame >= 600) break;  /* auto-continue after ~10s */
+    }
+
+    /* Wait for button release so it doesn't leak into the browser */
+    for (int i = 0; i < 60; i++) {
+        if (read_selector_buttons() == 0) break;
+        sleep_ms(16);
+    }
 }
 
 /* ─── Main selector ───────────────────────────────────────────────── */
@@ -890,8 +1644,9 @@ bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *scr
     psram_reset();
     rom_list = (rom_entry_t *)psram_malloc(MAX_ROMS * sizeof(rom_entry_t));
     rom_meta = (rom_meta_t *)psram_malloc(MAX_ROMS * sizeof(rom_meta_t));
+    fb_entries = (fb_entry_t *)psram_malloc(FB_MAX_ENTRIES * sizeof(fb_entry_t));
     img_buf = (uint8_t *)psram_malloc(IMG_BUF_BYTES);
-    if (!rom_list || !rom_meta || !img_buf) return false;
+    if (!rom_list || !rom_meta || !fb_entries || !img_buf) return false;
     memset(rom_list, 0, MAX_ROMS * sizeof(rom_entry_t));
     memset(rom_meta, 0, MAX_ROMS * sizeof(rom_meta_t));
 
@@ -905,38 +1660,52 @@ bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *scr
     sleep_ms(100);       /* let TV sync */
 
     /* Scan ROMs (SD access may take time) */
-    scan_roms();
-    if (rom_count == 0) return false;
+    bool snes_dir_ok = false;
+    scan_roms(&snes_dir_ok);
 
-    /* CRC cache — compute missing CRCs with on-screen progress */
-    load_crc_cache();
-    int need_crc = 0;
-    for (int i = 0; i < rom_count; i++)
-        if (!rom_list[i].crc_valid) need_crc++;
-
-    if (need_crc > 0) {
-        int done = 0;
-        for (int i = 0; i < rom_count; i++) {
-            if (rom_list[i].crc_valid) continue;
-            done++;
-            fb_fill(PAL_BG);
-            char msg[48];
-            snprintf(msg, sizeof(msg), "Indexing %d/%d...", done, need_crc);
-            fb_text_center(SCREEN_H / 2 - 4, msg, PAL_WHITE);
-            present();
-            ensure_crc(i);
+    /* No ROMs in /snes: show notice, then drop into the file browser as the
+     * only way forward. Keep reopening it until the user loads a ROM. */
+    if (rom_count == 0) {
+        scan_result = snes_dir_ok ? ROM_SCAN_NO_ROMS : ROM_SCAN_NO_SNES_DIR;
+        rom_selector_no_roms_notice();
+        while (1) {
+            /* Search returns FB_RESULT_CAROUSEL_IDX only when library has
+             * ROMs — here rom_count==0, so only SELECTED / BACK. */
+            if (file_browser_show(selected_rom_path, buffer_size, NULL) == FB_RESULT_SELECTED)
+                return true;
+            /* No carousel to show. Just reopen the browser. */
         }
-        save_crc_cache();
     }
+    scan_result = ROM_SCAN_OK;
 
-    /* Load metadata */
-    for (int i = 0; i < rom_count; i++)
+    /* CRC cache — compute missing CRCs with progress bar */
+    load_crc_cache();
+    for (int i = 0; i < rom_count; i++) {
+        if (!rom_list[i].crc_valid) ensure_crc(i);
+        show_indexing_progress("INDEXING ROMS...", i + 1, rom_count);
+    }
+    save_crc_cache();
+
+    /* Load metadata with progress bar */
+    for (int i = 0; i < rom_count; i++) {
         load_rom_title(i);
+        show_indexing_progress("LOADING METADATA...", i + 1, rom_count);
+    }
 
     load_last_rom();
 
     int selected = last_selected_rom;
     if (selected >= rom_count) selected = 0;
+
+    /* Start directly in file browser if that was the last used mode */
+    if (g_settings.selector_mode == SELECTOR_MODE_BROWSER) {
+        int fb_idx = -1;
+        fb_result_t fr = file_browser_show(selected_rom_path, buffer_size, &fb_idx);
+        if (fr == FB_RESULT_SELECTED) return true;
+        if (fr == FB_RESULT_CAROUSEL_IDX && fb_idx >= 0 && fb_idx < rom_count)
+            selected = fb_idx;
+        /* Otherwise fall through to carousel */
+    }
 
     int prev_buttons = read_selector_buttons();
     uint32_t hold_counter = 0;
@@ -991,25 +1760,50 @@ bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *scr
         }
         prev_buttons = buttons;
 
-        /* Settings hotkey: Start+Select or F12 */
-        bool settings_hotkey = ((buttons & BTN_START) && (buttons & BTN_SEL)) || (buttons & BTN_F12);
-        if (settings_hotkey) {
-            /* Wait for release */
-            for (int w = 0; w < 60; w++) {
-                int b = read_selector_buttons();
-                if (b == 0) break;
-                sleep_ms(16);
-            }
-
-            settings_menu_show(SCREEN[0], false);
-
-            /* Restore selector */
+        /* Select+Start: switch to file browser. Checked BEFORE anything
+         * else so the combo never leaks to per-button handlers. Settings
+         * is intentionally NOT available from the carousel — it only
+         * opens while a ROM is running. */
+        bool sel_start = ((pressed & BTN_SEL) && (buttons & BTN_START)) ||
+                         ((pressed & BTN_START) && (buttons & BTN_SEL));
+        if (sel_start || (pressed & BTN_F12)) {
+            g_settings.selector_mode = SELECTOR_MODE_BROWSER;
+            int fb_idx = -1;
+            fb_result_t fr = file_browser_show(selected_rom_path, buffer_size, &fb_idx);
+            if (fr == FB_RESULT_SELECTED) return true;
+            if (fr == FB_RESULT_CAROUSEL_IDX && fb_idx >= 0 && fb_idx < rom_count)
+                selected = fb_idx;
+            /* Browser returned without picking — restore carousel */
             setup_selector_palette();
             draw_buf = 0;
             fb = SCREEN[draw_buf];
             cur_img_idx = -1;
             load_rom_image(selected);
             prev_buttons = read_selector_buttons();
+            info_state = INFO_HIDDEN;
+            info_anim_frame = 0;
+            scroll_dir = 0;
+            scroll_frame = 0;
+            continue;
+        }
+
+        /* Select+A: search dialog */
+        bool sel_a = ((pressed & BTN_SEL) && (buttons & BTN_A)) ||
+                     ((pressed & BTN_A) && (buttons & BTN_SEL));
+        if (sel_a) {
+            int found = search_dialog_show();
+            if (found >= 0 && found < rom_count) {
+                selected = found;
+                load_rom_image(selected);
+            }
+            setup_selector_palette();
+            cur_img_idx = -1;
+            load_rom_image(selected);
+            prev_buttons = read_selector_buttons();
+            info_state = INFO_HIDDEN;
+            info_anim_frame = 0;
+            scroll_dir = 0;
+            scroll_frame = 0;
             continue;
         }
 
@@ -1070,6 +1864,8 @@ bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *scr
                 }
 
                 save_last_rom(selected);
+                g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
+                settings_save();
                 snprintf(selected_rom_path, buffer_size, "/snes/%s", rom_list[selected].filename);
                 return true;
             }
@@ -1145,18 +1941,80 @@ static void setup_welcome_palette(void) {
 }
 
 static void draw_filled_circle(int cx, int cy, int r, uint8_t color) {
-    int r2 = r * r;
+    /* Use the half-pixel test (2dx+1)^2 <= 4*(r^2 - dy^2) so each row's
+     * half-width matches a continuous-circle sample at the pixel centre.
+     * The naive integer test ((dx+1)^2 <= r^2-dy^2) produced four
+     * single-pixel stubs at the cardinal extremes because one row was
+     * allowed to poke past the reach of its neighbours. */
+    int four_r2 = 4 * r * r;
     for (int y = cy - r; y <= cy + r; y++) {
         if (y < 0 || y >= SCREEN_H) continue;
         int dy = y - cy;
-        int dx_sq = r2 - dy * dy;
+        int limit = four_r2 - 4 * dy * dy;
+        if (limit <= 0) continue; /* drop the collapsed top/bottom row */
         int dx = 0;
-        while ((dx + 1) * (dx + 1) <= dx_sq) dx++;
+        while ((2 * dx + 3) * (2 * dx + 3) <= limit) dx++;
         int x0 = cx - dx;
         int x1 = cx + dx;
         if (x0 < 0) x0 = 0;
         if (x1 >= SCREEN_W) x1 = SCREEN_W - 1;
         if (x0 <= x1) memset(&fb[y * SCREEN_W + x0], color, x1 - x0 + 1);
+    }
+}
+
+/* ─── Starfield backdrop (welcome screen) ─────────────────────────── */
+
+#define STAR_COUNT 64
+
+typedef struct {
+    int32_t x, y;       /* Q8.8 sub-pixel position */
+    int16_t vx;         /* Q8.8 per-frame horizontal velocity (depth tier) */
+    int16_t prev_x, prev_y;
+    uint8_t color;
+    uint8_t _pad;
+} star_t;
+
+static star_t stars[STAR_COUNT];
+static bool stars_ready = false;
+
+static uint32_t star_rng_state = 0xC0FFEE17u;
+static uint32_t star_rng(void) {
+    star_rng_state = star_rng_state * 1664525u + 1013904223u;
+    return star_rng_state;
+}
+
+static void init_starfield(void) {
+    const uint8_t tier_color[3] = {
+        cube_rgb(2, 2, 3),   /* far: dim blue-grey */
+        cube_rgb(4, 4, 5),   /* mid: light blue */
+        cube_rgb(7, 7, 7),   /* near: white */
+    };
+    const int16_t tier_vx[3] = { -32, -80, -160 };
+
+    for (int i = 0; i < STAR_COUNT; i++) {
+        int tier = (int)(star_rng() % 3);
+        stars[i].x = (int32_t)(star_rng() % (SCREEN_W << 8));
+        stars[i].y = (int32_t)(star_rng() % (SCREEN_H << 8));
+        stars[i].vx = tier_vx[tier];
+        stars[i].color = tier_color[tier];
+        stars[i].prev_x = -1;
+        stars[i].prev_y = -1;
+    }
+    stars_ready = true;
+}
+
+static void draw_starfield(void) {
+    if (!stars_ready) init_starfield();
+    for (int i = 0; i < STAR_COUNT; i++) {
+        stars[i].x += stars[i].vx;
+        if (stars[i].x < 0) stars[i].x += (SCREEN_W << 8);
+        else if (stars[i].x >= (SCREEN_W << 8)) stars[i].x -= (SCREEN_W << 8);
+
+        int sx = stars[i].x >> 8;
+        int sy = stars[i].y >> 8;
+        stars[i].prev_x = (int16_t)sx;
+        stars[i].prev_y = (int16_t)sy;
+        fb_pixel(sx, sy, stars[i].color);
     }
 }
 
@@ -1230,14 +2088,15 @@ void welcome_screen_show(void) {
 #endif
 
     uint32_t frame = 0;
-    int prev_buttons = 0xFF;
+    int prev_buttons = 0xFF;  /* ignore initial held buttons */
 
     while (1) {
         fb_fill(PAL_BG);
+        draw_starfield();
 
         /* Circle behind the logo */
         int circle_cx = SCREEN_W / 2;
-        int circle_cy = 60;
+        int circle_cy = 68;
         int circle_r = 44;
         draw_filled_circle(circle_cx, circle_cy, circle_r, PAL_LOGO_CIRCLE);
 
@@ -1248,32 +2107,30 @@ void welcome_screen_show(void) {
         draw_logo_shadow(circle_cx, circle_cy, bounce, circle_r);
         draw_logo_3x(logo_x, logo_y);
 
-        /* Text */
-        fb_text_center(110, "FRANK SNES", PAL_WHITE);
-        fb_text_center(124, version_str, PAL_GRAY);
-        fb_text_center(144, "BY MIKHAIL MATVEEV", PAL_GRAY);
-        fb_text_center(156, "<XTREME@RH1.TECH>", PAL_GRAY);
-        fb_text_center(176, "RH1.TECH", PAL_GRAY);
+        /* Text — drop-shadowed so the starfield stays readable */
+        fb_text_center_shadow(118, "FRANK SNES", PAL_WHITE, PAL_BLACK);
+        fb_text_center_shadow(132, version_str, PAL_LOGO_LGRAY, PAL_BLACK);
+        fb_text_center_shadow(152, "BY MIKHAIL MATVEEV", PAL_LOGO_LGRAY, PAL_BLACK);
+        fb_text_center_shadow(164, "GITHUB.COM/RH1TECH/MURMSNES", PAL_LOGO_LGRAY, PAL_BLACK);
+        fb_text_center_shadow(184, "RH1.TECH", PAL_LOGO_LGRAY, PAL_BLACK);
 
         /* Blinking "PRESS START" after 2 seconds */
         if (frame >= 120 && ((frame / 30) & 1) == 0) {
-            fb_text_center(SCREEN_H - 16, "PRESS START", PAL_WHITE);
+            fb_text_center_shadow(SCREEN_H - 16, "PRESS START", PAL_WHITE, PAL_BLACK);
         }
 
         present();
         frame++;
         sleep_ms(16);
 
-        /* Check input after initial settle */
+        /* Read input every frame so edge detection works across the
+         * settle-to-active transition. */
+        int buttons = read_selector_buttons();
         if (frame >= 120) {
-            int buttons = read_selector_buttons();
             int pressed = buttons & ~prev_buttons;
-            prev_buttons = buttons;
-            if (pressed & (BTN_A | BTN_START))
-                break;
-        } else {
-            prev_buttons = read_selector_buttons();
+            if (pressed) break;   /* any button advances */
         }
+        prev_buttons = buttons;
 
         /* Auto-continue after 10 seconds */
         if (frame >= 600) break;

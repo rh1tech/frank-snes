@@ -26,6 +26,10 @@
 #define VOLUME_MAX  100
 #define VOLUME_STEP 10
 
+// ROM selector view mode (persisted across boots)
+#define SELECTOR_MODE_CAROUSEL 0
+#define SELECTOR_MODE_BROWSER  1
+
 // Button mapping: 8 remappable SNES buttons (D-pad is always fixed)
 // Each entry maps a SNES button to a physical button index (0-7)
 #define BTNMAP_COUNT 8
@@ -58,6 +62,7 @@ typedef struct {
     bool    sprites_enabled;
     bool    transparency_enabled;
     bool    hdma_enabled;
+    bool    crt_overscan;         // CRT overscan simulation: blank edge columns to hide scroll edge artifacts
 
     // Audio settings
     bool    echo_enabled;         // Sound echo (reverb)
@@ -67,6 +72,11 @@ typedef struct {
     button_map_t btnmap_kbd;      // Keyboard
     button_map_t btnmap_nes;      // NES/SNES gamepad
     button_map_t btnmap_usb;      // USB gamepad
+
+    // ROM selector state
+    uint8_t selector_mode;        // SELECTOR_MODE_CAROUSEL or SELECTOR_MODE_BROWSER
+    char    browser_path[280];    // Last file browser directory
+    char    browser_file[256];    // Last launched file name (in browser_path)
 } settings_t;
 
 extern settings_t g_settings;

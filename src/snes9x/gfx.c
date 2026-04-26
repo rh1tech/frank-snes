@@ -454,6 +454,7 @@ void S9xEndScreenRefresh(void)
        * offset-per-tile first-column artifacts and similar scroll
        * edge glitches that SNES games relied on CRT overscan to
        * conceal.  SuperFX titles need a wider margin. */
+      if (g_settings.crt_overscan)
       {
          int edge = Settings.SuperFX ? 20 : 8;
          int y;

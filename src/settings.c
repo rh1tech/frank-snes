@@ -38,11 +38,12 @@
 #define VALUE_X       132
 
 /* Palette indices for menu rendering */
-#define PAL_BG      1
-#define PAL_WHITE   2
-#define PAL_YELLOW  3
-#define PAL_GRAY    4
-#define PAL_RED     5
+#define PAL_BG          1
+#define PAL_WHITE       2
+#define PAL_YELLOW      3
+#define PAL_GRAY        4
+#define PAL_RED         5
+#define PAL_DARKGRAY    6   /* Used by scrollbar track */
 
 /* ─── Menu pages ──────────────────────────────────────────────────── */
 
@@ -87,6 +88,7 @@ typedef enum {
     VIDEO_SPRITES,
     VIDEO_TRANSPARENCY,
     VIDEO_HDMA,
+    VIDEO_OVERSCAN,
     VIDEO_SEP,
     VIDEO_BACK,
     VIDEO_ITEM_COUNT
@@ -113,11 +115,15 @@ settings_t g_settings = {
     .sprites_enabled = true,
     .transparency_enabled = true,
     .hdma_enabled = true,
+    .crt_overscan = false,
     .echo_enabled = false,
     .interpolation = true,
     .btnmap_kbd = BTNMAP_DEFAULT,
     .btnmap_nes = BTNMAP_DEFAULT,
     .btnmap_usb = BTNMAP_DEFAULT,
+    .selector_mode = SELECTOR_MODE_CAROUSEL,
+    .browser_path = "",
+    .browser_file = "",
 };
 
 /* Edit copy */
@@ -263,15 +269,25 @@ static void draw_hline(uint8_t *screen, int x, int y, int w, uint8_t color) {
     memset(&screen[y * SCREEN_WIDTH + x], color, (size_t)w);
 }
 
+static void draw_rect(uint8_t *screen, int x, int y, int w, int h, uint8_t color) {
+    for (int yy = y; yy < y + h && yy < SCREEN_HEIGHT; yy++) {
+        if (yy < 0) continue;
+        int x0 = x < 0 ? 0 : x;
+        int x1 = (x + w) > SCREEN_WIDTH ? SCREEN_WIDTH : (x + w);
+        if (x0 < x1) memset(&screen[yy * SCREEN_WIDTH + x0], color, (size_t)(x1 - x0));
+    }
+}
+
 /* ─── Menu palette setup ──────────────────────────────────────────── */
 
 static void setup_menu_palette(void) {
     graphics_set_palette(0, 0x000000);
-    graphics_set_palette(PAL_BG,     0x080810);    /* dark blue-gray */
-    graphics_set_palette(PAL_WHITE,  0xFFFFFF);
-    graphics_set_palette(PAL_YELLOW, 0xFFFF00);
-    graphics_set_palette(PAL_GRAY,   0x808080);
-    graphics_set_palette(PAL_RED,    0xFF4444);
+    graphics_set_palette(PAL_BG,       0x080810);    /* dark blue-gray */
+    graphics_set_palette(PAL_WHITE,    0xFFFFFF);
+    graphics_set_palette(PAL_YELLOW,   0xFFFF00);
+    graphics_set_palette(PAL_GRAY,     0x808080);
+    graphics_set_palette(PAL_RED,      0xFF4444);
+    graphics_set_palette(PAL_DARKGRAY, 0x404048);
     graphics_restore_sync_colors();
 }
 
@@ -540,6 +556,7 @@ static const char *video_label(int item) {
         case VIDEO_SPRITES:      return "SPRITES";
         case VIDEO_TRANSPARENCY: return "TRANSPARENCY";
         case VIDEO_HDMA:         return "HDMA";
+        case VIDEO_OVERSCAN:     return "CRT OVERSCAN";
         case VIDEO_BACK:         return "BACK";
         default:                 return "";
     }
@@ -554,6 +571,7 @@ static const char *video_value(int item) {
         case VIDEO_SPRITES:      return edit.sprites_enabled ? "ON" : "OFF";
         case VIDEO_TRANSPARENCY: return edit.transparency_enabled ? "ON" : "OFF";
         case VIDEO_HDMA:         return edit.hdma_enabled ? "ON" : "OFF";
+        case VIDEO_OVERSCAN:     return edit.crt_overscan ? "ON" : "OFF";
         default: return NULL;
     }
 }
@@ -568,6 +586,7 @@ static void video_change_value(int item, int dir) {
         case VIDEO_SPRITES:      edit.sprites_enabled = !edit.sprites_enabled; break;
         case VIDEO_TRANSPARENCY: edit.transparency_enabled = !edit.transparency_enabled; break;
         case VIDEO_HDMA:         edit.hdma_enabled = !edit.hdma_enabled; break;
+        case VIDEO_OVERSCAN:     edit.crt_overscan = !edit.crt_overscan; break;
         default: break;
     }
 }
@@ -829,6 +848,22 @@ static void draw_menu(uint8_t *screen, const char *title, int item_count,
 
         y += LINE_HEIGHT;
     }
+
+    /* Scrollbar — only drawn when the list overflows */
+    if (total_height > vis_height) {
+        int sb_x = SCREEN_WIDTH - 8;
+        int sb_w = 3;
+        int track_y = vis_top;
+        int track_h = vis_height;
+        int thumb_h = track_h * vis_height / total_height;
+        if (thumb_h < 6) thumb_h = 6;
+        int max_scroll = total_height - vis_height;
+        int thumb_y = track_y;
+        if (max_scroll > 0)
+            thumb_y += (track_h - thumb_h) * scroll_offset / max_scroll;
+        draw_rect(screen, sb_x, track_y, sb_w, track_h, PAL_DARKGRAY);
+        draw_rect(screen, sb_x, thumb_y, sb_w, thumb_h, PAL_WHITE);
+    }
 }
 
 /* ─── Settings persistence ────────────────────────────────────────── */
@@ -879,6 +914,8 @@ void settings_load(void) {
             g_settings.transparency_enabled = (atoi(value) != 0);
         } else if (strcmp(key, "hdma") == 0) {
             g_settings.hdma_enabled = (atoi(value) != 0);
+        } else if (strcmp(key, "crt_overscan") == 0) {
+            g_settings.crt_overscan = (atoi(value) != 0);
         } else if (strcmp(key, "echo") == 0) {
             g_settings.echo_enabled = (atoi(value) != 0);
         } else if (strcmp(key, "interpolation") == 0) {
@@ -907,6 +944,17 @@ void settings_load(void) {
                    &g_settings.btnmap_usb.map[6], &g_settings.btnmap_usb.map[7]);
             for (int i = 0; i < BTNMAP_COUNT; i++)
                 if (g_settings.btnmap_usb.map[i] >= BTNMAP_COUNT) g_settings.btnmap_usb.map[i] = (uint8_t)i;
+        } else if (strcmp(key, "selector_mode") == 0) {
+            if (strcmp(value, "browser") == 0)
+                g_settings.selector_mode = SELECTOR_MODE_BROWSER;
+            else
+                g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
+        } else if (strcmp(key, "browser_path") == 0) {
+            strncpy(g_settings.browser_path, value, sizeof(g_settings.browser_path) - 1);
+            g_settings.browser_path[sizeof(g_settings.browser_path) - 1] = '\0';
+        } else if (strcmp(key, "browser_file") == 0) {
+            strncpy(g_settings.browser_file, value, sizeof(g_settings.browser_file) - 1);
+            g_settings.browser_file[sizeof(g_settings.browser_file) - 1] = '\0';
         }
     }
 
@@ -934,6 +982,7 @@ bool settings_save(void) {
     f_printf(&file, "sprites=%d\n", g_settings.sprites_enabled ? 1 : 0);
     f_printf(&file, "transparency=%d\n", g_settings.transparency_enabled ? 1 : 0);
     f_printf(&file, "hdma=%d\n", g_settings.hdma_enabled ? 1 : 0);
+    f_printf(&file, "crt_overscan=%d\n", g_settings.crt_overscan ? 1 : 0);
     f_printf(&file, "echo=%d\n", g_settings.echo_enabled ? 1 : 0);
     f_printf(&file, "interpolation=%d\n", g_settings.interpolation ? 1 : 0);
     f_printf(&file, "btnmap_kbd=%d,%d,%d,%d,%d,%d,%d,%d\n",
@@ -951,6 +1000,10 @@ bool settings_save(void) {
              g_settings.btnmap_usb.map[2], g_settings.btnmap_usb.map[3],
              g_settings.btnmap_usb.map[4], g_settings.btnmap_usb.map[5],
              g_settings.btnmap_usb.map[6], g_settings.btnmap_usb.map[7]);
+    f_printf(&file, "selector_mode=%s\n",
+             g_settings.selector_mode == SELECTOR_MODE_BROWSER ? "browser" : "carousel");
+    f_printf(&file, "browser_path=%s\n", g_settings.browser_path);
+    f_printf(&file, "browser_file=%s\n", g_settings.browser_file);
 
     f_close(&file);
     printf("Settings saved to %s\n", SETTINGS_PATH);
