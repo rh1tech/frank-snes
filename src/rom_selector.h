@@ -37,4 +37,12 @@ void rom_selector_show_sd_error(uint8_t *screen_buffer, int error_code);
  */
 void welcome_screen_show(void);
 
+/**
+ * Show a warning screen if any game-affecting video settings are off
+ * (BGs, sprites, transparency, HDMA).  No-op when all are default.
+ * CRT overscan is excluded because it does not affect game content.
+ * Waits for user input or auto-continues after timeout.
+ */
+void video_settings_warning_show(void);
+
 #endif // ROM_SELECTOR_H

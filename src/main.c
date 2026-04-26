@@ -1453,6 +1453,10 @@ int main(void) {
     // Show welcome screen on first boot
     welcome_screen_show();
 
+    // Warn the user if any game-affecting video settings are off.
+    // No-op when all defaults are intact.
+    video_settings_warning_show();
+
     // Main loop: ROM selector -> load -> emulate -> repeat
     char rom_path[MAX_ROM_PATH];
 

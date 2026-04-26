@@ -2186,6 +2186,124 @@ void welcome_screen_show(void) {
     }
 }
 
+/* ─── Video settings warning screen ───────────────────────────────── */
+
+/* Collect labels of any game-affecting video settings currently off.
+ * Returns the number of items written to labels[]. */
+static int collect_nondefault_video_settings(const char *labels[], int max_labels) {
+    int n = 0;
+    if (!(g_settings.bg_enabled & 0x01) && n < max_labels) labels[n++] = "BACKGROUND 1";
+    if (!(g_settings.bg_enabled & 0x02) && n < max_labels) labels[n++] = "BACKGROUND 2";
+    if (!(g_settings.bg_enabled & 0x04) && n < max_labels) labels[n++] = "BACKGROUND 3";
+    if (!(g_settings.bg_enabled & 0x08) && n < max_labels) labels[n++] = "BACKGROUND 4";
+    if (!g_settings.sprites_enabled     && n < max_labels) labels[n++] = "SPRITES";
+    if (!g_settings.transparency_enabled && n < max_labels) labels[n++] = "TRANSPARENCY";
+    if (!g_settings.hdma_enabled        && n < max_labels) labels[n++] = "HDMA";
+    return n;
+}
+
+/* Max characters that fit across SCREEN_W at 6px per char, with a safety
+ * margin so text never touches the edges. */
+#define WARN_LINE_MAX_CHARS 40
+#define WARN_MAX_LINES 4
+
+void video_settings_warning_show(void) {
+    const char *off_labels[7];
+    int off_count = collect_nondefault_video_settings(off_labels, 7);
+    if (off_count == 0) return;  /* everything default — nothing to warn about */
+
+    /* Reuse welcome palette so PAL_WHITE / PAL_LOGO_* are defined. */
+    setup_welcome_palette();
+    draw_buf = 0;
+    fb = SCREEN[draw_buf];
+
+    /* Build a comma-separated sentence and wrap it across up to WARN_MAX_LINES
+     * lines, breaking only at separator boundaries so labels stay intact. */
+    char off_lines[WARN_MAX_LINES][WARN_LINE_MAX_CHARS + 1];
+    int line_count = 0;
+    for (int i = 0; i < WARN_MAX_LINES; i++) off_lines[i][0] = 0;
+    {
+        int line = 0;
+        size_t col = 0;
+        for (int i = 0; i < off_count && line < WARN_MAX_LINES; i++) {
+            const char *sep = (i == 0) ? "" : (i == off_count - 1 ? " AND " : ", ");
+            size_t need = strlen(sep) + strlen(off_labels[i]);
+            if (col + need > WARN_LINE_MAX_CHARS && col > 0) {
+                /* Doesn't fit — move to next line.  Drop the leading
+                 * separator on the new line for cleanliness. */
+                line++;
+                col = 0;
+                if (line >= WARN_MAX_LINES) break;
+                sep = "";
+                need = strlen(off_labels[i]);
+            }
+            int written = snprintf(off_lines[line] + col,
+                                   sizeof(off_lines[line]) - col,
+                                   "%s%s", sep, off_labels[i]);
+            if (written > 0) col += (size_t)written;
+        }
+        line_count = line + 1;
+    }
+
+    uint32_t frame = 0;
+    int prev_buttons = read_selector_buttons();  /* ignore initial held buttons */
+
+    while (1) {
+        fb_fill(PAL_BG);
+        draw_starfield();
+
+        fb_text_center_shadow(60, "VIDEO SETTINGS WARNING",
+                              PAL_LOGO_YELLOW, PAL_BLACK);
+        fb_text_center_shadow(90, "YOU HAVE THESE SETTINGS TURNED OFF:",
+                              PAL_WHITE, PAL_BLACK);
+
+        /* Push each list line down from y=110 with 12px line height. */
+        for (int i = 0; i < line_count; i++) {
+            if (off_lines[i][0]) {
+                fb_text_center_shadow(110 + i * 12, off_lines[i],
+                                      PAL_LOGO_LGRAY, PAL_BLACK);
+            }
+        }
+
+        /* Place closing text below the list so it never overlaps. */
+        int y_footer = 110 + line_count * 12 + 12;
+        if (y_footer > SCREEN_H - 40) y_footer = SCREEN_H - 40;
+        fb_text_center_shadow(y_footer, "GAME CONTENT MAY NOT DISPLAY CORRECTLY.",
+                              PAL_WHITE, PAL_BLACK);
+        fb_text_center_shadow(y_footer + 16, "CHANGE THESE IN THE SETTINGS MENU",
+                              PAL_LOGO_LGRAY, PAL_BLACK);
+        fb_text_center_shadow(y_footer + 28, "(START + SELECT DURING GAMEPLAY).",
+                              PAL_LOGO_LGRAY, PAL_BLACK);
+
+        /* Blinking "PRESS ANY BUTTON" after 1 second */
+        if (frame >= 60 && ((frame / 30) & 1) == 0) {
+            fb_text_center_shadow(SCREEN_H - 16, "PRESS ANY BUTTON",
+                                  PAL_WHITE, PAL_BLACK);
+        }
+
+        present();
+        frame++;
+        sleep_ms(16);
+
+        /* Any button advances after a short settle period. */
+        int buttons = read_selector_buttons();
+        if (frame >= 30) {
+            int pressed = buttons & ~prev_buttons;
+            if (pressed) break;
+        }
+        prev_buttons = buttons;
+
+        /* Auto-continue after 8 seconds so the device never hangs here. */
+        if (frame >= 480) break;
+    }
+
+    /* Wait for buttons to be released */
+    for (int i = 0; i < 60; i++) {
+        if (read_selector_buttons() == 0) break;
+        sleep_ms(16);
+    }
+}
+
 /* ─── SD error screen ─────────────────────────────────────────────── */
 
 void rom_selector_show_sd_error(uint8_t *screen_buffer, int error_code) {
