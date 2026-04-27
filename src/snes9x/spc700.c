@@ -364,6 +364,9 @@ if (!(S9xAPUGetByteZ (Work8) & (1 << (b)))) \
 else \
     IAPU.PC += 3
 
+#ifdef PICO_ON_DEVICE
+__attribute__((hot, section(".time_critical.apu_exec")))
+#endif
 void APUExecute(void/*int32_t target_cycles*/)
 {
    int8_t   Int8;

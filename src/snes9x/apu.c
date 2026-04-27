@@ -134,6 +134,9 @@ void S9xAPUWritePort(int32_t Address, uint8_t Byte)
 volatile uint32_t dsp_log_frame = 0;
 volatile uint32_t dsp_write_count = 0; /* total DSP writes — for hang detection */
 
+#ifdef PICO_ON_DEVICE
+__attribute__((hot, section(".time_critical.apu_dsp")))
+#endif
 void S9xSetAPUDSP(uint8_t byte)
 {
    uint8_t reg = IAPU.RAM [0xf2];

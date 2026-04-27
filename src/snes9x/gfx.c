@@ -23,6 +23,14 @@
 
 extern volatile bool g_palette_needs_update;
 
+/* Graphics pipeline hot path — S9xUpdateScreen, RenderScreen, DrawBackground
+ * and friends are called every rendered frame. Place in SRAM. */
+#ifdef PICO_ON_DEVICE
+#define GFX_HOT __attribute__((hot, section(".time_critical.gfx")))
+#else
+#define GFX_HOT
+#endif
+
 #ifdef FRANK_SNES_PROFILE
 #include "pico/stdlib.h"
 #include "frank_snes_profile.h"
@@ -3025,7 +3033,7 @@ static void RenderScreen(uint8_t* Screen, bool sub, bool force_no_add, uint8_t D
 #endif
 }
 
-void S9xUpdateScreen(void)
+GFX_HOT void S9xUpdateScreen(void)
 {
    g_upd_screen_calls++;
 #ifdef FRANK_SNES_PROFILE

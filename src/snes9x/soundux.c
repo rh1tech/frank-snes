@@ -32,9 +32,12 @@
 #define CLIP8(v) \
 (v) = (((v) <= -128) ? -128 : (((v) >= 127) ? 127 : (v)))
 
+/* Echo[24000] (96KB) lives in PSRAM — only touched when SoundData.echo_enable,
+ * and at most once per output sample. Keeps SRAM bss under 512KB budget. */
+static int32_t *g_echo_buffer = NULL;
+
 static struct LocalStateStruct {
    int32_t wave[SOUND_BUFFER_SIZE];
-   int32_t Echo [24000];
    int32_t MixBuffer [SOUND_BUFFER_SIZE];
    int32_t EchoBuffer [SOUND_BUFFER_SIZE];
    int32_t FilterTaps [8];
@@ -68,7 +71,7 @@ static bool g_disable_noise = false;
 static uint8_t g_channel_mute_mask = 0x00; // 0 = all channels enabled
 
 #define wave LocalState->wave
-#define Echo LocalState->Echo
+#define Echo g_echo_buffer
 #define MixBuffer LocalState->MixBuffer
 #define EchoBuffer LocalState->EchoBuffer
 #define FilterTaps LocalState->FilterTaps
@@ -332,7 +335,7 @@ void S9xSetEchoEnable(uint8_t byte)
       byte = 0;
    if (byte && !SoundData.echo_enable)
    {
-      memset(Echo, 0, sizeof(Echo));
+      memset(Echo, 0, 24000 * sizeof(int32_t));
       memset(Loop, 0, sizeof(Loop));
    }
 
@@ -982,6 +985,9 @@ const int32_t* S9xGetMixBuffer(void)
  * This is faster because we only process one channel instead of two.
  * The output is single-channel; caller duplicates to stereo for I2S.
  */
+#ifdef PICO_ON_DEVICE
+__attribute__((hot, section(".time_critical.mix")))
+#endif
 void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
 {
    int32_t J;
@@ -1302,6 +1308,11 @@ void S9xSetPlaybackRate(uint32_t playback_rate)
 bool S9xInitSound(int32_t buffer_ms, int32_t lag_ms)
 {
    memset(&LocalStateStorage, 0, sizeof(LocalStateStorage));
+   if (!g_echo_buffer) {
+      g_echo_buffer = (int32_t *)malloc(24000 * sizeof(int32_t));
+      if (!g_echo_buffer) return false;
+   }
+   memset(g_echo_buffer, 0, 24000 * sizeof(int32_t));
    so.playback_rate = 0;
    S9xResetSound(true);
    return true;

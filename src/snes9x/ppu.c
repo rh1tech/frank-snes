@@ -15,6 +15,14 @@
 extern FxInit_s SuperFX;
 static void S9xSetSuperFX(uint8_t Byte, uint16_t Address);
 
+/* PPU/CPU register I/O sits on the hot path — called per $21xx/$42xx/$43xx
+ * access during opcode emulation. Place in SRAM to avoid XIP cache misses. */
+#ifdef PICO_ON_DEVICE
+#define PPU_HOT __attribute__((hot, section(".time_critical.ppu_io")))
+#else
+#define PPU_HOT
+#endif
+
 #if PICO_ON_DEVICE
 #include "graphics.h"
 #else
@@ -117,7 +125,7 @@ void S9xFixColourBrightness() {
 /* S9xSetPPU()                                                                */
 /* This function sets a PPU Register to a specific byte                       */
 /******************************************************************************/
-void S9xSetPPU(uint8_t Byte, uint16_t Address)
+PPU_HOT void S9xSetPPU(uint8_t Byte, uint16_t Address)
 {
    if (Address <= 0x2183)
    {
@@ -638,7 +646,7 @@ void S9xSetPPU(uint8_t Byte, uint16_t Address)
 /* S9xGetPPU()                                                                */
 /* This function retrieves a PPU Register                                     */
 /******************************************************************************/
-uint8_t S9xGetPPU(uint16_t Address)
+PPU_HOT uint8_t S9xGetPPU(uint16_t Address)
 {
    uint8_t byte;
    if (Address < 0x2100) /* not a real PPU reg */
@@ -898,7 +906,7 @@ uint8_t S9xGetPPU(uint16_t Address)
 /* S9xSetCPU()                                                                */
 /* This function sets a CPU/DMA Register to a specific byte                   */
 /******************************************************************************/
-void S9xSetCPU(uint8_t byte, uint16_t Address)
+PPU_HOT void S9xSetCPU(uint8_t byte, uint16_t Address)
 {
    int32_t d;
 
@@ -1328,7 +1336,7 @@ void S9xSetCPU(uint8_t byte, uint16_t Address)
 /* S9xGetCPU()                                                                */
 /* This function retrieves a CPU/DMA Register                                 */
 /******************************************************************************/
-uint8_t S9xGetCPU(uint16_t Address)
+PPU_HOT uint8_t S9xGetCPU(uint16_t Address)
 {
    int32_t d;
    uint8_t byte;

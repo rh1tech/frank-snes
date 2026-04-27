@@ -20,6 +20,9 @@ extern uint8_t* HDMABasePointers [8];
 /* S9xDoDMA()                                                                                 */
 /* This function preforms the general dma transfer                                            */
 /**********************************************************************************************/
+#ifdef PICO_ON_DEVICE
+__attribute__((hot, section(".time_critical.dma")))
+#endif
 void S9xDoDMA(uint8_t Channel)
 {
    uint8_t Work;
