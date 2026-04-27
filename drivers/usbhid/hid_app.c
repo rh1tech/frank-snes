@@ -259,7 +259,12 @@ static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t c
                 prev_kbd_report = *(hid_keyboard_report_t const *)report;
                 break;
             case HID_USAGE_DESKTOP_MOUSE:
-                process_mouse_report((hid_mouse_report_t const *)report);
+                if (len >= 3) {
+                    hid_mouse_report_t padded = {0};
+                    memcpy(&padded, report,
+                           len < sizeof(padded) ? len : sizeof(padded));
+                    process_mouse_report(&padded);
+                }
                 break;
             case HID_USAGE_DESKTOP_GAMEPAD:
             case HID_USAGE_DESKTOP_JOYSTICK: {
@@ -305,6 +310,8 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
         printf("  -> Parsed %d reports from descriptor\n", hid_info[instance].report_count);
 
         bool is_gamepad = false;
+        bool is_mouse = false;
+        bool is_keyboard = false;
         for (uint8_t i = 0; i < hid_info[instance].report_count && i < MAX_REPORT; i++) {
             printf("  -> Report %d: usage_page=0x%02X, usage=0x%02X\n",
                    i, hid_info[instance].report_info[i].usage_page,
@@ -313,10 +320,24 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
                 uint8_t usage = hid_info[instance].report_info[i].usage;
                 if (usage == HID_USAGE_DESKTOP_GAMEPAD || usage == HID_USAGE_DESKTOP_JOYSTICK)
                     is_gamepad = true;
+                else if (usage == HID_USAGE_DESKTOP_MOUSE)
+                    is_mouse = true;
+                else if (usage == HID_USAGE_DESKTOP_KEYBOARD)
+                    is_keyboard = true;
             }
         }
 
-        if (!is_gamepad && hid_info[instance].report_count == 0) {
+        if (is_mouse) {
+            mouse_connected = 1;
+            printf("  -> MOUSE detected via descriptor\n");
+        }
+        if (is_keyboard) {
+            keyboard_connected = 1;
+            printf("  -> KEYBOARD detected via descriptor\n");
+        }
+
+        if (!is_gamepad && !is_mouse && !is_keyboard &&
+            hid_info[instance].report_count == 0) {
             printf("  -> No reports parsed, assuming gamepad\n");
             is_gamepad = true;
         }
@@ -368,21 +389,34 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
             }
             break;
         case HID_ITF_PROTOCOL_MOUSE:
-            if (report && len >= sizeof(hid_mouse_report_t))
-                process_mouse_report((hid_mouse_report_t const *)report);
+            // Boot-protocol mice send 3 bytes (buttons,x,y); some add
+            // wheel (4); hid_mouse_report_t is 5. Pad short reports
+            // instead of dropping them — the old `len >= sizeof(...)`
+            // check silently ignored most real mice.
+            if (report && len >= 3) {
+                hid_mouse_report_t padded = {0};
+                memcpy(&padded, report, len < sizeof(padded) ? len : sizeof(padded));
+                process_mouse_report(&padded);
+            }
             break;
         default:
             if (report && len >= 2) {
                 if (report_debug_counter < 5) {
-                    printf("Gamepad report (dev=%d, len=%d): ", dev_addr, len);
+                    printf("Generic HID report (dev=%d, len=%d): ", dev_addr, len);
                     for (int i = 0; i < len && i < 16; i++) printf("%02X ", report[i]);
                     printf("\n");
                     report_debug_counter++;
                 }
-                int slot = find_or_alloc_gamepad_slot(dev_addr, instance);
+                // Generic HID device (protocol=NONE). Could be a mouse
+                // or keyboard enumerated without boot-protocol support,
+                // or a gamepad. Route via the parsed descriptor first;
+                // fall back to gamepad if no match.
+                int slot = find_gamepad_slot_by_dev(dev_addr);
                 if (slot >= 0) {
                     gamepad_slots[slot].connected = 1;
                     process_gamepad_report(slot, report, len);
+                } else {
+                    process_generic_report(dev_addr, instance, report, len);
                 }
             }
             break;

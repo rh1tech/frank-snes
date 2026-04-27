@@ -1,9 +1,10 @@
 // PS/2 Keyboard Wrapper for SNES
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "../../src/board_config.h"
+#include "board_config.h"
 #include "ps2kbd_wrapper.h"
 #include "ps2kbd_mrmltr.h"
+#include "ps2/ps2.h"
 
 // Simple ring buffer for key events (avoids std::queue to save RAM)
 #define EVENT_QUEUE_SIZE 16
@@ -205,8 +206,13 @@ static uint16_t key_to_state_bit(uint8_t key) {
 }
 
 extern "C" void ps2kbd_init(void) {
-    kbd = new Ps2Kbd_Mrmltr(pio1, PS2_PIN_CLK, key_handler);
-    kbd->init_gpio();
+    // Topology matches frank-wolf (proven working with this mouse):
+    //   pio0 = HDMI
+    //   pio1 = audio + nespad + PS/2 mouse
+    //   pio2 = PS/2 keyboard
+    ps2_mouse_pio_init(pio1, PS2_MOUSE_CLK);
+    ps2_kbd_pio_init(pio2, PS2_PIN_CLK);
+    kbd = new Ps2Kbd_Mrmltr(key_handler);
     g_kbd_state = 0;
 }
 

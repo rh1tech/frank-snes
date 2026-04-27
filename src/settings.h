@@ -68,6 +68,9 @@ typedef struct {
     bool    echo_enabled;         // Sound echo (reverb)
     bool    interpolation;        // Sound interpolation
 
+    // Emulation settings
+    bool    mouse_enabled;        // SNES mouse (controller port 2) enabled
+
     // Button mappings per input device
     button_map_t btnmap_kbd;      // Keyboard
     button_map_t btnmap_nes;      // NES/SNES gamepad

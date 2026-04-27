@@ -113,6 +113,10 @@ static inline uint get_psram_pin(void) {
 #define PS2_PIN_CLK  0
 #define PS2_PIN_DATA 1
 
+// PS/2 Mouse Pins (separate from keyboard; data must be CLK+1)
+#define PS2_MOUSE_CLK  17
+#define PS2_MOUSE_DATA 18
+
 // I2S Audio Pins
 #define I2S_DATA_PIN       26
 #define I2S_CLOCK_PIN_BASE 27
@@ -145,6 +149,10 @@ static inline uint get_psram_pin(void) {
 // PS/2 Keyboard Pins
 #define PS2_PIN_CLK  2
 #define PS2_PIN_DATA 3
+
+// PS/2 Mouse Pins (separate from keyboard; data must be CLK+1)
+#define PS2_MOUSE_CLK  0
+#define PS2_MOUSE_DATA 1
 
 // I2S Audio Pins
 #define I2S_DATA_PIN       9

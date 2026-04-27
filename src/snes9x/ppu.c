@@ -1389,6 +1389,29 @@ PPU_HOT uint8_t S9xGetCPU(uint16_t Address)
             return rv;
          }
 
+         if (IPPU.Controller == SNES_MOUSE)
+         {
+            /* Mouse streams a 32-bit packet on port 2. IPPU.Mouse[0] is
+             * laid out with the low 16 bits matching the joypad layout
+             * (so bits 15..0 get read first, MSB-first, via the ^15
+             * XOR). Bits 16..23 carry dx (sign in bit 23) and bits
+             * 24..31 carry dy (sign in bit 31), also clocked MSB-first
+             * within each byte. Extend the read past position 16 so the
+             * game actually sees the delta bytes. */
+            if (PPU.Joypad2ButtonReadPos >= 32)
+               return 1;
+            uint32_t p = PPU.Joypad2ButtonReadPos++;
+            uint32_t shift;
+            if (p < 16) {
+               shift = p ^ 15;          /* bits 15..0 */
+            } else if (p < 24) {
+               shift = 16 + (23 - p);   /* dx byte, MSB-first */
+            } else {
+               shift = 24 + (31 - p);   /* dy byte, MSB-first */
+            }
+            return (IPPU.Mouse[0] >> shift) & 1;
+         }
+
          if (PPU.Joypad2ButtonReadPos >= 16) /* Joypad 2 is enabled */
             return 1;
 

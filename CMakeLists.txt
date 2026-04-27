@@ -60,7 +60,8 @@ string(REPLACE " " "." FRANK_SNES_VERSION_STR "${FRANK_SNES_VERSION_RAW}")
 add_subdirectory(src/fatfs)
 add_subdirectory(drivers/sdcard)
 add_subdirectory(drivers/nespad)
-add_subdirectory(drivers/ps2kbd)
+add_subdirectory(drivers/ps2)
+add_subdirectory(src/ps2kbd)
 add_subdirectory(drivers/usbhid)
 
 # Driver library
@@ -144,7 +145,8 @@ target_include_directories(frank-snes PRIVATE
     drivers
     drivers/sdcard
     drivers/nespad
-    drivers/ps2kbd
+    drivers/ps2
+    src/ps2kbd
 )
 
 target_compile_definitions(frank-snes PRIVATE

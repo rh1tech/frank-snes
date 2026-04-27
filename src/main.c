@@ -47,6 +47,7 @@
 // Input drivers
 #include "nespad/nespad.h"
 #include "ps2kbd/ps2kbd_wrapper.h"
+#include "ps2/ps2.h"
 #ifdef USB_HID_ENABLED
 #include "usbhid/usbhid.h"
 #endif
@@ -478,8 +479,118 @@ uint32_t S9xReadJoypad(const int32_t port) {
     return joypad;
 }
 
+//=============================================================================
+// SNES Mouse (plugged into controller port 2).
+//
+// Pointer lives in screen space [0..255, 0..223]. Host mouse deltas (PS/2
+// and USB) are accumulated into this position each frame. Snes9x reads the
+// position via S9xReadMousePosition() when the emulated controller is
+// SNES_MOUSE and turns position deltas into SNES mouse packets.
+//=============================================================================
+
+static int32_t  snes_mouse_x = 128;
+static int32_t  snes_mouse_y = 112;
+static uint32_t snes_mouse_buttons = 0;
+
+static inline void snes_mouse_apply_delta(int16_t dx, int16_t dy, uint8_t buttons) {
+    // Free-running accumulator — do NOT clamp to screen bounds. Snes9x
+    // reads our value and diffs it against its own previous sample to
+    // produce per-frame motion packets for the SNES mouse, then the game
+    // handles on-screen cursor bounds itself. Clamping here silently
+    // swallows real mouse motion once the accumulator hits 0 or 255,
+    // which shows up as "can't move left/up anymore until I move the
+    // opposite direction first".
+    snes_mouse_x += (int32_t)dx;
+    snes_mouse_y += (int32_t)dy;
+
+    // PS/2/USB buttons: bit0=left, bit1=right, bit2=middle.
+    // SNES mouse returns bit0=left, bit1=right (via the PPU code).
+    snes_mouse_buttons = (uint32_t)(buttons & 0x03);
+}
+
+static void poll_host_mouse(void) {
+    if (!g_settings.mouse_enabled) return;
+
+    // PS/2 mouse (streaming via ps2_mouse_poll + get_state)
+    if (ps2_mouse_is_initialized()) {
+        int16_t dx = 0, dy = 0;
+        int8_t wheel = 0;
+        uint8_t btns = 0;
+        if (ps2_mouse_get_state(&dx, &dy, &wheel, &btns)) {
+            // On this board/driver the raw axes are swapped AND both
+            // signs are inverted relative to screen space.
+            //   raw dy -> screen X, negated  (right hand = +x on screen)
+            //   raw dx -> screen Y, negated  (down hand  = +y on screen)
+            snes_mouse_apply_delta((int16_t)-dy, (int16_t)dx, btns);
+            LOG("[mouse ps2] dx=%d dy=%d btn=0x%02X -> pos=(%ld,%ld)\n",
+                (int)dx, (int)dy, btns,
+                (long)snes_mouse_x, (long)snes_mouse_y);
+        } else {
+            // Still need to refresh button state even when no motion.
+            uint32_t new_btn = (uint32_t)(btns & 0x03);
+            if (new_btn != snes_mouse_buttons) {
+                LOG("[mouse ps2] btn-only 0x%02X -> 0x%02X\n",
+                    (unsigned)snes_mouse_buttons, (unsigned)new_btn);
+                snes_mouse_buttons = new_btn;
+            }
+        }
+    }
+
+#ifdef USB_HID_ENABLED
+    if (usbhid_mouse_connected()) {
+        usbhid_mouse_state_t m;
+        usbhid_get_mouse_state(&m);
+        if (m.has_motion || m.dx || m.dy || m.buttons) {
+            // Same axis swap + inversion the PS/2 path needed on this
+            // build: raw dx/dy are rotated/flipped relative to screen
+            // space. raw dy -> screen -x, raw dx -> screen +y.
+            snes_mouse_apply_delta((int16_t)-m.dy, (int16_t)m.dx, m.buttons);
+            LOG("[mouse usb] dx=%d dy=%d btn=0x%02X -> pos=(%ld,%ld)\n",
+                (int)m.dx, (int)m.dy, m.buttons,
+                (long)snes_mouse_x, (long)snes_mouse_y);
+        }
+    }
+#endif
+
+    // Once-per-second heartbeat so we can tell whether the mouse pipeline
+    // is alive even when no motion is arriving. Shows PS/2 init state,
+    // raw-byte count from the IRQ, packet count, ring depth, and errors.
+    static uint32_t last_heartbeat_us = 0;
+    uint32_t now_us = time_us_32();
+    if ((now_us - last_heartbeat_us) >= 1000000u) {
+        last_heartbeat_us = now_us;
+        uint32_t raw = 0, pkts = 0, ring = 0;
+        uint32_t ferr = 0, perr = 0, serr = 0;
+        ps2_mouse_get_counters(&raw, &pkts, &ring);
+        ps2_mouse_get_errors(&ferr, &perr, &serr);
+        uint32_t fifo = ps2_mouse_pio_fifo_level();
+        LOG("[mouse hb] ps2_init=%d wheel=%d fifo=%lu raw=%lu pkts=%lu ring=%lu "
+            "frame=%lu parity=%lu sync=%lu "
+#ifdef USB_HID_ENABLED
+            "usb=%d "
+#endif
+            "pos=(%ld,%ld) btn=0x%02X enabled=%d\n",
+            (int)ps2_mouse_is_initialized(),
+            (int)ps2_mouse_has_wheel(),
+            (unsigned long)fifo,
+            (unsigned long)raw, (unsigned long)pkts, (unsigned long)ring,
+            (unsigned long)ferr, (unsigned long)perr, (unsigned long)serr,
+#ifdef USB_HID_ENABLED
+            (int)usbhid_mouse_connected(),
+#endif
+            (long)snes_mouse_x, (long)snes_mouse_y,
+            (unsigned)snes_mouse_buttons,
+            (int)g_settings.mouse_enabled);
+    }
+}
+
 bool S9xReadMousePosition(int32_t which1, int32_t *x, int32_t *y, uint32_t *buttons) {
-    return false;
+    if (which1 != 0) return false;
+    if (!g_settings.mouse_enabled) return false;
+    if (x) *x = snes_mouse_x;
+    if (y) *y = snes_mouse_y;
+    if (buttons) *buttons = snes_mouse_buttons;
+    return true;
 }
 
 bool S9xReadSuperScopePosition(int32_t *x, int32_t *y, uint32_t *buttons) {
@@ -503,12 +614,20 @@ static inline void snes9x_init(void) {
     Settings.H_Max = SNES_CYCLES_PER_SCANLINE;
     Settings.FrameTimePAL = 20000;
     Settings.FrameTimeNTSC = 16667;
-    Settings.ControllerOption = SNES_JOYPAD;
+    // When the SNES mouse is enabled, put the port-2 controller in mouse
+    // mode. S9xProcessMouse() only writes IPPU.Joypads[1] while the
+    // active controller is SNES_MOUSE, so without this the game never
+    // sees the mouse — pointer moves in our code but nothing reaches
+    // the emulated bus.
+    Settings.ControllerOption = g_settings.mouse_enabled ? SNES_MOUSE
+                                                         : SNES_JOYPAD;
     Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
     Settings.SoundPlaybackRate = AUDIO_SAMPLE_RATE;
     Settings.DisableSoundEcho = !g_settings.echo_enabled;
     Settings.InterpolatedSound = g_settings.interpolation;
     Settings.Mute = (g_settings.volume == 0);
+    Settings.Mouse = g_settings.mouse_enabled;
+    Settings.MouseMaster = g_settings.mouse_enabled;
 
     S9xInitDisplay();
     S9xInitMemory();
@@ -908,6 +1027,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 #ifdef USB_HID_ENABLED
         usbhid_task();
 #endif
+        poll_host_mouse();
 
         /* F11 = back to ROM selector. Edge-triggered so holding F11 past
          * the selector return doesn't immediately fire again. */
@@ -1455,7 +1575,7 @@ int main(void) {
 #if CPU_CLOCK_MHZ > 252
     vreg_disable_voltage_limit();
     vreg_set_voltage(CPU_VOLTAGE);
-    set_flash_timings(CPU_CLOCK_MHZ, 88);
+    set_flash_timings(CPU_CLOCK_MHZ, 66);
     sleep_ms(100);
 #endif
     
@@ -1465,10 +1585,14 @@ int main(void) {
     }
     
     stdio_init_all();
-#if PICO_STDIO_USB
-    // Wait up to 2s for USB CDC to enumerate so boot messages are visible
-    for (int i = 0; i < 20 && !stdio_usb_connected(); i++)
-        sleep_ms(100);
+#if LIB_PICO_STDIO_USB
+    // Dev builds (USB_HID=0): USB CDC is the stdio sink. Wait until the
+    // host terminal opens the port, THEN sleep 3 more seconds before any
+    // LOG() fires, so the whole boot log lands in the console.
+    while (!stdio_usb_connected()) {
+        sleep_ms(10);
+    }
+    sleep_ms(3000);
 #endif
     
     LOG("\n\n");
@@ -1548,9 +1672,18 @@ int main(void) {
     LOG("NES/SNES gamepad not configured (NESPAD_GPIO_CLK not defined)\n");
 #endif
 
-    // Initialize PS/2 keyboard
+    // Initialize PS/2 keyboard + mouse on the shared PS/2 driver (pio2).
+    // ps2kbd_init() calls ps2_init() internally to claim keyboard + mouse
+    // state machines on the same PIO. Then bring up the mouse device.
     ps2kbd_init();
     LOG("PS/2 keyboard initialized\n");
+
+    if (ps2_mouse_init_device()) {
+        LOG("PS/2 mouse initialized%s\n",
+            ps2_mouse_has_wheel() ? " (IntelliMouse)" : "");
+    } else {
+        LOG("PS/2 mouse not detected (will remain inactive)\n");
+    }
 
 #ifdef USB_HID_ENABLED
     // Initialize USB HID

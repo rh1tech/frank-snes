@@ -14,6 +14,7 @@ BOARD_VARIANT="${1:?Usage: ./build.sh <M1|M2> [CPU_SPEED] [PSRAM_SPEED]}"
 : "${FRANK_SNES_SUPERFX_DIAG:=OFF}"
 : "${FRANK_SNES_AUTOBOOT:=OFF}"
 : "${FRANK_SNES_AUTOPAD:=OFF}"
+: "${USB_HID_ENABLED:=OFF}"
 
 cmake \
 	-DPICO_PLATFORM=rp2350 \
@@ -25,6 +26,6 @@ cmake \
 	-DBOARD_VARIANT=${BOARD_VARIANT} \
 	-DCPU_SPEED=${CPU_SPEED} \
 	-DPSRAM_SPEED=${PSRAM_SPEED} \
-	-DUSB_HID_ENABLED=OFF \
+	-DUSB_HID_ENABLED=${USB_HID_ENABLED} \
 	..
 make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)

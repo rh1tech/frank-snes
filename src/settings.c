@@ -67,6 +67,7 @@ typedef enum {
     MAIN_PLAYER1,
     MAIN_PLAYER2,
     MAIN_BUTTONS,
+    MAIN_MOUSE,
     MAIN_SEP2,
     MAIN_SAVE_GAME,
     MAIN_LOAD_GAME,
@@ -104,6 +105,7 @@ typedef enum {
     AUDIO_ITEM_COUNT
 } audio_item_t;
 
+
 /* Global settings with defaults */
 settings_t g_settings = {
     .p1_mode = INPUT_MODE_ANY,
@@ -119,6 +121,7 @@ settings_t g_settings = {
     .crt_overscan = false,
     .echo_enabled = false,
     .interpolation = true,
+    .mouse_enabled = true,
     .btnmap_kbd = BTNMAP_DEFAULT,
     .btnmap_nes = BTNMAP_DEFAULT,
     .btnmap_usb = BTNMAP_DEFAULT,
@@ -455,6 +458,7 @@ static const char *main_label(int item) {
         case MAIN_SAVE_GAME: return (status_frames > 0) ? status_msg : "SAVE GAME";
         case MAIN_LOAD_GAME: return save_exists ? "LOAD GAME" : "LOAD GAME (-)";
         case MAIN_BUTTONS:   return "BUTTON MAPPING...";
+        case MAIN_MOUSE:     return "SNES MOUSE";
         case MAIN_VIDEO:     return "VIDEO SETTINGS...";
         case MAIN_AUDIO:     return "AUDIO SETTINGS...";
         case MAIN_RESTART:   return "RESTART GAME";
@@ -482,6 +486,8 @@ static const char *main_value(int item) {
             return input_mode_names[edit.p1_mode];
         case MAIN_PLAYER2:
             return input_mode_names[edit.p2_mode];
+        case MAIN_MOUSE:
+            return edit.mouse_enabled ? "ON" : "OFF";
         default:
             return NULL;
     }
@@ -540,6 +546,9 @@ static void main_change_value(int item, int dir) {
             }
             break;
         }
+        case MAIN_MOUSE:
+            edit.mouse_enabled = !edit.mouse_enabled;
+            break;
         default:
             break;
     }
@@ -624,6 +633,7 @@ static void audio_change_value(int item, int dir) {
         default: break;
     }
 }
+
 
 /* ─── Item helpers (button mapping device selector) ───────────────── */
 
@@ -923,6 +933,8 @@ void settings_load(void) {
             g_settings.echo_enabled = (atoi(value) != 0);
         } else if (strcmp(key, "interpolation") == 0) {
             g_settings.interpolation = (atoi(value) != 0);
+        } else if (strcmp(key, "mouse_enabled") == 0) {
+            g_settings.mouse_enabled = (atoi(value) != 0);
         } else if (strcmp(key, "btnmap_kbd") == 0) {
             sscanf(value, "%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",
                    &g_settings.btnmap_kbd.map[0], &g_settings.btnmap_kbd.map[1],
@@ -988,6 +1000,7 @@ bool settings_save(void) {
     f_printf(&file, "crt_overscan=%d\n", g_settings.crt_overscan ? 1 : 0);
     f_printf(&file, "echo=%d\n", g_settings.echo_enabled ? 1 : 0);
     f_printf(&file, "interpolation=%d\n", g_settings.interpolation ? 1 : 0);
+    f_printf(&file, "mouse_enabled=%d\n", g_settings.mouse_enabled ? 1 : 0);
     f_printf(&file, "btnmap_kbd=%d,%d,%d,%d,%d,%d,%d,%d\n",
              g_settings.btnmap_kbd.map[0], g_settings.btnmap_kbd.map[1],
              g_settings.btnmap_kbd.map[2], g_settings.btnmap_kbd.map[3],
@@ -1028,6 +1041,10 @@ void settings_apply_runtime(void) {
     Settings.DisableSoundEcho = !g_settings.echo_enabled;
     Settings.InterpolatedSound = g_settings.interpolation;
     Settings.Mute = (g_settings.volume == 0);
+
+    /* Emulation: SNES Mouse (plugged into port 2) */
+    Settings.Mouse = g_settings.mouse_enabled;
+    Settings.MouseMaster = g_settings.mouse_enabled;
 
     /* CRT effect */
     graphics_set_crt_active(g_settings.crt_effect);

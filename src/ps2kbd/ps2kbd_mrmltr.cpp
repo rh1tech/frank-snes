@@ -9,13 +9,8 @@
 // https://wiki.osdev.org/PS/2_Keyboard
 //
 #include "ps2kbd_mrmltr.h"
+#include "ps2/ps2.h"
 #include <cstdio>
-#if KBD_CLOCK_PIN == 2
-#include "ps2kbd_mrmltr2.pio.h"
-#else
-#include "ps2kbd_mrmltr.pio.h"
-#endif
-#include "hardware/clocks.h"
 
 #ifdef DEBUG_PS2
 #define DBG_PRINTF(...) printf(__VA_ARGS__)
@@ -162,9 +157,8 @@ static uint8_t ps2kbd_page_0[] {
 };
 
 
-Ps2Kbd_Mrmltr::Ps2Kbd_Mrmltr(PIO pio, uint base_gpio, std::function<void(hid_keyboard_report_t *curr, hid_keyboard_report_t *prev)> keyHandler) :
-  _pio(pio),
-  _base_gpio(base_gpio),
+Ps2Kbd_Mrmltr::Ps2Kbd_Mrmltr(std::function<void(hid_keyboard_report_t *curr, hid_keyboard_report_t *prev)> keyHandler) :
+  _action(0),
   _double(false),
   _overflow(false),
   _keyHandler(keyHandler)
@@ -332,31 +326,18 @@ void Ps2Kbd_Mrmltr::handleActions() {
 }
 
 void Ps2Kbd_Mrmltr::tick() {
-  if (pio_sm_is_rx_fifo_full(_pio, _sm)) {
-    DBG_PRINTF("PS/2 keyboard PIO overflow\n");
-    _overflow = true;
-    while (!pio_sm_is_rx_fifo_empty(_pio, _sm)) {
-      // pull a scan code from the PIO SM fifo
-      uint32_t rc = _pio->rxf[_sm];    
-      printf("PS/2 drain rc %4.4lX (%ld)\n", (unsigned long)rc, (long)rc);
-    }
-    clearHidKeys();
-    clearActions();
-  }
-  
-  while (!pio_sm_is_rx_fifo_empty(_pio, _sm)) {
-    // pull a scan code from the PIO SM fifo
-    uint32_t rc = _pio->rxf[_sm];    
-    DBG_PRINTF("PS/2 rc %4.4lX (%ld)\n", (unsigned long)rc, (long)rc);
-    
-    uint32_t code = (rc << 2) >> 24;
+  // Pull decoded PS/2 bytes from the unified driver (set 2 scan codes).
+  while (ps2_kbd_has_data()) {
+    int rc = ps2_kbd_get_byte();
+    if (rc < 0) continue;
+    uint32_t code = (uint32_t)rc & 0xFFu;
     DBG_PRINTF("PS/2 keycode %2.2lX (%ld)\n", (unsigned long)code, (long)code);
 
-    // TODO Handle PS/2 overflow/error messages
+    // Handle PS/2 overflow/error messages
     switch (code) {
       case 0xaa: {
          DBG_PRINTF("PS/2 keyboard Self test passed\n");
-         break;       
+         break;
       }
       case 0xe1: {
         _double = true;
@@ -371,7 +352,7 @@ void Ps2Kbd_Mrmltr::tick() {
         break;
       }
       default: {
-        _actions[_action].code = code;
+        _actions[_action].code = (uint8_t)code;
         if (_double) {
           _action = 1;
           _double = false;
@@ -384,44 +365,4 @@ void Ps2Kbd_Mrmltr::tick() {
       }
     }
   }
-}
-
-// TODO Error checking and reporting
-void Ps2Kbd_Mrmltr::init_gpio() {
-    // init KBD pins to input
-    gpio_init(_base_gpio);     // Data
-    gpio_init(_base_gpio + 1); // Clock
-    // with pull up
-    gpio_pull_up(_base_gpio);
-    gpio_pull_up(_base_gpio + 1);
-    // get a state machine
-    _sm = pio_claim_unused_sm(_pio, true);
-    // reserve program space in SM memory
-#if KBD_CLOCK_PIN == 2
-    uint offset = pio_add_program(_pio, &m2ps2kbd_program);
-#else
-    uint offset = pio_add_program(_pio, &ps2kbd_program);
-#endif
-    // Set pin directions base
-    pio_sm_set_consecutive_pindirs(_pio, _sm, _base_gpio, 2, false);
-    // program the start and wrap SM registers
-#if KBD_CLOCK_PIN == 2
-    pio_sm_config c = m2ps2kbd_program_get_default_config(offset);
-#else
-    pio_sm_config c = ps2kbd_program_get_default_config(offset);
-#endif
-    // Set the base input pin. pin index 0 is DAT, index 1 is CLK  // Murmulator: 0->CLK 1->DAT ( _base_gpio + 1)
-    //  sm_config_set_in_pins(&c, _base_gpio);
-    sm_config_set_in_pins(&c, _base_gpio + 1);
-    // Shift 8 bits to the right, autopush enabled
-    sm_config_set_in_shift(&c, true, true, 10);
-    // Deeper FIFO as we're not doing any TX
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
-    // We don't expect clock faster than 16.7KHz and want no less
-    // than 8 SM cycles per keyboard clock.
-    float div = (float)clock_get_hz(clk_sys) / (8 * 16700);
-    sm_config_set_clkdiv(&c, div);
-    // Ready to go
-    pio_sm_init(_pio, _sm, offset, &c);
-    pio_sm_set_enabled(_pio, _sm, true);
 }
