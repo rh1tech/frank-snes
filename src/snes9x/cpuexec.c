@@ -102,7 +102,7 @@ void S9xClearIRQ(uint32_t source)
    CLEAR_IRQ_SOURCE(source);
 }
 
-void S9xDoHBlankProcessing()
+CPU_HOT void S9xDoHBlankProcessing()
 {
    CPU.WaitCounter++;
    switch (CPU.WhichEvent)
