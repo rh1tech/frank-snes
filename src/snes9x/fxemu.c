@@ -8,7 +8,33 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Place every opcode handler in SRAM so the hot dispatch loop never pays
+ * XIP cache misses fetching instruction code from flash.  Each handler is
+ * tiny (30-120 bytes) and the total fits easily into RP2350 SRAM. */
+#ifdef PICO_ON_DEVICE
+#define FX_OP __attribute__((hot, section(".time_critical.fx_op")))
+#else
+#define FX_OP
+#endif
+
 FxRegs_s GSU;
+
+/* --- Diagnostics --- */
+#ifdef FRANK_SNES_SUPERFX_DIAG
+volatile uint32_t g_gsu_call_count = 0;
+volatile uint32_t g_gsu_inst_count = 0;
+volatile uint32_t g_gsu_plot_count = 0;
+volatile uint32_t g_gsu_start_fail = 0;
+volatile uint32_t g_gsu_stop_count = 0;
+volatile uint32_t g_gsu_last_scmr = 0;
+volatile uint32_t g_gsu_last_scbr = 0;
+volatile uint32_t g_gsu_last_mode = 0;
+volatile uint32_t g_gsu_plot_xmin = 255;
+volatile uint32_t g_gsu_plot_xmax = 0;
+volatile uint32_t g_gsu_plot_ymin = 255;
+volatile uint32_t g_gsu_plot_ymax = 0;
+volatile uint32_t g_gsu_plot_colors = 0;  /* bitmask of seen color bytes lo nibble */
+#endif
 
 /* --- Internal macros --- */
 
@@ -62,7 +88,7 @@ FxRegs_s GSU;
 
 /* --- Plot/Rpix functions --- */
 
-static void fx_plot_2bit(void)
+FX_OP static void fx_plot_2bit(void)
 {
    uint32_t x = USEX8(R1);
    uint32_t y = USEX8(R2);
@@ -70,13 +96,16 @@ static void fx_plot_2bit(void)
    R15++; CLRFLAGS; R1++;
    c = (POR & 0x02) ? ((x ^ y) & 1 ? (uint8_t)(COLR >> 4) : (uint8_t)COLR) : (uint8_t)COLR;
    if (!(POR & 0x01) && !(c & 0xf)) return;
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_plot_count++;
+#endif
    a = GSU.apvScreen[y >> 3] + GSU.x[x >> 3] + ((y & 7) << 1);
    v = 128 >> (x & 7);
    if (c & 0x01) a[0] |= v; else a[0] &= ~v;
    if (c & 0x02) a[1] |= v; else a[1] &= ~v;
 }
 
-static void fx_rpix_2bit(void)
+FX_OP static void fx_rpix_2bit(void)
 {
    uint32_t x = USEX8(R1);
    uint32_t y = USEX8(R2);
@@ -88,7 +117,7 @@ static void fx_rpix_2bit(void)
    TESTR14;
 }
 
-static void fx_plot_4bit(void)
+FX_OP static void fx_plot_4bit(void)
 {
    uint32_t x = USEX8(R1);
    uint32_t y = USEX8(R2);
@@ -96,6 +125,9 @@ static void fx_plot_4bit(void)
    R15++; CLRFLAGS; R1++;
    c = (POR & 0x02) ? ((x ^ y) & 1 ? (uint8_t)(COLR >> 4) : (uint8_t)COLR) : (uint8_t)COLR;
    if (!(POR & 0x01) && !(c & 0xf)) return;
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_plot_count++;
+#endif
    a = GSU.apvScreen[y >> 3] + GSU.x[x >> 3] + ((y & 7) << 1);
    v = 128 >> (x & 7);
    if (c & 0x01) a[0x00] |= v; else a[0x00] &= ~v;
@@ -104,7 +136,7 @@ static void fx_plot_4bit(void)
    if (c & 0x08) a[0x11] |= v; else a[0x11] &= ~v;
 }
 
-static void fx_rpix_4bit(void)
+FX_OP static void fx_rpix_4bit(void)
 {
    uint32_t x = USEX8(R1);
    uint32_t y = USEX8(R2);
@@ -119,7 +151,7 @@ static void fx_rpix_4bit(void)
    TESTR14;
 }
 
-static void fx_plot_8bit(void)
+FX_OP static void fx_plot_8bit(void)
 {
    uint32_t x = USEX8(R1);
    uint32_t y = USEX8(R2);
@@ -128,6 +160,14 @@ static void fx_plot_8bit(void)
    c = (uint8_t)COLR;
    if (!(POR & 0x10)) { if (!(POR & 0x01) && !(c & 0xf)) return; }
    else if (!(POR & 0x01) && !c) return;
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_plot_count++;
+   if (x < g_gsu_plot_xmin) g_gsu_plot_xmin = x;
+   if (x > g_gsu_plot_xmax) g_gsu_plot_xmax = x;
+   if (y < g_gsu_plot_ymin) g_gsu_plot_ymin = y;
+   if (y > g_gsu_plot_ymax) g_gsu_plot_ymax = y;
+   g_gsu_plot_colors |= (1u << (c & 0x1F));
+#endif
    a = GSU.apvScreen[y >> 3] + GSU.x[x >> 3] + ((y & 7) << 1);
    v = 128 >> (x & 7);
    if (c & 0x01) a[0x00] |= v; else a[0x00] &= ~v;
@@ -140,7 +180,7 @@ static void fx_plot_8bit(void)
    if (c & 0x80) a[0x31] |= v; else a[0x31] &= ~v;
 }
 
-static void fx_rpix_8bit(void)
+FX_OP static void fx_rpix_8bit(void)
 {
    uint32_t x = USEX8(R1);
    uint32_t y = USEX8(R2);
@@ -160,7 +200,7 @@ static void fx_rpix_8bit(void)
    TESTR14;
 }
 
-static void fx_obj_func(void) { }
+FX_OP static void fx_obj_func(void) { }
 
 static void (*fx_plot_table[])(void) = {
    &fx_plot_2bit, &fx_plot_4bit, &fx_plot_4bit, &fx_plot_8bit, &fx_obj_func,
@@ -170,8 +210,11 @@ static void (*fx_plot_table[])(void) = {
 /* --- Opcode implementations --- */
 
 /* 00 - stop */
-static void fx_stop(void)
+FX_OP static void fx_stop(void)
 {
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_stop_count++;
+#endif
    CF(G);
    GSU.vCounter = 0;
    GSU.vInstCount = GSU.vCounter;
@@ -184,10 +227,10 @@ static void fx_stop(void)
 }
 
 /* 01 - nop */
-static void fx_nop(void) { CLRFLAGS; R15++; }
+FX_OP static void fx_nop(void) { CLRFLAGS; R15++; }
 
 /* 02 - cache */
-static void fx_cache(void)
+FX_OP static void fx_cache(void)
 {
    uint32_t c = R15 & 0xfff0;
    if (GSU.vCacheBaseReg != c || !GSU.bCacheActive) {
@@ -199,7 +242,7 @@ static void fx_cache(void)
 }
 
 /* 03 - lsr */
-static void fx_lsr(void)
+FX_OP static void fx_lsr(void)
 {
    GSU.vCarry = SREG & 1;
    uint32_t v = USEX16(SREG) >> 1;
@@ -207,7 +250,7 @@ static void fx_lsr(void)
 }
 
 /* 04 - rol */
-static void fx_rol(void)
+FX_OP static void fx_rol(void)
 {
    uint32_t v = USEX16((SREG << 1) + GSU.vCarry);
    GSU.vCarry = (SREG >> 15) & 1;
@@ -215,7 +258,7 @@ static void fx_rol(void)
 }
 
 /* 05 - bra */
-static void fx_bra(void)
+FX_OP static void fx_bra(void)
 {
    uint8_t v = PIPE; R15++; FETCHPIPE; R15 += SEX8(v);
 }
@@ -228,19 +271,19 @@ static void fx_bra(void)
 
 #define BRA_COND(cond) { uint8_t v = PIPE; R15++; FETCHPIPE; if (cond) R15 += SEX8(v); else R15++; }
 
-static void fx_blt(void) { BRA_COND((TEST_S != 0) != (TEST_OV != 0)); }
-static void fx_bge(void) { BRA_COND((TEST_S != 0) == (TEST_OV != 0)); }
-static void fx_bne(void) { BRA_COND(!TEST_Z); }
-static void fx_beq(void) { BRA_COND(TEST_Z); }
-static void fx_bpl(void) { BRA_COND(!TEST_S); }
-static void fx_bmi(void) { BRA_COND(TEST_S); }
-static void fx_bcc(void) { BRA_COND(!TEST_CY); }
-static void fx_bcs(void) { BRA_COND(TEST_CY); }
-static void fx_bvc(void) { BRA_COND(!TEST_OV); }
-static void fx_bvs(void) { BRA_COND(TEST_OV); }
+FX_OP static void fx_blt(void) { BRA_COND((TEST_S != 0) != (TEST_OV != 0)); }
+FX_OP static void fx_bge(void) { BRA_COND((TEST_S != 0) == (TEST_OV != 0)); }
+FX_OP static void fx_bne(void) { BRA_COND(!TEST_Z); }
+FX_OP static void fx_beq(void) { BRA_COND(TEST_Z); }
+FX_OP static void fx_bpl(void) { BRA_COND(!TEST_S); }
+FX_OP static void fx_bmi(void) { BRA_COND(TEST_S); }
+FX_OP static void fx_bcc(void) { BRA_COND(!TEST_CY); }
+FX_OP static void fx_bcs(void) { BRA_COND(TEST_CY); }
+FX_OP static void fx_bvc(void) { BRA_COND(!TEST_OV); }
+FX_OP static void fx_bvs(void) { BRA_COND(TEST_OV); }
 
 /* 10-1F - to rn / move rn */
-static void fx_to(void)
+FX_OP static void fx_to(void)
 {
    uint32_t reg = CUR_REG;
    if (TF(B)) {
@@ -255,7 +298,7 @@ static void fx_to(void)
 }
 
 /* 20-2F - with rn */
-static void fx_with(void)
+FX_OP static void fx_with(void)
 {
    SF(B);
    GSU.pvSreg = GSU.pvDreg = &GSU.avReg[CUR_REG];
@@ -263,7 +306,7 @@ static void fx_with(void)
 }
 
 /* 30-3B - stw (rn) */
-static void fx_stw(void)
+FX_OP static void fx_stw(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vLastRamAdr = GSU.avReg[reg];
@@ -273,7 +316,7 @@ static void fx_stw(void)
 }
 
 /* 30-3B(ALT1) - stb (rn) */
-static void fx_stb(void)
+FX_OP static void fx_stb(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vLastRamAdr = GSU.avReg[reg];
@@ -282,7 +325,7 @@ static void fx_stb(void)
 }
 
 /* 3C - loop */
-static void fx_loop(void)
+FX_OP static void fx_loop(void)
 {
    GSU.vSign = GSU.vZero = --R12;
    if ((uint16_t)R12 != 0) R15 = R13; else R15++;
@@ -290,12 +333,12 @@ static void fx_loop(void)
 }
 
 /* 3D-3F - alt mode set */
-static void fx_alt1(void) { SF(ALT1); CF(B); R15++; }
-static void fx_alt2(void) { SF(ALT2); CF(B); R15++; }
-static void fx_alt3(void) { SF(ALT1); SF(ALT2); CF(B); R15++; }
+FX_OP static void fx_alt1(void) { SF(ALT1); CF(B); R15++; }
+FX_OP static void fx_alt2(void) { SF(ALT2); CF(B); R15++; }
+FX_OP static void fx_alt3(void) { SF(ALT1); SF(ALT2); CF(B); R15++; }
 
 /* 40-4B - ldw (rn) */
-static void fx_ldw(void)
+FX_OP static void fx_ldw(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vLastRamAdr = GSU.avReg[reg];
@@ -305,7 +348,7 @@ static void fx_ldw(void)
 }
 
 /* 40-4B(ALT1) - ldb (rn) */
-static void fx_ldb(void)
+FX_OP static void fx_ldb(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vLastRamAdr = GSU.avReg[reg];
@@ -314,7 +357,7 @@ static void fx_ldb(void)
 }
 
 /* 4D - swap */
-static void fx_swap(void)
+FX_OP static void fx_swap(void)
 {
    uint8_t c = (uint8_t)SREG, d = (uint8_t)(SREG >> 8);
    uint32_t v = (((uint32_t)c) << 8) | ((uint32_t)d);
@@ -322,7 +365,7 @@ static void fx_swap(void)
 }
 
 /* 4E - color */
-static void fx_color(void)
+FX_OP static void fx_color(void)
 {
    uint8_t c = (uint8_t)SREG;
    if (POR & 0x04) c = (c & 0xf0) | (c >> 4);
@@ -332,7 +375,7 @@ static void fx_color(void)
 }
 
 /* 4E(ALT1) - cmode */
-static void fx_cmode(void)
+FX_OP static void fx_cmode(void)
 {
    POR = SREG;
    if (POR & 0x10) GSU.vScreenHeight = 256;
@@ -342,14 +385,14 @@ static void fx_cmode(void)
 }
 
 /* 4F - not */
-static void fx_not(void)
+FX_OP static void fx_not(void)
 {
    uint32_t v = ~SREG;
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 50-5F - add rn */
-static void fx_add(void)
+FX_OP static void fx_add(void)
 {
    uint32_t reg = CUR_REG;
    int32_t s = SUSEX16(SREG) + SUSEX16(GSU.avReg[reg]);
@@ -360,7 +403,7 @@ static void fx_add(void)
 }
 
 /* 50-5F(ALT1) - adc rn */
-static void fx_adc(void)
+FX_OP static void fx_adc(void)
 {
    uint32_t reg = CUR_REG;
    int32_t s = SUSEX16(SREG) + SUSEX16(GSU.avReg[reg]) + SEX16(GSU.vCarry);
@@ -371,7 +414,7 @@ static void fx_adc(void)
 }
 
 /* 50-5F(ALT2) - add #n */
-static void fx_add_i(void)
+FX_OP static void fx_add_i(void)
 {
    uint32_t imm = CUR_REG;
    int32_t s = SUSEX16(SREG) + imm;
@@ -382,7 +425,7 @@ static void fx_add_i(void)
 }
 
 /* 50-5F(ALT3) - adc #n */
-static void fx_adc_i(void)
+FX_OP static void fx_adc_i(void)
 {
    uint32_t imm = CUR_REG;
    int32_t s = SUSEX16(SREG) + imm + SUSEX16(GSU.vCarry);
@@ -393,7 +436,7 @@ static void fx_adc_i(void)
 }
 
 /* 60-6F - sub rn */
-static void fx_sub(void)
+FX_OP static void fx_sub(void)
 {
    uint32_t reg = CUR_REG;
    int32_t s = SUSEX16(SREG) - SUSEX16(GSU.avReg[reg]);
@@ -404,7 +447,7 @@ static void fx_sub(void)
 }
 
 /* 60-6F(ALT1) - sbc rn */
-static void fx_sbc(void)
+FX_OP static void fx_sbc(void)
 {
    uint32_t reg = CUR_REG;
    int32_t s = SUSEX16(SREG) - SUSEX16(GSU.avReg[reg]) - (SUSEX16(GSU.vCarry ^ 1));
@@ -415,7 +458,7 @@ static void fx_sbc(void)
 }
 
 /* 60-6F(ALT2) - sub #n */
-static void fx_sub_i(void)
+FX_OP static void fx_sub_i(void)
 {
    uint32_t imm = CUR_REG;
    int32_t s = SUSEX16(SREG) - imm;
@@ -426,7 +469,7 @@ static void fx_sub_i(void)
 }
 
 /* 60-6F(ALT3) - cmp rn */
-static void fx_cmp(void)
+FX_OP static void fx_cmp(void)
 {
    uint32_t reg = CUR_REG;
    int32_t s = SUSEX16(SREG) - SUSEX16(GSU.avReg[reg]);
@@ -437,7 +480,7 @@ static void fx_cmp(void)
 }
 
 /* 70 - merge */
-static void fx_merge(void)
+FX_OP static void fx_merge(void)
 {
    uint32_t v = (R7 & 0xff00) | ((R8 & 0xff00) >> 8);
    R15++; DREG = v;
@@ -449,63 +492,63 @@ static void fx_merge(void)
 }
 
 /* 71-7F - and rn */
-static void fx_and(void)
+FX_OP static void fx_and(void)
 {
    uint32_t v = SREG & GSU.avReg[CUR_REG];
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 71-7F(ALT1) - bic rn */
-static void fx_bic(void)
+FX_OP static void fx_bic(void)
 {
    uint32_t v = SREG & ~GSU.avReg[CUR_REG];
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 71-7F(ALT2) - and #n */
-static void fx_and_i(void)
+FX_OP static void fx_and_i(void)
 {
    uint32_t v = SREG & CUR_REG;
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 71-7F(ALT3) - bic #n */
-static void fx_bic_i(void)
+FX_OP static void fx_bic_i(void)
 {
    uint32_t v = SREG & ~((uint32_t)CUR_REG);
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 80-8F - mult rn (signed 8x8→16) */
-static void fx_mult(void)
+FX_OP static void fx_mult(void)
 {
    uint32_t v = (uint32_t)(SEX8(SREG) * SEX8(GSU.avReg[CUR_REG]));
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 80-8F(ALT1) - umult rn (unsigned 8x8→16) */
-static void fx_umult(void)
+FX_OP static void fx_umult(void)
 {
    uint32_t v = USEX8(SREG) * USEX8(GSU.avReg[CUR_REG]);
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 80-8F(ALT2) - mult #n */
-static void fx_mult_i(void)
+FX_OP static void fx_mult_i(void)
 {
    uint32_t v = (uint32_t)(SEX8(SREG) * ((int32_t)CUR_REG));
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 80-8F(ALT3) - umult #n */
-static void fx_umult_i(void)
+FX_OP static void fx_umult_i(void)
 {
    uint32_t v = USEX8(SREG) * ((uint32_t)CUR_REG);
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 90 - sbk */
-static void fx_sbk(void)
+FX_OP static void fx_sbk(void)
 {
    RAM(GSU.vLastRamAdr) = (uint8_t)SREG;
    RAM(GSU.vLastRamAdr ^ 1) = (uint8_t)(SREG >> 8);
@@ -513,21 +556,21 @@ static void fx_sbk(void)
 }
 
 /* 91-94 - link #n (opcode 0x91=link 1, 0x92=link 2, etc.) */
-static void fx_link(void)
+FX_OP static void fx_link(void)
 {
    R11 = R15 + CUR_REG;
    CLRFLAGS; R15++;
 }
 
 /* 95 - sex */
-static void fx_sex(void)
+FX_OP static void fx_sex(void)
 {
    uint32_t v = (uint32_t)SEX8(SREG);
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* 96 - asr */
-static void fx_asr(void)
+FX_OP static void fx_asr(void)
 {
    GSU.vCarry = SREG & 1;
    uint32_t v = (uint32_t)(SEX16(SREG) >> 1);
@@ -535,7 +578,7 @@ static void fx_asr(void)
 }
 
 /* 96(ALT1) - div2 */
-static void fx_div2(void)
+FX_OP static void fx_div2(void)
 {
    int32_t s = SEX16(SREG);
    GSU.vCarry = s & 1;
@@ -544,7 +587,7 @@ static void fx_div2(void)
 }
 
 /* 97 - ror */
-static void fx_ror(void)
+FX_OP static void fx_ror(void)
 {
    uint32_t v = (USEX16(SREG) >> 1) | (GSU.vCarry << 15);
    GSU.vCarry = SREG & 1;
@@ -552,14 +595,14 @@ static void fx_ror(void)
 }
 
 /* 98-9D - jmp rn */
-static void fx_jmp(void)
+FX_OP static void fx_jmp(void)
 {
    R15 = GSU.avReg[CUR_REG];
    CLRFLAGS;
 }
 
 /* 98-9D(ALT1) - ljmp rn */
-static void fx_ljmp(void)
+FX_OP static void fx_ljmp(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vPrgBankReg = GSU.avReg[reg] & 0x7f;
@@ -571,14 +614,14 @@ static void fx_ljmp(void)
 }
 
 /* 9E - lob */
-static void fx_lob(void)
+FX_OP static void fx_lob(void)
 {
    uint32_t v = USEX8(SREG);
    R15++; DREG = v; GSU.vSign = v << 8; GSU.vZero = v << 8; TESTR14; CLRFLAGS;
 }
 
 /* 9F - fmult (16x16→32, upper 16 bits) */
-static void fx_fmult(void)
+FX_OP static void fx_fmult(void)
 {
    uint32_t c = (uint32_t)(SEX16(SREG) * SEX16(R6));
    uint32_t v = c >> 16;
@@ -588,7 +631,7 @@ static void fx_fmult(void)
 }
 
 /* 9F(ALT1) - lmult (16x16→32, full result) */
-static void fx_lmult(void)
+FX_OP static void fx_lmult(void)
 {
    uint32_t c = (uint32_t)(SEX16(SREG) * SEX16(R6));
    R4 = c;
@@ -599,7 +642,7 @@ static void fx_lmult(void)
 }
 
 /* A0-AF - ibt rn,#pp */
-static void fx_ibt(void)
+FX_OP static void fx_ibt(void)
 {
    uint32_t reg = CUR_REG;
    uint8_t v = PIPE; R15++; FETCHPIPE; R15++;
@@ -609,7 +652,7 @@ static void fx_ibt(void)
 }
 
 /* A0-AF(ALT1) - lms rn,(yy) */
-static void fx_lms(void)
+FX_OP static void fx_lms(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vLastRamAdr = ((uint32_t)PIPE) << 1;
@@ -621,7 +664,7 @@ static void fx_lms(void)
 }
 
 /* A0-AF(ALT2) - sms (yy),rn */
-static void fx_sms(void)
+FX_OP static void fx_sms(void)
 {
    uint32_t reg = CUR_REG;
    uint32_t v = GSU.avReg[reg];
@@ -633,7 +676,7 @@ static void fx_sms(void)
 }
 
 /* B0-BF - from rn / moves rn */
-static void fx_from(void)
+FX_OP static void fx_from(void)
 {
    uint32_t reg = CUR_REG;
    if (TF(B)) {
@@ -649,42 +692,42 @@ static void fx_from(void)
 }
 
 /* C0 - hib */
-static void fx_hib(void)
+FX_OP static void fx_hib(void)
 {
    uint32_t v = USEX8(SREG >> 8);
    R15++; DREG = v; GSU.vSign = v << 8; GSU.vZero = v << 8; TESTR14; CLRFLAGS;
 }
 
 /* C1-CF - or rn */
-static void fx_or(void)
+FX_OP static void fx_or(void)
 {
    uint32_t v = SREG | GSU.avReg[CUR_REG];
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* C1-CF(ALT1) - xor rn */
-static void fx_xor(void)
+FX_OP static void fx_xor(void)
 {
    uint32_t v = SREG ^ GSU.avReg[CUR_REG];
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* C1-CF(ALT2) - or #n */
-static void fx_or_i(void)
+FX_OP static void fx_or_i(void)
 {
    uint32_t v = SREG | CUR_REG;
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* C1-CF(ALT3) - xor #n */
-static void fx_xor_i(void)
+FX_OP static void fx_xor_i(void)
 {
    uint32_t v = SREG ^ CUR_REG;
    R15++; DREG = v; GSU.vSign = v; GSU.vZero = v; TESTR14; CLRFLAGS;
 }
 
 /* D0-DE - inc rn */
-static void fx_inc(void)
+FX_OP static void fx_inc(void)
 {
    uint32_t reg = CUR_REG;
    GSU.avReg[reg]++;
@@ -694,7 +737,7 @@ static void fx_inc(void)
 }
 
 /* DF - getc */
-static void fx_getc(void)
+FX_OP static void fx_getc(void)
 {
    uint8_t c = GSU.vRomBuffer;
    if (POR & 0x04) c = (c & 0xf0) | (c >> 4);
@@ -704,7 +747,7 @@ static void fx_getc(void)
 }
 
 /* DF(ALT2) - ramb */
-static void fx_ramb(void)
+FX_OP static void fx_ramb(void)
 {
    GSU.vRamBankReg = SREG & (FX_RAM_BANKS - 1);
    GSU.pvRamBank = GSU.apvRamBank[GSU.vRamBankReg & 0x3];
@@ -712,7 +755,7 @@ static void fx_ramb(void)
 }
 
 /* DF(ALT3) - romb */
-static void fx_romb(void)
+FX_OP static void fx_romb(void)
 {
    GSU.vRomBankReg = USEX8(SREG) & 0x7f;
    GSU.pvRomBank = GSU.apvRomBank[GSU.vRomBankReg];
@@ -720,7 +763,7 @@ static void fx_romb(void)
 }
 
 /* E0-EE - dec rn */
-static void fx_dec(void)
+FX_OP static void fx_dec(void)
 {
    uint32_t reg = CUR_REG;
    GSU.avReg[reg]--;
@@ -730,35 +773,35 @@ static void fx_dec(void)
 }
 
 /* EF - getb */
-static void fx_getb(void)
+FX_OP static void fx_getb(void)
 {
    uint32_t v = (uint32_t)GSU.vRomBuffer;
    R15++; DREG = v; TESTR14; CLRFLAGS;
 }
 
 /* EF(ALT1) - getbh */
-static void fx_getbh(void)
+FX_OP static void fx_getbh(void)
 {
    uint32_t v = USEX8(SREG) | (USEX8(GSU.vRomBuffer) << 8);
    R15++; DREG = v; TESTR14; CLRFLAGS;
 }
 
 /* EF(ALT2) - getbl */
-static void fx_getbl(void)
+FX_OP static void fx_getbl(void)
 {
    uint32_t v = (SREG & 0xff00) | USEX8(GSU.vRomBuffer);
    R15++; DREG = v; TESTR14; CLRFLAGS;
 }
 
 /* EF(ALT3) - getbs */
-static void fx_getbs(void)
+FX_OP static void fx_getbs(void)
 {
    uint32_t v = SEX8(GSU.vRomBuffer);
    R15++; DREG = v; TESTR14; CLRFLAGS;
 }
 
 /* F0-FF - iwt rn,#xx */
-static void fx_iwt(void)
+FX_OP static void fx_iwt(void)
 {
    uint32_t reg = CUR_REG;
    uint32_t v = PIPE; R15++; FETCHPIPE; R15++;
@@ -769,7 +812,7 @@ static void fx_iwt(void)
 }
 
 /* F0-FF(ALT1) - lm rn,(xx) */
-static void fx_lm(void)
+FX_OP static void fx_lm(void)
 {
    uint32_t reg = CUR_REG;
    GSU.vLastRamAdr = PIPE; R15++; FETCHPIPE; R15++;
@@ -781,7 +824,7 @@ static void fx_lm(void)
 }
 
 /* F0-FF(ALT2) - sm (xx),rn */
-static void fx_sm(void)
+FX_OP static void fx_sm(void)
 {
    uint32_t reg = CUR_REG;
    uint32_t v = GSU.avReg[reg];
@@ -894,6 +937,11 @@ static void (*fx_opcode_table[1024])(void) =
 #define FX_HOT
 #endif
 
+/* All opcode handlers are now in .time_critical to avoid XIP cache misses
+ * on every dispatch.  They fit comfortably in SRAM.
+ * Applied retroactively to all `static void fx_...` above via objcopy — see
+ * CMake `set_source_files_properties` in the build rules. */
+
 FX_HOT static uint32_t fx_run(uint32_t nInstructions)
 {
    GSU.vCounter = nInstructions;
@@ -909,12 +957,12 @@ FX_HOT static uint32_t fx_run(uint32_t nInstructions)
 
 /* --- Register space read/write --- */
 
-static void fx_readRegisterSpaceForCheck(void)
+FX_OP static void fx_readRegisterSpaceForCheck(void)
 {
    R15 = (uint32_t)READ_WORD(&GSU.pvRegisters[30]);
 }
 
-static void fx_readRegisterSpaceForUse(void)
+FX_OP static void fx_readRegisterSpaceForUse(void)
 {
    static const uint32_t avHeight[] = { 128, 160, 192, 256 };
    static const uint32_t avMult[] = { 16, 32, 32, 64 };
@@ -970,12 +1018,12 @@ static void fx_readRegisterSpaceForUse(void)
       fx_computeScreenPointers();
 }
 
-static void fx_writeRegisterSpaceAfterCheck(void)
+FX_OP static void fx_writeRegisterSpaceAfterCheck(void)
 {
    WRITE_WORD(&GSU.pvRegisters[30], R15);
 }
 
-static void fx_writeRegisterSpaceAfterUse(void)
+FX_OP static void fx_writeRegisterSpaceAfterUse(void)
 {
    int32_t i;
    uint8_t *p = GSU.pvRegisters;
@@ -1113,17 +1161,31 @@ static bool fx_checkStartAddress(void)
 int32_t FxEmulate(uint32_t nInstructions)
 {
    uint32_t vCount;
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_call_count++;
+#endif
    fx_readRegisterSpaceForCheck();
 
    if (!fx_checkStartAddress()) {
+#ifdef FRANK_SNES_SUPERFX_DIAG
+      g_gsu_start_fail++;
+#endif
       CF(G);
       fx_writeRegisterSpaceAfterCheck();
       return 0;
    }
 
    fx_readRegisterSpaceForUse();
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_last_scmr = GSU.pvRegisters[GSU_SCMR];
+   g_gsu_last_scbr = GSU.pvRegisters[GSU_SCBR];
+   g_gsu_last_mode = GSU.vMode;
+#endif
    CF(IRQ);
    vCount = fx_run(nInstructions);
+#ifdef FRANK_SNES_SUPERFX_DIAG
+   g_gsu_inst_count += vCount;
+#endif
 
    fx_writeRegisterSpaceAfterCheck();
    fx_writeRegisterSpaceAfterUse();

@@ -3055,13 +3055,20 @@ void S9xUpdateScreen(void)
    if (IPPU.OBJChanged)
       S9xSetupOBJ();
 
-#ifndef NO_WINDOW_CLIPPING
-   if (PPU.RecomputeClipWindows)
-   {
-      ComputeClipWindows();
-      PPU.RecomputeClipWindows = false;
-   }
+#ifdef NO_WINDOW_CLIPPING
+   /* Window clipping disabled globally for performance, but SuperFX games
+    * (DOOM, Winter Gold, etc.) REQUIRE it to mask the 3D viewport borders.
+    * Without window clipping, garbled tile data is visible outside the
+    * rendered region. */
+   if (Settings.SuperFX)
 #endif
+   {
+      if (PPU.RecomputeClipWindows)
+      {
+         ComputeClipWindows();
+         PPU.RecomputeClipWindows = false;
+      }
+   }
 
    GFX.StartY = IPPU.PreviousLine;
    if ((GFX.EndY = IPPU.CurrentLine - 1) >= PPU.ScreenHeight)

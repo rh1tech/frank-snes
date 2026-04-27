@@ -441,6 +441,40 @@ uint32_t S9xReadJoypad(const int32_t port) {
         prev_joypad = joypad;
     }
 
+#ifdef FRANK_SNES_AUTOPAD
+    /* Scripted pad driver for SNES DOOM: drives through logos, title,
+     * menus, difficulty/episode select, then moves forward with D-pad UP.
+     * Press events are 8 frames ON, 12 frames OFF — DOOM's menu debouncer
+     * needs at least 6 frames between presses. */
+    if (port == 0) {
+        static uint32_t autopad_frame = 0;
+        autopad_frame++;
+        uint32_t f = autopad_frame;
+
+        /* Phase plan (frame counts at ~24 emulated FPS so beat is ~0.33s/press):
+         *   0..240   : wait through publisher logos (~10s at 24fps)
+         *   240..250 : START (skip title "Press Start")
+         *   270..280 : A (confirm "New Game" main menu)
+         *   300..310 : A (confirm default difficulty)
+         *   330..340 : A (confirm first episode)
+         *   360..480 : wait for level load (~5s)
+         *   480+     : hold UP continuously to move forward in the level
+         */
+        if (f >= 240 && f < 248)          joypad |= SNES_START_MASK;
+        else if (f >= 270 && f < 278)     joypad |= SNES_A_MASK;
+        else if (f >= 300 && f < 308)     joypad |= SNES_A_MASK;
+        else if (f >= 330 && f < 338)     joypad |= SNES_A_MASK;
+        else if (f >= 360 && f < 368)     joypad |= SNES_A_MASK;  /* extra safety confirm */
+        else if (f >= 480) {
+            /* Hold UP to walk forward, alternate occasional strafing */
+            joypad |= SNES_UP_MASK;
+            /* Wiggle left/right every 60 frames to explore */
+            uint32_t phase = (f - 480) / 60;
+            if (phase & 1) joypad |= SNES_LEFT_MASK;
+        }
+    }
+#endif
+
     return joypad;
 }
 
@@ -1137,6 +1171,69 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         next_frame_deadline += TARGET_FRAME_US;
         frame_num++;
 
+#ifdef FRANK_SNES_SUPERFX_DIAG
+        {
+            extern volatile uint32_t g_gsu_call_count;
+            extern volatile uint32_t g_gsu_inst_count;
+            extern volatile uint32_t g_gsu_plot_count;
+            extern volatile uint32_t g_gsu_start_fail;
+            extern volatile uint32_t g_gsu_stop_count;
+            extern volatile uint32_t g_gsu_last_scmr;
+            extern volatile uint32_t g_gsu_last_scbr;
+            extern volatile uint32_t g_gsu_last_mode;
+            extern volatile uint32_t g_gsu_plot_xmin;
+            extern volatile uint32_t g_gsu_plot_xmax;
+            extern volatile uint32_t g_gsu_plot_ymin;
+            extern volatile uint32_t g_gsu_plot_ymax;
+            extern volatile uint32_t g_gsu_plot_colors;
+            static uint32_t diag_last_us = 0;
+            uint32_t diag_now = time_us_32();
+            if ((uint32_t)(diag_now - diag_last_us) >= 1000000u) {
+                uint32_t sfr = (uint32_t)Memory.FillRAM[0x3030]
+                             | ((uint32_t)Memory.FillRAM[0x3031] << 8);
+                uint32_t pbr = Memory.FillRAM[0x3034];
+                uint8_t r4300 = Memory.FillRAM[0x4300];
+                uint8_t r4301 = Memory.FillRAM[0x4301];
+                uint16_t r4302 = Memory.FillRAM[0x4302]
+                               | (Memory.FillRAM[0x4303] << 8);
+                uint8_t r4304 = Memory.FillRAM[0x4304];
+                uint16_t r4305 = Memory.FillRAM[0x4305]
+                               | (Memory.FillRAM[0x4306] << 8);
+                LOG("[gsu] calls=%lu plot=%lu stop=%lu fail=%lu "
+                    "sfr=%04lx pbr=%02lx scmr=%02lx scbr=%02lx mode=%lu "
+                    "| x=[%lu..%lu] y=[%lu..%lu] colors=%08lx "
+                    "| dma0 ctrl=%02x bbus=%02x abus=%04x abnk=%02x cnt=%04x "
+                    "| brightness=%u fb=%u\n",
+                    (unsigned long)g_gsu_call_count,
+                    (unsigned long)g_gsu_plot_count,
+                    (unsigned long)g_gsu_stop_count,
+                    (unsigned long)g_gsu_start_fail,
+                    (unsigned long)sfr, (unsigned long)pbr,
+                    (unsigned long)g_gsu_last_scmr,
+                    (unsigned long)g_gsu_last_scbr,
+                    (unsigned long)g_gsu_last_mode,
+                    (unsigned long)g_gsu_plot_xmin, (unsigned long)g_gsu_plot_xmax,
+                    (unsigned long)g_gsu_plot_ymin, (unsigned long)g_gsu_plot_ymax,
+                    (unsigned long)g_gsu_plot_colors,
+                    (unsigned)r4300, (unsigned)r4301, (unsigned)r4302,
+                    (unsigned)r4304, (unsigned)r4305,
+                    (unsigned)PPU.Brightness,
+                    (unsigned)PPU.ForcedBlanking);
+                g_gsu_call_count = 0;
+                g_gsu_inst_count = 0;
+                g_gsu_plot_count = 0;
+                g_gsu_start_fail = 0;
+                g_gsu_stop_count = 0;
+                g_gsu_plot_xmin = 255;
+                g_gsu_plot_xmax = 0;
+                g_gsu_plot_ymin = 255;
+                g_gsu_plot_ymax = 0;
+                g_gsu_plot_colors = 0;
+                diag_last_us = diag_now;
+            }
+        }
+#endif
+
 #ifdef FRANK_SNES_PROFILE
         // Update stats (keep overhead tiny; print at most once/sec)
         uint32_t now_us = time_us_32();
@@ -1461,17 +1558,25 @@ int main(void) {
     LOG("USB HID initialized\n");
 #endif
 
+#ifndef FRANK_SNES_AUTOBOOT
     // Show welcome screen on first boot
     welcome_screen_show();
 
     // Warn the user if any game-affecting video settings are off.
     // No-op when all defaults are intact.
     video_settings_warning_show();
+#endif
 
     // Main loop: ROM selector -> load -> emulate -> repeat
     char rom_path[MAX_ROM_PATH];
 
     while (true) {
+#ifdef FRANK_SNES_AUTOBOOT
+        // Autoboot: skip welcome & selector, hardcode Doom path
+        snprintf(rom_path, sizeof(rom_path), "%s",
+                 "/SNES/Doom (USA).sfc");
+        LOG("AUTOBOOT: %s\n", rom_path);
+#else
         // Show ROM selector (sets up its own palette and buffer management)
         LOG("Starting ROM selector...\n");
         bool rom_selected = rom_selector_show(rom_path, sizeof(rom_path), SCREEN[0]);
@@ -1483,6 +1588,7 @@ int main(void) {
         }
 
         LOG("ROM selected: %s\n", rom_path);
+#endif
 
         // Clear both screen buffers
         memset(SCREEN[0], 0, sizeof(SCREEN[0]));

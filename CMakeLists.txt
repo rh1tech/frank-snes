@@ -18,6 +18,15 @@ option(FRANK_SNES_PROFILE "Enable periodic performance profiling output" OFF)
 # DSP command logging (KON/KOFF/FLG/GAIN to serial)
 option(FRANK_SNES_DSP_LOG "Enable DSP command logging output" OFF)
 
+# SuperFX diagnostics: per-second counters printed to serial
+option(FRANK_SNES_SUPERFX_DIAG "Enable SuperFX GSU execution diagnostics" OFF)
+
+# Autoboot: skip welcome + selector, hardcode Doom path (debugging)
+option(FRANK_SNES_AUTOBOOT "Auto-load Doom on boot (skip UI)" OFF)
+
+# Autopad: scripted gamepad inputs to drive title/menus (debugging)
+option(FRANK_SNES_AUTOPAD "Inject scripted button presses" OFF)
+
 # Fast mode: aggressively reduce quality for higher framerate
 option(FRANK_SNES_FAST_MODE "Enable fast mode (reduced quality for higher FPS)" ON)
 
@@ -158,10 +167,23 @@ if(FRANK_SNES_DSP_LOG)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_DSP_LOG=1)
 endif()
 
+if(FRANK_SNES_SUPERFX_DIAG)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_SUPERFX_DIAG=1)
+endif()
+
+if(FRANK_SNES_AUTOBOOT)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_AUTOBOOT=1)
+endif()
+
+if(FRANK_SNES_AUTOPAD)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_AUTOPAD=1)
+endif()
+
 if(FRANK_SNES_FAST_MODE)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_FAST_MODE=1)
     message(STATUS "FAST MODE enabled")
 endif()
+
 
 # Peripheral pins per board variant
 if(BOARD_VARIANT STREQUAL "M1")

@@ -162,10 +162,10 @@ bool S9xInitMemory(void)
    IPPU.ScreenColors = (uint16_t *)calloc(256 * 9, sizeof(uint16_t));
    IPPU.DirectColors = IPPU.ScreenColors + 256;
 
-   Memory.RAM   = (uint8_t*)malloc(RAM_SIZE);
-   Memory.SRAM  = (uint8_t*)malloc(Settings.ForceSuperFX ? 0x20000 : SRAM_SIZE);
-   Memory.VRAM  = (uint8_t*)malloc(VRAM_SIZE);
-   Memory.FillRAM = (uint8_t*)malloc(0x8000);
+   Memory.RAM   = (uint8_t*)calloc(RAM_SIZE, 1);
+   Memory.SRAM  = (uint8_t*)calloc(Settings.ForceSuperFX ? 0x20000 : SRAM_SIZE, 1);
+   Memory.VRAM  = (uint8_t*)calloc(VRAM_SIZE, 1);
+   Memory.FillRAM = (uint8_t*)calloc(0x8000, 1);
    bytes0x2000 = (uint8_t *)malloc(0x2000);
 
    // Only allocate ROM if not already set (e.g., loaded from SD card)

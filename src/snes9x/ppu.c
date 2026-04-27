@@ -2086,14 +2086,15 @@ void S9xSuperFXExec(void)
    if ((Memory.FillRAM[0x3000 + GSU_SFR] & FLG_G) &&
        (Memory.FillRAM[0x3000 + GSU_SCMR] & 0x18) == 0x18)
    {
-      /* Cycle-limited execution: ~350/700 instructions per HBlank, matching
-       * real hardware where the SuperFX runs in parallel with the CPU.
-       * Games (DOOM) depend on the SuperFX taking multiple frames to render,
-       * so that their IRQ handlers initialize state AFTER init code runs. */
-      FxEmulate((Memory.FillRAM[0x3000 + GSU_CLSR] & 1) ? 700 : 350);
+      /* Run GSU until it STOPs naturally (matches snes9x2005 reference).
+       * Cycle-limited execution (350/700 per HBlank) is a StarFox hack
+       * that breaks DOOM and others because they need the GSU to complete
+       * frame rendering within one CPU frame. */
+      FxEmulate(~(uint32_t)0);
 
       int32_t GSUStatus = Memory.FillRAM[0x3000 + GSU_SFR]
                         | (Memory.FillRAM[0x3000 + GSU_SFR + 1] << 8);
+
       if ((GSUStatus & (FLG_G | FLG_IRQ)) == FLG_IRQ)
          S9xSetIRQ(GSU_IRQ_SOURCE);
    }
