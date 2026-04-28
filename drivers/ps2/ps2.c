@@ -35,6 +35,8 @@
 #define PS2_CMD_SET_SCALING_1_1   0xE6
 
 #define PS2_RESP_ACK              0xFA
+#define PS2_RESP_RESEND           0xFE
+#define PS2_RESP_ERROR            0xFC
 #define PS2_RESP_BAT_OK           0xAA
 
 //=============================================================================
@@ -259,9 +261,17 @@ static bool mouse_send_byte(uint8_t data) {
     gpio_set_dir(mouse_clk_pin, GPIO_IN);
     gpio_set_dir(mouse_data_pin, GPIO_IN);
     
-    // Wait for bus idle
+    // Wait for bus idle (both CLK and DATA high). Some slower/older mice
+    // take longer to release the lines after BAT or after sending us a byte,
+    // so poll for up to ~5 ms before we assume the bus is ours.
+    {
+        absolute_time_t idle_deadline = make_timeout_time_us(5000);
+        while (!time_reached(idle_deadline)) {
+            if (gpio_get(mouse_clk_pin) && gpio_get(mouse_data_pin)) break;
+        }
+    }
     sleep_us(50);
-    
+
     // 1. Inhibit communication - pull clock low >100us
     mouse_clk_low();
     busy_wait_us_32(150);
@@ -374,19 +384,62 @@ static int mouse_get_byte(uint32_t timeout_ms) {
 
 /**
  * Send command and wait for ACK.
+ *
+ * Per the PS/2 spec the device may reply with 0xFE (RESEND) if it decoded
+ * the host byte incorrectly. In practice some older/no-name mice instead
+ * reply 0xFC (ERROR) for the same condition post-BAT, so we treat both
+ * the same and retry the byte. We also retry if the RTS step itself
+ * didn't get a response (send_byte failure), which happens when the
+ * mouse briefly holds the lines after reset or after its own error byte.
+ *
+ * Before each attempt we drain any stale bytes sitting in the PIO RX
+ * FIFO so we don't consume a leftover error/ACK from a previous command
+ * as the response to this one.
  */
 static bool mouse_send_command(uint8_t cmd) {
-    if (!mouse_send_byte(cmd)) {
-        printf("Mouse: send_byte(0x%02X) failed\n", cmd);
-        return false;
+    // Two tries is enough. PS/2 devices in an error state need tens of
+    // milliseconds to recover; our earlier 4-retry loop at 5 ms flooded
+    // some mice into a locked state that even a subsequent reset
+    // couldn't recover from. If two paced retries don't work, the
+    // caller should escalate (usually via bus recovery + full reset).
+    const int MAX_TRIES = 2;
+    int resp = -1;
+    for (int attempt = 0; attempt < MAX_TRIES; attempt++) {
+        // Flush any stragglers from a previous (possibly failed) exchange.
+        while (!pio_sm_is_rx_fifo_empty(ps2_pio, mouse_sm)) {
+            pio_sm_get(ps2_pio, mouse_sm);
+        }
+
+        if (!mouse_send_byte(cmd)) {
+            if (attempt + 1 < MAX_TRIES) {
+                sleep_ms(30);
+                continue;
+            }
+            printf("Mouse: send_byte(0x%02X) failed\n", cmd);
+            return false;
+        }
+
+        resp = mouse_get_byte(100);
+        if (resp == PS2_RESP_ACK) {
+            return true;
+        }
+        if (resp == PS2_RESP_RESEND || resp == PS2_RESP_ERROR) {
+            // Device asks us to resend (0xFE) or reports a decode error
+            // (0xFC); give it time to fully return to the idle state
+            // before retrying the same byte.
+            sleep_ms(30);
+            continue;
+        }
+        // Timeout or unknown byte — bail out.
+        break;
     }
-    
-    int resp = mouse_get_byte(100);
-    if (resp != PS2_RESP_ACK) {
-        printf("Mouse: cmd 0x%02X got 0x%02X (expected ACK)\n", cmd, resp);
-        return false;
+    if (resp < 0) {
+        printf("Mouse: cmd 0x%02X timed out waiting for ACK\n", cmd);
+    } else {
+        printf("Mouse: cmd 0x%02X got 0x%02X (expected ACK)\n",
+               cmd, (unsigned)resp & 0xFF);
     }
-    return true;
+    return false;
 }
 
 /**
@@ -486,17 +539,63 @@ static void mouse_process_packet(void) {
 // Mouse Device Initialization
 //=============================================================================
 
+/**
+ * Force the PS/2 bus into a clean idle state. Used between full-init
+ * attempts to unstick a mouse that's gotten wedged mid-transaction.
+ *
+ * Per the PS/2 "Communication Inhibit" pattern: the host holds CLK low
+ * for an extended period (spec says >100 µs; we use 20 ms to clobber any
+ * device that's halfway through clocking out a byte), then releases
+ * both lines and lets the bus settle.
+ */
+static void mouse_bus_recover(void) {
+    if (mouse_streaming) {
+        mouse_disable_irq();
+    }
+    pio_sm_set_enabled(ps2_pio, mouse_sm, false);
+
+    gpio_init(mouse_clk_pin);
+    gpio_init(mouse_data_pin);
+    gpio_pull_up(mouse_clk_pin);
+    gpio_pull_up(mouse_data_pin);
+
+    // Drive CLK low long enough to abort any device-side transaction.
+    gpio_set_dir(mouse_clk_pin, GPIO_OUT);
+    gpio_put(mouse_clk_pin, 0);
+    gpio_set_dir(mouse_data_pin, GPIO_IN);
+    sleep_ms(20);
+
+    // Release both lines and let pull-ups take over.
+    gpio_set_dir(mouse_clk_pin, GPIO_IN);
+    sleep_ms(30);
+
+    // Hand pins back to PIO and restart the RX state machine.
+    pio_gpio_init(ps2_pio, mouse_clk_pin);
+    pio_gpio_init(ps2_pio, mouse_data_pin);
+    gpio_pull_up(mouse_clk_pin);
+    gpio_pull_up(mouse_data_pin);
+    pio_sm_clear_fifos(ps2_pio, mouse_sm);
+    pio_sm_exec(ps2_pio, mouse_sm, pio_encode_jmp(ps2_program_offset));
+    pio_sm_set_enabled(ps2_pio, mouse_sm, true);
+}
+
 static bool mouse_enable_intellimouse(void) {
-    // Magic sequence to enable IntelliMouse
+    // Magic knock: three sample-rate writes (200, 100, 80) followed by
+    // GET_DEVICE_ID. IntelliMouse-capable devices answer 0x03 (wheel)
+    // or 0x04 (5-button), legacy devices stay at 0x00.
+    //
+    // If any step here fails we abandon the probe and leave the mouse
+    // in a plain 3-byte packet mode — don't try to "fix" it, the caller
+    // will continue with basic configuration.
     if (!mouse_send_command_param(PS2_CMD_SET_SAMPLE_RATE, 200)) return false;
     if (!mouse_send_command_param(PS2_CMD_SET_SAMPLE_RATE, 100)) return false;
     if (!mouse_send_command_param(PS2_CMD_SET_SAMPLE_RATE, 80)) return false;
-    
+
     if (!mouse_send_command(PS2_CMD_GET_DEVICE_ID)) return false;
-    
+
     int id = mouse_get_byte(100);
     printf("Mouse: Device ID after magic: 0x%02X\n", id);
-    
+
     if (id == 0x03 || id == 0x04) {
         mouse_packet_size = 4;
         mouse_state.has_wheel = 1;
@@ -537,7 +636,18 @@ static bool mouse_reset_and_init(void) {
     // Get device ID
     int id = mouse_get_byte(100);
     printf("Mouse: Device ID: 0x%02X\n", id);
-    
+
+    // Some mice need a breather between BAT completion and the first
+    // real host-to-device command. Without this delay, cheap/older
+    // mice lock up on the first 0xF3 (sample-rate) write. 50 ms is
+    // plenty for everything we've tested.
+    sleep_ms(50);
+
+    // Drain any straggler bytes the device may have queued during BAT.
+    while (!pio_sm_is_rx_fifo_empty(ps2_pio, mouse_sm)) {
+        pio_sm_get(ps2_pio, mouse_sm);
+    }
+
     // Try IntelliMouse
     if (mouse_enable_intellimouse()) {
         printf("Mouse: IntelliMouse enabled\n");
@@ -701,18 +811,27 @@ bool ps2_mouse_init_device(void) {
     
     for (int attempt = 0; attempt < 3; attempt++) {
         printf("Mouse: Init attempt %d\n", attempt + 1);
-        
+
+        // Before every attempt except the first, force the bus back to
+        // a known-idle state. A mouse that got wedged mid-transaction
+        // on the previous attempt won't accept a fresh 0xFF (reset)
+        // until we clock it out of its current state.
+        if (attempt > 0) {
+            mouse_bus_recover();
+            sleep_ms(100);
+        }
+
         // Clear FIFO
         while (!pio_sm_is_rx_fifo_empty(ps2_pio, mouse_sm)) {
             pio_sm_get(ps2_pio, mouse_sm);
         }
-        
+
         if (mouse_reset_and_init()) {
             mouse_state.initialized = 1;
             printf("Mouse: Init SUCCESS\n");
             return true;
         }
-        
+
         sleep_ms(200);
     }
     
