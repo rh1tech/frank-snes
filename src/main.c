@@ -1639,6 +1639,22 @@ int main(void) {
     // Use palette index 1 instead of 0 to avoid HDMI issues
     memset(SCREEN, 1, sizeof(SCREEN));
 
+    // Initialize PS/2 keyboard + mouse BEFORE HDMI. The PS/2 bit-bang
+    // transmissions during mouse init may electrically perturb the HDMI
+    // TMDS pairs (GPIO 0/1 vs GPIO 12-19 on M2). Bringing HDMI up after
+    // PS/2 init means HDMI is never live during any TX transient, so
+    // any coupling hits dark pixels rather than an active video frame.
+    LOG("Initializing PS/2...\n");
+    ps2kbd_init();
+    LOG("PS/2 keyboard initialized\n");
+
+    if (ps2_mouse_init_device()) {
+        LOG("PS/2 mouse initialized%s\n",
+            ps2_mouse_has_wheel() ? " (IntelliMouse)" : "");
+    } else {
+        LOG("PS/2 mouse not detected (will remain inactive)\n");
+    }
+
     // Initialize HDMI on Core 0 (like murmgenesis) - critical for ROM selector display
     LOG("Initializing HDMI...\n");
     graphics_init(g_out_HDMI);
@@ -1651,7 +1667,7 @@ int main(void) {
     // Launch Core 1 (Audio + APU)
     LOG("Starting render core (Audio)...\n");
     multicore_launch_core1(render_core);
-    
+
     // Wait for Core 1 to initialize HDMI and audio
     LOG("[Core0] Waiting for Core 1 to initialize...\n");
     while (!core1_ready) {
@@ -1659,7 +1675,7 @@ int main(void) {
     }
     LOG("[Core0] Render core started (HDMI + Audio on Core 1)\n");
 
-    // Initialize input devices
+    // Initialize gamepad (GPIO 20/21/26 — far from HDMI, safe to do after HDMI)
     LOG("Initializing input devices...\n");
 #ifdef NESPAD_GPIO_CLK
     if (nespad_begin(clock_get_hz(clk_sys) / 1000, NESPAD_GPIO_CLK, NESPAD_GPIO_DATA, NESPAD_GPIO_LATCH)) {
@@ -1671,19 +1687,6 @@ int main(void) {
 #else
     LOG("NES/SNES gamepad not configured (NESPAD_GPIO_CLK not defined)\n");
 #endif
-
-    // Initialize PS/2 keyboard + mouse on the shared PS/2 driver (pio2).
-    // ps2kbd_init() calls ps2_init() internally to claim keyboard + mouse
-    // state machines on the same PIO. Then bring up the mouse device.
-    ps2kbd_init();
-    LOG("PS/2 keyboard initialized\n");
-
-    if (ps2_mouse_init_device()) {
-        LOG("PS/2 mouse initialized%s\n",
-            ps2_mouse_has_wheel() ? " (IntelliMouse)" : "");
-    } else {
-        LOG("PS/2 mouse not detected (will remain inactive)\n");
-    }
 
 #ifdef USB_HID_ENABLED
     // Initialize USB HID

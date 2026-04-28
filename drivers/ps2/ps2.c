@@ -682,21 +682,25 @@ static bool mouse_reset_and_init(void) {
         pio_sm_get(ps2_pio, mouse_sm);
     }
 
-    // Skip IntelliMouse magic knock + post-BAT config writes.
-    // Two-byte command sequences (e.g. SET_SAMPLE_RATE + parameter) fail
-    // reproducibly on USB_HID=1 release builds with the device returning
-    // 0xFC on the second byte of the pair. Identical wire-level code
-    // works on frank-wolf with the same mouse on the same hardware, so
-    // the root cause is believed to be binary-layout-sensitive timing
-    // (XIP cache / flash layout) rather than a protocol bug. Raising
-    // the inter-byte gap, masking IRQs, full PIO SM restart, and atomic
-    // handoff all failed to cure it — skipping the multi-byte sequence
-    // is the only fix we found. See MOUSE_FIX.md for the full writeup.
-    //
-    // In this mode the mouse runs in its post-BAT default (100 Hz,
-    // 4 counts/mm, 3-byte packets, no scroll wheel). Fully usable for
-    // SNES Mouse emulation — the SNES Mouse protocol only reports at
-    // 60 Hz so higher rates add no value.
+#ifdef USB_HID_ENABLED
+    // On USB_HID=1 release builds, two-byte command sequences fail
+    // with the device returning 0xFC. Skip the IntelliMouse probe and
+    // the config writes; rely on post-BAT defaults (100 Hz, 4 counts/mm,
+    // 3-byte packets). See MOUSE_FIX.md.
+    printf("Mouse: using post-BAT defaults (HID=1 workaround)\n");
+#else
+    // On USB_HID=0 dev builds, multi-byte commands are reliable.
+    // Apply the full original init so the mouse runs at the same
+    // config as pre-fix builds — 200 Hz sample rate, 8 counts/mm,
+    // 1:1 scaling. This matches the runtime behavior that historically
+    // did NOT cause the welcome-screen HDMI resync.
+    if (mouse_enable_intellimouse()) {
+        printf("Mouse: IntelliMouse enabled\n");
+    }
+    mouse_send_command_param(PS2_CMD_SET_SAMPLE_RATE, 200);
+    mouse_send_command_param(PS2_CMD_SET_RESOLUTION, 3);
+    mouse_send_command(PS2_CMD_SET_SCALING_1_1);
+#endif
 
     // Enable streaming mode FIRST (before enabling IRQ!)
     // The ACK for this command must be received via polling, not IRQ
