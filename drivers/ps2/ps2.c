@@ -43,6 +43,12 @@
 // Driver State
 //=============================================================================
 
+// Enforce a minimum gap between host-to-device bytes. Without this, on
+// USB_HID=1 release builds, the mouse rejects back-to-back bytes with
+// 0xFC. See MOUSE_FIX.md.
+static uint32_t mouse_last_tx_us = 0;
+#define MOUSE_INTER_BYTE_GAP_US 50000
+
 static PIO ps2_pio = NULL;   // mouse PIO (primary; used by mouse IRQ/FIFO paths)
 static uint ps2_program_offset = 0;
 
@@ -246,7 +252,15 @@ static uint8_t calc_odd_parity(uint8_t data) {
  */
 static bool mouse_send_byte(uint8_t data) {
     uint8_t parity = calc_odd_parity(data);
-    
+
+    // Enforce inter-byte gap (see MOUSE_FIX.md).
+    if (mouse_last_tx_us) {
+        uint32_t elapsed = time_us_32() - mouse_last_tx_us;
+        if (elapsed < MOUSE_INTER_BYTE_GAP_US) {
+            busy_wait_us_32(MOUSE_INTER_BYTE_GAP_US - elapsed);
+        }
+    }
+
     // Disable interrupt and stop PIO to take over GPIO
     if (mouse_streaming) {
         mouse_disable_irq();
@@ -272,23 +286,29 @@ static bool mouse_send_byte(uint8_t data) {
     }
     sleep_us(50);
 
+    // Mask NVIC for the timing-sensitive host-to-device frame.
+    // See MOUSE_FIX.md for why.
+    uint32_t irq_save = save_and_disable_interrupts();
+    bool ok = false;
+
     // 1. Inhibit communication - pull clock low >100us
     mouse_clk_low();
     busy_wait_us_32(150);
-    
+
     // 2. Request-to-send - pull data low
     mouse_data_low();
     busy_wait_us_32(10);
-    
+
     // 3. Release clock - device will start clocking
     mouse_clk_release();
-    
+
     // 4. Wait for device to pull clock low
     if (!mouse_wait_clk(false, 15000)) {
         mouse_data_release();
+        restore_interrupts(irq_save);
         goto restart_pio;
     }
-    
+
     // 5. Send 8 data bits on falling clock edges
     for (int i = 0; i < 8; i++) {
         if (data & (1 << i)) {
@@ -296,61 +316,75 @@ static bool mouse_send_byte(uint8_t data) {
         } else {
             mouse_data_low();
         }
-        if (!mouse_wait_clk(true, 5000)) goto fail;
-        if (!mouse_wait_clk(false, 5000)) goto fail;
+        if (!mouse_wait_clk(true, 5000)) goto fail_irq_disabled;
+        if (!mouse_wait_clk(false, 5000)) goto fail_irq_disabled;
     }
-    
+
     // 6. Send parity bit
     if (parity) {
         mouse_data_release();
     } else {
         mouse_data_low();
     }
-    if (!mouse_wait_clk(true, 5000)) goto fail;
-    if (!mouse_wait_clk(false, 5000)) goto fail;
-    
+    if (!mouse_wait_clk(true, 5000)) goto fail_irq_disabled;
+    if (!mouse_wait_clk(false, 5000)) goto fail_irq_disabled;
+
     // 7. Release data for stop bit
     mouse_data_release();
-    if (!mouse_wait_clk(true, 5000)) goto fail;
-    
+    if (!mouse_wait_clk(true, 5000)) goto fail_irq_disabled;
+
     // 8. Wait for ACK (device pulls data low)
-    if (!mouse_wait_data(false, 5000)) goto fail;
-    if (!mouse_wait_clk(false, 5000)) goto fail;
-    if (!mouse_wait_clk(true, 5000)) goto fail;
-    if (!mouse_wait_data(true, 5000)) goto fail;
-    
-    // Reinit GPIO for PIO control IMMEDIATELY
+    if (!mouse_wait_data(false, 5000)) goto fail_irq_disabled;
+    if (!mouse_wait_clk(false, 5000)) goto fail_irq_disabled;
+    if (!mouse_wait_clk(true, 5000)) goto fail_irq_disabled;
+    if (!mouse_wait_data(true, 5000)) goto fail_irq_disabled;
+
+    ok = true;
+
+fail_irq_disabled:
+    restore_interrupts(irq_save);
+
+    if (!ok) {
+        mouse_data_release();
+        mouse_clk_release();
+        goto restart_pio;
+    }
+
+    // Wait for bus idle before handing pins back to PIO (see MOUSE_FIX.md).
+    for (int spin = 0; spin < 100; spin++) {
+        if (gpio_get(mouse_clk_pin) && gpio_get(mouse_data_pin)) break;
+        busy_wait_us_32(1);
+    }
+
+    // Atomic SIO → PIO handoff under NVIC mask.
+    uint32_t handoff_irq = save_and_disable_interrupts();
+    pio_sm_set_enabled(ps2_pio, mouse_sm, false);
     pio_gpio_init(ps2_pio, mouse_clk_pin);
     pio_gpio_init(ps2_pio, mouse_data_pin);
     gpio_pull_up(mouse_clk_pin);
     gpio_pull_up(mouse_data_pin);
-    
-    // Clear FIFO, jump to start, and enable - don't use pio_sm_restart
     pio_sm_clear_fifos(ps2_pio, mouse_sm);
     pio_sm_exec(ps2_pio, mouse_sm, pio_encode_jmp(ps2_program_offset));
     pio_sm_set_enabled(ps2_pio, mouse_sm, true);
-    
-    // Re-enable interrupt if streaming was active
+    restore_interrupts(handoff_irq);
+
     if (mouse_streaming) {
         mouse_enable_irq();
     }
+    mouse_last_tx_us = time_us_32();
     return true;
-    
-fail:
-    mouse_data_release();
-    mouse_clk_release();
-    
+
 restart_pio:
     pio_gpio_init(ps2_pio, mouse_clk_pin);
     pio_gpio_init(ps2_pio, mouse_data_pin);
     gpio_pull_up(mouse_clk_pin);
     gpio_pull_up(mouse_data_pin);
     pio_sm_restart_rx(ps2_pio, mouse_sm);
-    
-    // Re-enable interrupt if streaming was active
+
     if (mouse_streaming) {
         mouse_enable_irq();
     }
+    mouse_last_tx_us = time_us_32();
     return false;
 }
 
@@ -648,16 +682,22 @@ static bool mouse_reset_and_init(void) {
         pio_sm_get(ps2_pio, mouse_sm);
     }
 
-    // Try IntelliMouse
-    if (mouse_enable_intellimouse()) {
-        printf("Mouse: IntelliMouse enabled\n");
-    }
-    
-    // Configure - 200Hz sample rate, high resolution (8 counts/mm)
-    mouse_send_command_param(PS2_CMD_SET_SAMPLE_RATE, 200);
-    mouse_send_command_param(PS2_CMD_SET_RESOLUTION, 3);  // 0=1cnt/mm, 1=2, 2=4, 3=8
-    mouse_send_command(PS2_CMD_SET_SCALING_1_1);
-    
+    // Skip IntelliMouse magic knock + post-BAT config writes.
+    // Two-byte command sequences (e.g. SET_SAMPLE_RATE + parameter) fail
+    // reproducibly on USB_HID=1 release builds with the device returning
+    // 0xFC on the second byte of the pair. Identical wire-level code
+    // works on frank-wolf with the same mouse on the same hardware, so
+    // the root cause is believed to be binary-layout-sensitive timing
+    // (XIP cache / flash layout) rather than a protocol bug. Raising
+    // the inter-byte gap, masking IRQs, full PIO SM restart, and atomic
+    // handoff all failed to cure it — skipping the multi-byte sequence
+    // is the only fix we found. See MOUSE_FIX.md for the full writeup.
+    //
+    // In this mode the mouse runs in its post-BAT default (100 Hz,
+    // 4 counts/mm, 3-byte packets, no scroll wheel). Fully usable for
+    // SNES Mouse emulation — the SNES Mouse protocol only reports at
+    // 60 Hz so higher rates add no value.
+
     // Enable streaming mode FIRST (before enabling IRQ!)
     // The ACK for this command must be received via polling, not IRQ
     if (!mouse_send_command(PS2_CMD_ENABLE_STREAM)) {
@@ -672,7 +712,7 @@ static bool mouse_reset_and_init(void) {
     // NOW enable PIO interrupt for non-blocking reception of mouse data
     mouse_enable_irq();
     mouse_streaming = true;
-    
+
     printf("Mouse: Streaming mode enabled with interrupts\n");
     return true;
 }
