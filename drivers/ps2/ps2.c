@@ -638,30 +638,39 @@ static bool mouse_enable_intellimouse(void) {
     return false;
 }
 
+// Set by mouse_reset_and_init() when the device sent at least one byte
+// in response to our RESET. Lets the outer retry loop distinguish
+// "mouse connected but init failed" (retry worth) from "no mouse on
+// the bus" (bail immediately).
+static bool mouse_saw_response = false;
+
 static bool mouse_reset_and_init(void) {
     printf("Mouse: Sending reset...\n");
-    
+    mouse_saw_response = false;
+
     // Drain any garbage from FIFO first
     while (!pio_sm_is_rx_fifo_empty(ps2_pio, mouse_sm)) {
         pio_sm_get(ps2_pio, mouse_sm);
     }
-    
+
     if (!mouse_send_byte(PS2_CMD_RESET)) {
         printf("Mouse: Reset send failed\n");
         return false;
     }
-    
+
     // Mouse reset takes 300-500ms for self-test
     // Wait for ACK (0xFA), then BAT OK (0xAA), then device ID (0x00)
     int resp = mouse_get_byte(2000);  // Longer timeout for reset
     printf("Mouse: Response 1: 0x%02X\n", resp);
-    
+    if (resp >= 0) mouse_saw_response = true;
+
     if (resp == PS2_RESP_ACK) {
         // Got ACK, wait for BAT
         resp = mouse_get_byte(2000);
         printf("Mouse: Response 2: 0x%02X\n", resp);
+        if (resp >= 0) mouse_saw_response = true;
     }
-    
+
     if (resp != PS2_RESP_BAT_OK) {
         printf("Mouse: BAT failed (got 0x%02X)\n", resp);
         return false;
@@ -853,7 +862,12 @@ bool ps2_mouse_init_device(void) {
     // Check bus state
     printf("Mouse: CLK=%d DATA=%d\n", mouse_read_clk(), mouse_read_data());
     
-    for (int attempt = 0; attempt < 3; attempt++) {
+    // Retry up to MAX_ATTEMPTS times, but bail early if the mouse
+    // doesn't respond on the bus at all — a wedged-but-connected mouse
+    // sometimes needs several full resets to unstick, while a missing
+    // mouse should not hold up boot.
+    const int MAX_ATTEMPTS = 10;
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         printf("Mouse: Init attempt %d\n", attempt + 1);
 
         // Before every attempt except the first, force the bus back to
@@ -862,7 +876,7 @@ bool ps2_mouse_init_device(void) {
         // until we clock it out of its current state.
         if (attempt > 0) {
             mouse_bus_recover();
-            sleep_ms(100);
+            sleep_ms(300);
         }
 
         // Clear FIFO
@@ -876,9 +890,17 @@ bool ps2_mouse_init_device(void) {
             return true;
         }
 
-        sleep_ms(200);
+        // If the mouse never responded to RESET, stop retrying — it's
+        // either not plugged in or the bus is broken. Repeating won't
+        // help and only slows boot.
+        if (!mouse_saw_response) {
+            printf("Mouse: No device on bus, giving up\n");
+            break;
+        }
+
+        sleep_ms(500);
     }
-    
+
     printf("Mouse: Init FAILED\n");
     return false;
 }
