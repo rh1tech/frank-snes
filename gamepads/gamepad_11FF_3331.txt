@@ -1,0 +1,38 @@
+# frank-gamepad capture log
+Source=HID
+VID=0x11FF
+PID=0x3331
+Manufacturer=(none)
+Product=(none)
+Serial=(none)
+ReportLen=8
+Baseline=7F 7F 7F 7F 7F 0F 00 A0
+
+UP=byte[1]:-0x7F
+#   raw: 7F 00 7F 7F 7F 0F 00 A0
+DOWN=byte[1]:+0x80
+#   raw: 7F FF 7F 7F 7F 0F 00 A0
+LEFT=byte[0]:-0x7F
+#   raw: 00 7F 7F 7F 7F 0F 00 A0
+RIGHT=byte[0]:+0x80
+#   raw: FF 7F 7F 7F 7F 0F 00 A0
+SELECT=byte[6]:+0x10
+#   raw: 7F 7F 7F 7F 7F 0F 10 A0
+SELECT_ALT=byte[6]:+0x01
+#   raw: 7F 7F 7F 7F 7F 0F 01 A0
+START=byte[6]:+0x20
+#   raw: 7F 7F 7F 7F 7F 0F 20 A0
+START_ALT=byte[6]:+0x02
+#   raw: 7F 7F 7F 7F 7F 0F 02 A0
+Y=byte[5]:+0x10
+#   raw: 7F 7F 7F 7F 7F 1F 00 A0
+B=byte[5]:+0x40
+#   raw: 7F 7F 7F 7F 7F 4F 00 A0
+A=byte[5]:+0x80
+#   raw: 7F 7F 7F 7F 7F 8F 00 A0
+X=byte[5]:+0x20
+#   raw: 7F 7F 7F 7F 7F 2F 00 A0
+L=byte[6]:+0x04
+#   raw: 7F 7F 7F 7F 7F 0F 04 A0
+R=byte[6]:+0x08
+#   raw: 7F 7F 7F 7F 7F 0F 08 A0

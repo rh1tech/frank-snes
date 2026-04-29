@@ -6,6 +6,7 @@
 
 #include "tusb.h"
 #include "usbhid.h"
+#include "xinput_host.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -37,8 +38,119 @@ static volatile int8_t cumulative_wheel = 0;
 static volatile uint8_t current_buttons = 0;
 static volatile int mouse_has_motion = 0;
 
+//--------------------------------------------------------------------
+// Gamepad button map
+//
+// Different HID gamepads lay out their 8-byte reports differently.
+// Each entry picks a byte index + bitmask for every logical SNES-facing
+// button. D-pad is always treated as two analog axes (bytes dpad_x/dpad_y)
+// and decoded with the standard <0x40 / >0xC0 thresholds.
+//
+// Canonical output bits (what main.c's usbgp_bits[] expects):
+//   0x0001=A 0x0002=B 0x0004=X 0x0008=Y
+//   0x0010=L 0x0020=R 0x0040=Start 0x0080=Select
+//--------------------------------------------------------------------
+
+typedef struct {
+    uint8_t byte;
+    uint8_t mask;
+} btn_bit_t;
+
+typedef struct {
+    uint16_t vid;
+    uint16_t pid;
+    uint8_t  dpad_x;        // byte index for d-pad X axis (0xFF = none)
+    uint8_t  dpad_y;        // byte index for d-pad Y axis (0xFF = none)
+    btn_bit_t a;
+    btn_bit_t b;
+    btn_bit_t x;
+    btn_bit_t y;
+    btn_bit_t l;
+    btn_bit_t r;
+    btn_bit_t start;
+    btn_bit_t select;
+} gamepad_map_t;
+
+// Known HID gamepads harvested via frank-gamepad's capture tool.
+// The three families we actually see on the bench.
+static const gamepad_map_t known_hid_maps[] = {
+    // SNES USB clone (iNNEXT / Retrolink style). Capture: gamepad_081F_E401.txt
+    // baseline: 7F 7F 00 80 80 0F 00 00
+    {
+        .vid = 0x081F, .pid = 0xE401,
+        .dpad_x = 0, .dpad_y = 1,
+        .a      = { .byte = 5, .mask = 0x20 },
+        .b      = { .byte = 5, .mask = 0x40 },
+        .x      = { .byte = 5, .mask = 0x10 },
+        .y      = { .byte = 5, .mask = 0x80 },
+        .l      = { .byte = 6, .mask = 0x01 },
+        .r      = { .byte = 6, .mask = 0x02 },
+        .start  = { .byte = 6, .mask = 0x20 },
+        .select = { .byte = 6, .mask = 0x10 },
+    },
+    // SpeedLink / cheap clone layout. Capture: gamepad_11FF_3331.txt
+    // baseline: 7F 7F 7F 7F 7F 0F 00 A0
+    {
+        .vid = 0x11FF, .pid = 0x3331,
+        .dpad_x = 0, .dpad_y = 1,
+        .a      = { .byte = 5, .mask = 0x80 },
+        .b      = { .byte = 5, .mask = 0x40 },
+        .x      = { .byte = 5, .mask = 0x20 },
+        .y      = { .byte = 5, .mask = 0x10 },
+        .l      = { .byte = 6, .mask = 0x04 },
+        .r      = { .byte = 6, .mask = 0x08 },
+        .start  = { .byte = 6, .mask = 0x20 },
+        .select = { .byte = 6, .mask = 0x10 },
+    },
+};
+
+// Fallback layout — matches the original hardcoded table for unknown pads.
+// Same bits as the 0x081F/0xE401 pad; close enough for most SNES clones.
+static const gamepad_map_t fallback_hid_map = {
+    .vid = 0, .pid = 0,
+    .dpad_x = 3, .dpad_y = 4,   // old heuristic used bytes 3/4 for d-pad
+    .a      = { .byte = 5, .mask = 0x20 },
+    .b      = { .byte = 5, .mask = 0x40 },
+    .x      = { .byte = 5, .mask = 0x10 },
+    .y      = { .byte = 5, .mask = 0x80 },
+    .l      = { .byte = 6, .mask = 0x01 },
+    .r      = { .byte = 6, .mask = 0x02 },
+    .start  = { .byte = 6, .mask = 0x20 },
+    .select = { .byte = 6, .mask = 0x10 },
+};
+
+// XInput synthetic frame layout — see tuh_xinput_report_received_cb() below:
+//   byte[0] = wButtons low  (DPAD + START/BACK + LS/RS)
+//   byte[1] = wButtons high (LB=0x01 RB=0x02 A=0x10 B=0x20 X=0x40 Y=0x80)
+static const gamepad_map_t xinput_map = {
+    .vid = 0, .pid = 0,
+    .dpad_x = 0xFF, .dpad_y = 0xFF,  // dpad encoded as bits in byte 0
+    .a      = { .byte = 1, .mask = 0x10 },
+    .b      = { .byte = 1, .mask = 0x20 },
+    .x      = { .byte = 1, .mask = 0x40 },
+    .y      = { .byte = 1, .mask = 0x80 },
+    .l      = { .byte = 1, .mask = 0x01 },
+    .r      = { .byte = 1, .mask = 0x02 },
+    .start  = { .byte = 0, .mask = 0x10 },
+    .select = { .byte = 0, .mask = 0x20 },
+};
+
+static const gamepad_map_t *find_hid_map(uint16_t vid, uint16_t pid) {
+    for (size_t i = 0; i < sizeof(known_hid_maps) / sizeof(known_hid_maps[0]); i++) {
+        if (known_hid_maps[i].vid == vid && known_hid_maps[i].pid == pid)
+            return &known_hid_maps[i];
+    }
+    return &fallback_hid_map;
+}
+
 // Gamepad state — two slots for two USB gamepads
 #define MAX_GAMEPADS 2
+
+typedef enum {
+    GP_SRC_NONE = 0,
+    GP_SRC_HID,
+    GP_SRC_XINPUT,
+} gp_source_t;
 
 typedef struct {
     volatile int8_t axis_x;
@@ -46,32 +158,35 @@ typedef struct {
     volatile uint8_t dpad;
     volatile uint16_t buttons;
     volatile int connected;
-    uint8_t dev_addr;   // TinyUSB device address (0 = slot free)
-    uint8_t instance;   // TinyUSB HID instance
+    uint8_t dev_addr;
+    uint8_t instance;
+    gp_source_t source;
+    const gamepad_map_t *map;
 } gamepad_slot_t;
 
 static gamepad_slot_t gamepad_slots[MAX_GAMEPADS] = {0};
 
-// Find gamepad slot by dev_addr+instance, or allocate a new one. Returns -1 if full.
-static int find_or_alloc_gamepad_slot(uint8_t dev_addr, uint8_t inst) {
+static int find_or_alloc_gamepad_slot(uint8_t dev_addr, uint8_t inst, gp_source_t src) {
     for (int i = 0; i < MAX_GAMEPADS; i++) {
-        if (gamepad_slots[i].connected && gamepad_slots[i].dev_addr == dev_addr && gamepad_slots[i].instance == inst)
+        if (gamepad_slots[i].connected && gamepad_slots[i].dev_addr == dev_addr &&
+            gamepad_slots[i].instance == inst && gamepad_slots[i].source == src)
             return i;
     }
     for (int i = 0; i < MAX_GAMEPADS; i++) {
         if (!gamepad_slots[i].connected) {
             gamepad_slots[i].dev_addr = dev_addr;
             gamepad_slots[i].instance = inst;
+            gamepad_slots[i].source = src;
             return i;
         }
     }
     return -1;
 }
 
-// Find gamepad slot by dev_addr (for unmount). Returns -1 if not found.
-static int find_gamepad_slot_by_dev(uint8_t dev_addr) {
+static int find_gamepad_slot_by_dev(uint8_t dev_addr, gp_source_t src) {
     for (int i = 0; i < MAX_GAMEPADS; i++) {
-        if (gamepad_slots[i].connected && gamepad_slots[i].dev_addr == dev_addr)
+        if (gamepad_slots[i].connected && gamepad_slots[i].dev_addr == dev_addr &&
+            gamepad_slots[i].source == src)
             return i;
     }
     return -1;
@@ -195,31 +310,53 @@ static void process_mouse_report(hid_mouse_report_t const *report) {
 
 //--------------------------------------------------------------------
 // Process gamepad report (per-slot)
+//
+// Uses a per-device button map. For HID pads this depends on VID/PID
+// (some put face buttons on byte 5 with one bit pattern, others use
+// another). For XInput the callback delivers a synthetic frame whose
+// layout is fixed — see tuh_xinput_report_received_cb().
 //--------------------------------------------------------------------
 
+static inline uint16_t eval_btn(const btn_bit_t *b, uint8_t const *report, uint16_t len, uint16_t out_mask) {
+    if (b->byte >= len) return 0;
+    return (report[b->byte] & b->mask) ? out_mask : 0;
+}
+
 static void process_gamepad_report(int slot, uint8_t const *report, uint16_t len) {
-    if (slot < 0 || slot >= MAX_GAMEPADS || report == NULL || len < 7) return;
+    if (slot < 0 || slot >= MAX_GAMEPADS || report == NULL || len < 2) return;
 
     gamepad_slot_t *gp = &gamepad_slots[slot];
+    const gamepad_map_t *m = gp->map ? gp->map : &fallback_hid_map;
 
-    // D-pad from bytes 3-4 (0x00=min, 0x7F=center, 0xFF=max)
-    gp->dpad = 0;
-    if (report[3] < 0x40) gp->dpad |= 0x04; // Left
-    if (report[3] > 0xC0) gp->dpad |= 0x08; // Right
-    if (report[4] < 0x40) gp->dpad |= 0x01; // Up
-    if (report[4] > 0xC0) gp->dpad |= 0x02; // Down
+    // D-pad. Two decoding strategies:
+    //   * analog axes (dpad_x/dpad_y byte indices): 0x00=min 0x7F=centre 0xFF=max
+    //   * bit-packed (dpad_x == 0xFF): XInput-style UP/DOWN/LEFT/RIGHT in byte 0
+    uint8_t dpad = 0;
+    if (m->dpad_x != 0xFF && m->dpad_y != 0xFF &&
+        m->dpad_x < len && m->dpad_y < len) {
+        if (report[m->dpad_x] < 0x40) dpad |= 0x04; // Left
+        if (report[m->dpad_x] > 0xC0) dpad |= 0x08; // Right
+        if (report[m->dpad_y] < 0x40) dpad |= 0x01; // Up
+        if (report[m->dpad_y] > 0xC0) dpad |= 0x02; // Down
+    } else if (len >= 1) {
+        // XInput wButtons low byte: DPAD_UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08
+        if (report[0] & 0x01) dpad |= 0x01; // Up
+        if (report[0] & 0x02) dpad |= 0x02; // Down
+        if (report[0] & 0x04) dpad |= 0x04; // Left
+        if (report[0] & 0x08) dpad |= 0x08; // Right
+    }
+    gp->dpad = dpad;
 
-    // Buttons: A(0x20), B(0x40), X(0x10), Y(0x80) in byte 5
-    //          L(0x01), R(0x02), Select(0x10), Start(0x20) in byte 6
-    gp->buttons = 0;
-    if (report[5] & 0x20) gp->buttons |= 0x0001; // A
-    if (report[5] & 0x40) gp->buttons |= 0x0002; // B
-    if (report[5] & 0x10) gp->buttons |= 0x0004; // X
-    if (report[5] & 0x80) gp->buttons |= 0x0008; // Y
-    if (report[6] & 0x01) gp->buttons |= 0x0010; // L
-    if (report[6] & 0x02) gp->buttons |= 0x0020; // R
-    if (report[6] & 0x20) gp->buttons |= 0x0040; // Start
-    if (report[6] & 0x10) gp->buttons |= 0x0080; // Select
+    uint16_t buttons = 0;
+    buttons |= eval_btn(&m->a,      report, len, 0x0001);
+    buttons |= eval_btn(&m->b,      report, len, 0x0002);
+    buttons |= eval_btn(&m->x,      report, len, 0x0004);
+    buttons |= eval_btn(&m->y,      report, len, 0x0008);
+    buttons |= eval_btn(&m->l,      report, len, 0x0010);
+    buttons |= eval_btn(&m->r,      report, len, 0x0020);
+    buttons |= eval_btn(&m->start,  report, len, 0x0040);
+    buttons |= eval_btn(&m->select, report, len, 0x0080);
+    gp->buttons = buttons;
 }
 
 //--------------------------------------------------------------------
@@ -268,7 +405,7 @@ static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t c
                 break;
             case HID_USAGE_DESKTOP_GAMEPAD:
             case HID_USAGE_DESKTOP_JOYSTICK: {
-                int slot = find_or_alloc_gamepad_slot(dev_addr, instance);
+                int slot = find_or_alloc_gamepad_slot(dev_addr, instance, GP_SRC_HID);
                 if (slot >= 0) {
                     gamepad_slots[slot].connected = 1;
                     process_gamepad_report(slot, report, len);
@@ -282,7 +419,116 @@ static void process_generic_report(uint8_t dev_addr, uint8_t instance, uint8_t c
 }
 
 //--------------------------------------------------------------------
-// TinyUSB Callbacks
+// XInput class driver registration.
+//
+// TinyUSB looks up extra host class drivers via usbh_app_driver_get_cb().
+// Xbox 360 / Xbox One / XboxOG controllers do not expose a HID interface,
+// so without this callback the mount path above never fires for them.
+//--------------------------------------------------------------------
+
+usbh_class_driver_t const *usbh_app_driver_get_cb(uint8_t *driver_count) {
+    *driver_count = 1;
+    return &usbh_xinput_driver;
+}
+
+//--------------------------------------------------------------------
+// XInput callbacks
+//
+// Build a stable 8-byte synthetic report from xinput_gamepad_t so the
+// rest of the pipeline (process_gamepad_report → per-device button
+// map) works the same way as HID pads.
+//
+//   byte[0] = wButtons low  (DPAD_UP/DOWN/LEFT/RIGHT + START/BACK + LS/RS)
+//   byte[1] = wButtons high (LB=0x01 RB=0x02 GUIDE=0x04 SHARE=0x08
+//                            A=0x10 B=0x20 X=0x40 Y=0x80)
+//   byte[2] = bLeftTrigger  (quantised on/off)
+//   byte[3] = bRightTrigger (quantised on/off)
+//   byte[4..7] = stick axes quantised to three bins
+//
+// Stick quantisation matters: at rest an Xbox pad drifts ~±2000 LSB,
+// and a raw high-byte snapshot changes ~60x/sec. If process_gamepad_report
+// saw a change on every drift tick, upstream logic that debounces on
+// 'something changed' would never settle. See frank-gamepad commit
+// 0ec515c for the original bug and fix.
+//--------------------------------------------------------------------
+
+#define USBHID_XINPUT_REPORT_LEN 8
+
+static inline uint8_t xinput_axis_quantise(int16_t v) {
+    const int16_t threshold = 0x2000;   // ~25% deflection
+    if (v >  threshold) return 0x7F;
+    if (v < -threshold) return 0x80;
+    return 0x00;
+}
+
+static inline uint8_t xinput_trigger_quantise(uint8_t v) {
+    return v > 0x20 ? 0xFF : 0x00;
+}
+
+void tuh_xinput_mount_cb(uint8_t dev_addr, uint8_t instance, const xinputh_interface_t *xid_itf) {
+    printf("XInput mounted: dev_addr=%u inst=%u type=%u\n",
+           dev_addr, instance, (unsigned)xid_itf->type);
+
+    int slot = find_or_alloc_gamepad_slot(dev_addr, instance, GP_SRC_XINPUT);
+    if (slot < 0) {
+        printf("  -> slots full, ignored\n");
+        tuh_xinput_receive_report(dev_addr, instance);
+        return;
+    }
+    gamepad_slots[slot].connected = 1;
+    gamepad_slots[slot].map = &xinput_map;
+    gamepad_slots[slot].buttons = 0;
+    gamepad_slots[slot].dpad = 0;
+
+    // Light the player-1 quadrant LED on 360 pads so the user sees the
+    // association; XBone ignores the command.
+    tuh_xinput_set_led(dev_addr, instance, 1, true);
+    tuh_xinput_receive_report(dev_addr, instance);
+    printf("  -> XINPUT gamepad assigned to slot %d\n", slot);
+}
+
+void tuh_xinput_umount_cb(uint8_t dev_addr, uint8_t instance) {
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (gamepad_slots[i].connected &&
+            gamepad_slots[i].source == GP_SRC_XINPUT &&
+            gamepad_slots[i].dev_addr == dev_addr &&
+            gamepad_slots[i].instance == instance) {
+            printf("XInput unmounted: gamepad slot %d disconnected\n", i);
+            gamepad_slots[i].connected = 0;
+            gamepad_slots[i].buttons = 0;
+            gamepad_slots[i].dpad = 0;
+            gamepad_slots[i].axis_x = 0;
+            gamepad_slots[i].axis_y = 0;
+            gamepad_slots[i].dev_addr = 0;
+            gamepad_slots[i].source = GP_SRC_NONE;
+            gamepad_slots[i].map = NULL;
+        }
+    }
+}
+
+void tuh_xinput_report_received_cb(uint8_t dev_addr, uint8_t instance,
+                                   xinputh_interface_t const *xid_itf,
+                                   uint16_t len) {
+    (void)len;
+    int slot = find_gamepad_slot_by_dev(dev_addr, GP_SRC_XINPUT);
+    if (slot >= 0 && xid_itf) {
+        const xinput_gamepad_t *p = &xid_itf->pad;
+        uint8_t synth[USBHID_XINPUT_REPORT_LEN];
+        synth[0] = (uint8_t)(p->wButtons & 0xFF);
+        synth[1] = (uint8_t)((p->wButtons >> 8) & 0xFF);
+        synth[2] = xinput_trigger_quantise(p->bLeftTrigger);
+        synth[3] = xinput_trigger_quantise(p->bRightTrigger);
+        synth[4] = xinput_axis_quantise(p->sThumbLX);
+        synth[5] = xinput_axis_quantise(p->sThumbLY);
+        synth[6] = xinput_axis_quantise(p->sThumbRX);
+        synth[7] = xinput_axis_quantise(p->sThumbRY);
+        process_gamepad_report(slot, synth, sizeof(synth));
+    }
+    tuh_xinput_receive_report(dev_addr, instance);
+}
+
+//--------------------------------------------------------------------
+// TinyUSB HID Callbacks
 //--------------------------------------------------------------------
 
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_report, uint16_t desc_len) {
@@ -343,10 +589,15 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
         }
 
         if (is_gamepad) {
-            int slot = find_or_alloc_gamepad_slot(dev_addr, instance);
+            int slot = find_or_alloc_gamepad_slot(dev_addr, instance, GP_SRC_HID);
             if (slot >= 0) {
+                uint16_t vid = 0, pid = 0;
+                tuh_vid_pid_get(dev_addr, &vid, &pid);
                 gamepad_slots[slot].connected = 1;
-                printf("  -> GAMEPAD assigned to slot %d\n", slot);
+                gamepad_slots[slot].map = find_hid_map(vid, pid);
+                printf("  -> GAMEPAD slot %d VID=0x%04X PID=0x%04X (%s)\n",
+                       slot, vid, pid,
+                       gamepad_slots[slot].map == &fallback_hid_map ? "fallback" : "known");
             } else {
                 printf("  -> GAMEPAD slots full, ignored\n");
             }
@@ -363,7 +614,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
     } else if (itf_protocol == HID_ITF_PROTOCOL_MOUSE) {
         mouse_connected = 0;
     } else if (itf_protocol == HID_ITF_PROTOCOL_NONE) {
-        int slot = find_gamepad_slot_by_dev(dev_addr);
+        int slot = find_gamepad_slot_by_dev(dev_addr, GP_SRC_HID);
         if (slot >= 0) {
             printf("USB HID unmounted: gamepad slot %d disconnected\n", slot);
             gamepad_slots[slot].connected = 0;
@@ -372,6 +623,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
             gamepad_slots[slot].axis_x = 0;
             gamepad_slots[slot].axis_y = 0;
             gamepad_slots[slot].dev_addr = 0;
+            gamepad_slots[slot].source = GP_SRC_NONE;
+            gamepad_slots[slot].map = NULL;
         }
     }
 }
@@ -407,11 +660,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
                     printf("\n");
                     report_debug_counter++;
                 }
-                // Generic HID device (protocol=NONE). Could be a mouse
-                // or keyboard enumerated without boot-protocol support,
-                // or a gamepad. Route via the parsed descriptor first;
-                // fall back to gamepad if no match.
-                int slot = find_gamepad_slot_by_dev(dev_addr);
+                int slot = find_gamepad_slot_by_dev(dev_addr, GP_SRC_HID);
                 if (slot >= 0) {
                     gamepad_slots[slot].connected = 1;
                     process_gamepad_report(slot, report, len);
