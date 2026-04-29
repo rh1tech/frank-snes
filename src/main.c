@@ -1622,27 +1622,6 @@ int main(void) {
     psram_init(psram_pin);
     psram_reset();
     LOG("PSRAM initialized (8 MB)\n");
-    
-    // Mount SD card
-    LOG("Mounting SD card...\n");
-    FRESULT res = f_mount(&fs, "", 1);
-    if (res != FR_OK) {
-        LOG("Failed to mount SD card: %d\n", res);
-        // Blink LED to indicate error
-        while (1) {
-            gpio_put(PICO_DEFAULT_LED_PIN, 1);
-            sleep_ms(100);
-            gpio_put(PICO_DEFAULT_LED_PIN, 0);
-            sleep_ms(100);
-        }
-    }
-    LOG("SD card mounted\n");
-
-    // Load settings from SD card
-    LOG("Loading settings...\n");
-    settings_load();
-    LOG("Settings loaded (volume=%d, frameskip=%d, p1=%d, p2=%d)\n",
-        g_settings.volume, g_settings.frameskip, g_settings.p1_mode, g_settings.p2_mode);
 
     // Clear screen buffer BEFORE HDMI init - DMA starts scanning immediately
     // Use palette index 1 instead of 0 to avoid HDMI issues
@@ -1664,7 +1643,9 @@ int main(void) {
         LOG("PS/2 mouse not detected (will remain inactive)\n");
     }
 
-    // Initialize HDMI on Core 0 (like murmgenesis) - critical for ROM selector display
+    // Initialize HDMI on Core 0 (like murmgenesis) - critical for ROM selector display.
+    // Bring HDMI up BEFORE mounting SD so we can display a visible error
+    // screen when no SD card is inserted (otherwise the user just sees black).
     LOG("Initializing HDMI...\n");
     graphics_init(g_out_HDMI);
     graphics_set_buffer(SCREEN[0]);
@@ -1683,6 +1664,23 @@ int main(void) {
         tight_loop_contents();
     }
     LOG("[Core0] Render core started (HDMI + Audio on Core 1)\n");
+
+    // Mount SD card (AFTER HDMI so we can show an error screen on failure).
+    LOG("Mounting SD card...\n");
+    FRESULT res = f_mount(&fs, "", 1);
+    if (res != FR_OK) {
+        LOG("Failed to mount SD card: %d\n", res);
+        // Show a visible error screen and blink the LED while halted.
+        rom_selector_show_sd_error(SCREEN[0], (int)res);
+        // rom_selector_show_sd_error never returns.
+    }
+    LOG("SD card mounted\n");
+
+    // Load settings from SD card
+    LOG("Loading settings...\n");
+    settings_load();
+    LOG("Settings loaded (volume=%d, frameskip=%d, p1=%d, p2=%d)\n",
+        g_settings.volume, g_settings.frameskip, g_settings.p1_mode, g_settings.p2_mode);
 
     // Initialize gamepad (GPIO 20/21/26 — far from HDMI, safe to do after HDMI)
     LOG("Initializing input devices...\n");
