@@ -508,8 +508,18 @@ static inline void snes_mouse_apply_delta(int16_t dx, int16_t dy, uint8_t button
     snes_mouse_buttons = (uint32_t)(buttons & 0x03);
 }
 
+static inline bool mouse_is_connected(void) {
+    if (ps2_mouse_is_initialized()) return true;
+#ifdef USB_HID_ENABLED
+    if (usbhid_mouse_connected()) return true;
+#endif
+    return false;
+}
+
 static void poll_host_mouse(void) {
-    if (!g_settings.mouse_enabled) return;
+    // No user on/off toggle any more — if a mouse is physically attached we
+    // always drive the pointer and let the menu decide which SNES port it
+    // lands on via g_settings.mouse_port.
 
     // PS/2 mouse (streaming via ps2_mouse_poll + get_state)
     if (ps2_mouse_is_initialized()) {
@@ -580,13 +590,13 @@ static void poll_host_mouse(void) {
 #endif
             (long)snes_mouse_x, (long)snes_mouse_y,
             (unsigned)snes_mouse_buttons,
-            (int)g_settings.mouse_enabled);
+            (int)mouse_is_connected());
     }
 }
 
 bool S9xReadMousePosition(int32_t which1, int32_t *x, int32_t *y, uint32_t *buttons) {
     if (which1 != 0) return false;
-    if (!g_settings.mouse_enabled) return false;
+    if (!mouse_is_connected()) return false;
     if (x) *x = snes_mouse_x;
     if (y) *y = snes_mouse_y;
     if (buttons) *buttons = snes_mouse_buttons;
@@ -614,20 +624,19 @@ static inline void snes9x_init(void) {
     Settings.H_Max = SNES_CYCLES_PER_SCANLINE;
     Settings.FrameTimePAL = 20000;
     Settings.FrameTimeNTSC = 16667;
-    // When the SNES mouse is enabled, put the port-2 controller in mouse
-    // mode. S9xProcessMouse() only writes IPPU.Joypads[1] while the
-    // active controller is SNES_MOUSE, so without this the game never
-    // sees the mouse — pointer moves in our code but nothing reaches
-    // the emulated bus.
-    Settings.ControllerOption = g_settings.mouse_enabled ? SNES_MOUSE
-                                                         : SNES_JOYPAD;
+    // If a mouse is physically attached at boot, put the controller in
+    // SNES_MOUSE mode so S9xProcessMouse() actually drives the bus.
+    // Settings.MousePort decides whether the packet lands on port 1 or 2.
+    bool have_mouse = mouse_is_connected();
+    Settings.ControllerOption = have_mouse ? SNES_MOUSE : SNES_JOYPAD;
     Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
     Settings.SoundPlaybackRate = AUDIO_SAMPLE_RATE;
     Settings.DisableSoundEcho = !g_settings.echo_enabled;
     Settings.InterpolatedSound = g_settings.interpolation;
     Settings.Mute = (g_settings.volume == 0);
-    Settings.Mouse = g_settings.mouse_enabled;
-    Settings.MouseMaster = g_settings.mouse_enabled;
+    Settings.Mouse = have_mouse;
+    Settings.MouseMaster = have_mouse;
+    Settings.MousePort = g_settings.mouse_port;
 
     S9xInitDisplay();
     S9xInitMemory();

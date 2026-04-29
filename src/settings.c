@@ -12,6 +12,7 @@
 #include "hardware/watchdog.h"
 #include "nespad/nespad.h"
 #include "ps2kbd/ps2kbd_wrapper.h"
+#include "ps2/ps2.h"
 #include "ff.h"
 #include "snes9x/snapshot.h"
 #include <string.h>
@@ -21,6 +22,14 @@
 #ifdef USB_HID_ENABLED
 #include "usbhid/usbhid.h"
 #endif
+
+bool settings_mouse_connected(void) {
+    if (ps2_mouse_is_initialized()) return true;
+#ifdef USB_HID_ENABLED
+    if (usbhid_mouse_connected()) return true;
+#endif
+    return false;
+}
 
 /* Screen dimensions */
 #define SCREEN_WIDTH  256
@@ -121,7 +130,7 @@ settings_t g_settings = {
     .crt_overscan = false,
     .echo_enabled = false,
     .interpolation = true,
-    .mouse_enabled = true,
+    .mouse_port = MOUSE_PORT_2,
     .btnmap_kbd = BTNMAP_DEFAULT,
     .btnmap_nes = BTNMAP_DEFAULT,
     .btnmap_usb = BTNMAP_DEFAULT,
@@ -431,12 +440,16 @@ static bool is_separator_main(int item) {
     return item == MAIN_SEP1 || item == MAIN_SEP2 || item == MAIN_SEP3 || item == MAIN_SEP4;
 }
 
+static bool mouse_detected_cached = false;
+
 static bool is_hidden_main(int item) {
     /* Hide "Back to Game" when not in a game */
     if (!menu_in_game && item == MAIN_BACK_GAME) return true;
     /* Hide save/load and restart when not in a game */
     if (!menu_in_game && (item == MAIN_SAVE_GAME || item == MAIN_LOAD_GAME ||
                           item == MAIN_SEP3 || item == MAIN_RESTART)) return true;
+    /* Hide SNES mouse port selector when no mouse is connected */
+    if (item == MAIN_MOUSE && !mouse_detected_cached) return true;
     return false;
 }
 
@@ -458,7 +471,7 @@ static const char *main_label(int item) {
         case MAIN_SAVE_GAME: return (status_frames > 0) ? status_msg : "SAVE GAME";
         case MAIN_LOAD_GAME: return save_exists ? "LOAD GAME" : "LOAD GAME (-)";
         case MAIN_BUTTONS:   return "BUTTON MAPPING...";
-        case MAIN_MOUSE:     return "SNES MOUSE";
+        case MAIN_MOUSE:     return "MOUSE PORT";
         case MAIN_VIDEO:     return "VIDEO SETTINGS...";
         case MAIN_AUDIO:     return "AUDIO SETTINGS...";
         case MAIN_RESTART:   return "RESTART GAME";
@@ -487,7 +500,7 @@ static const char *main_value(int item) {
         case MAIN_PLAYER2:
             return input_mode_names[edit.p2_mode];
         case MAIN_MOUSE:
-            return edit.mouse_enabled ? "ON" : "OFF";
+            return edit.mouse_port == MOUSE_PORT_1 ? "GAMEPAD 1" : "GAMEPAD 2";
         default:
             return NULL;
     }
@@ -547,7 +560,7 @@ static void main_change_value(int item, int dir) {
             break;
         }
         case MAIN_MOUSE:
-            edit.mouse_enabled = !edit.mouse_enabled;
+            edit.mouse_port = (edit.mouse_port == MOUSE_PORT_1) ? MOUSE_PORT_2 : MOUSE_PORT_1;
             break;
         default:
             break;
@@ -933,8 +946,9 @@ void settings_load(void) {
             g_settings.echo_enabled = (atoi(value) != 0);
         } else if (strcmp(key, "interpolation") == 0) {
             g_settings.interpolation = (atoi(value) != 0);
-        } else if (strcmp(key, "mouse_enabled") == 0) {
-            g_settings.mouse_enabled = (atoi(value) != 0);
+        } else if (strcmp(key, "mouse_port") == 0) {
+            int v = atoi(value);
+            g_settings.mouse_port = (v == MOUSE_PORT_1) ? MOUSE_PORT_1 : MOUSE_PORT_2;
         } else if (strcmp(key, "btnmap_kbd") == 0) {
             sscanf(value, "%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",
                    &g_settings.btnmap_kbd.map[0], &g_settings.btnmap_kbd.map[1],
@@ -1000,7 +1014,7 @@ bool settings_save(void) {
     f_printf(&file, "crt_overscan=%d\n", g_settings.crt_overscan ? 1 : 0);
     f_printf(&file, "echo=%d\n", g_settings.echo_enabled ? 1 : 0);
     f_printf(&file, "interpolation=%d\n", g_settings.interpolation ? 1 : 0);
-    f_printf(&file, "mouse_enabled=%d\n", g_settings.mouse_enabled ? 1 : 0);
+    f_printf(&file, "mouse_port=%d\n", g_settings.mouse_port);
     f_printf(&file, "btnmap_kbd=%d,%d,%d,%d,%d,%d,%d,%d\n",
              g_settings.btnmap_kbd.map[0], g_settings.btnmap_kbd.map[1],
              g_settings.btnmap_kbd.map[2], g_settings.btnmap_kbd.map[3],
@@ -1042,9 +1056,12 @@ void settings_apply_runtime(void) {
     Settings.InterpolatedSound = g_settings.interpolation;
     Settings.Mute = (g_settings.volume == 0);
 
-    /* Emulation: SNES Mouse (plugged into port 2) */
-    Settings.Mouse = g_settings.mouse_enabled;
-    Settings.MouseMaster = g_settings.mouse_enabled;
+    /* Emulation: SNES Mouse — enabled only while a real mouse is connected.
+     * Port routing (1 or 2) is handled inside the PPU via Settings.MousePort. */
+    bool mouse_on = settings_mouse_connected();
+    Settings.Mouse = mouse_on;
+    Settings.MouseMaster = mouse_on;
+    Settings.MousePort = g_settings.mouse_port;
 
     /* CRT effect */
     graphics_set_crt_active(g_settings.crt_effect);
@@ -1091,6 +1108,10 @@ settings_result_t settings_menu_show(uint8_t *screen_buffer, bool in_game) {
 
     /* Copy settings for editing */
     edit = g_settings;
+
+    /* Latch mouse-connected state for this menu session — is_hidden_main
+     * is consulted while navigating, so we sample once on entry. */
+    mouse_detected_cached = settings_mouse_connected();
 
     /* Check if a save file exists for this ROM */
     save_exists = in_game ? check_save_exists() : false;

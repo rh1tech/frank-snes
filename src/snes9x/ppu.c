@@ -1351,6 +1351,20 @@ PPU_HOT uint8_t S9xGetCPU(uint16_t Address)
          if (Memory.FillRAM [0x4016] & 1)
             return 0;
 
+         if (IPPU.Controller == SNES_MOUSE && Settings.MousePort == 0)
+         {
+            /* Mouse on controller port 1 — streams the same 32-bit packet
+             * layout as the port-2 path below, but clocked out of 0x4016. */
+            if (PPU.Joypad1ButtonReadPos >= 32)
+               return 1;
+            uint32_t p = PPU.Joypad1ButtonReadPos++;
+            uint32_t shift;
+            if (p < 16)      shift = p ^ 15;
+            else if (p < 24) shift = 16 + (23 - p);
+            else             shift = 24 + (31 - p);
+            return (IPPU.Mouse[0] >> shift) & 1;
+         }
+
          if (PPU.Joypad1ButtonReadPos >= 16) /* Joypad 1 is enabled */
             return 1;
 
@@ -1389,7 +1403,7 @@ PPU_HOT uint8_t S9xGetCPU(uint16_t Address)
             return rv;
          }
 
-         if (IPPU.Controller == SNES_MOUSE)
+         if (IPPU.Controller == SNES_MOUSE && Settings.MousePort == 1)
          {
             /* Mouse streams a 32-bit packet on port 2. IPPU.Mouse[0] is
              * laid out with the low 16 bits matching the joypad layout
@@ -1845,7 +1859,11 @@ void S9xProcessMouse(int32_t which1)
       else
          IPPU.Mouse [which1] |= delta_y << 24;
 
-      IPPU.Joypads [1] = IPPU.Mouse [which1];
+      /* Route the packet into the joypad slot matching the configured
+       * controller port. 0x4016/0x4017 readers pull the full 32-bit mouse
+       * packet from IPPU.Mouse[0] regardless, but the joypad mirror still
+       * needs to land on the right port so strobed 16-bit reads look sane. */
+      IPPU.Joypads [Settings.MousePort ? 1 : 0] = IPPU.Mouse [which1];
    }
 }
 

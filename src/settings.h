@@ -30,6 +30,10 @@
 #define SELECTOR_MODE_CAROUSEL 0
 #define SELECTOR_MODE_BROWSER  1
 
+// SNES mouse port assignment
+#define MOUSE_PORT_1 0
+#define MOUSE_PORT_2 1
+
 // Button mapping: 8 remappable SNES buttons (D-pad is always fixed)
 // Each entry maps a SNES button to a physical button index (0-7)
 #define BTNMAP_COUNT 8
@@ -69,7 +73,7 @@ typedef struct {
     bool    interpolation;        // Sound interpolation
 
     // Emulation settings
-    bool    mouse_enabled;        // SNES mouse (controller port 2) enabled
+    uint8_t mouse_port;           // SNES mouse controller port: MOUSE_PORT_1 or MOUSE_PORT_2
 
     // Button mappings per input device
     button_map_t btnmap_kbd;      // Keyboard
@@ -92,6 +96,12 @@ typedef enum {
     SETTINGS_RESULT_ROM_SELECT,   // Return to ROM selector (no reboot)
     SETTINGS_RESULT_RESTART,      // Soft-reset the currently running ROM
 } settings_result_t;
+
+/**
+ * Returns true if a PS/2 or USB mouse is currently connected/initialized.
+ * Used by the settings menu to show/hide the SNES mouse port selector.
+ */
+bool settings_mouse_connected(void);
 
 /**
  * Load settings from SD card (/snes/settings.ini)

@@ -177,6 +177,7 @@ typedef struct
    bool     MultiPlayer5Master;
    bool     SuperScopeMaster;
    bool     MouseMaster;
+   uint8_t  MousePort;            /* 0 = controller port 1, 1 = controller port 2 */
 
    bool     SuperFX;
    bool     DSP1Master;
