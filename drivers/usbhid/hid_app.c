@@ -7,6 +7,7 @@
 #include "tusb.h"
 #include "usbhid.h"
 #include "xinput_host.h"
+#include "hid_rip.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -824,7 +825,28 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
 
         hid_info[instance].report_count = tuh_hid_parse_report_descriptor(
             hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
-        printf("  -> Parsed %d reports from descriptor\n", hid_info[instance].report_count);
+        printf("  -> Parsed %d reports from descriptor (stock tusb)\n",
+               hid_info[instance].report_count);
+
+        // Fallback: some pads ship descriptors the stock tinyusb parser
+        // trips on (multi-report-ID composites, arcade sticks, cheap clones).
+        // Re-parse via the fruit-bat/pico-hid-host RIP, which walks the full
+        // report-item tree including Push/Pop and collection depth. Only
+        // used when the stock parser returns nothing.
+        if (hid_info[instance].report_count == 0) {
+            tuh_hid_report_info_plus_t rip_info[MAX_REPORT];
+            uint8_t n = tuh_hid_parse_report_descriptor_plus(
+                rip_info, MAX_REPORT, desc_report, desc_len);
+            if (n > 0 && n <= MAX_REPORT) {
+                for (uint8_t i = 0; i < n; i++) {
+                    hid_info[instance].report_info[i].report_id  = rip_info[i].report_id;
+                    hid_info[instance].report_info[i].usage      = (uint8_t)rip_info[i].usage;
+                    hid_info[instance].report_info[i].usage_page = rip_info[i].usage_page;
+                }
+                hid_info[instance].report_count = n;
+                printf("  -> RIP fallback recovered %d reports\n", n);
+            }
+        }
 
         bool is_gamepad = false;
         bool is_mouse = false;

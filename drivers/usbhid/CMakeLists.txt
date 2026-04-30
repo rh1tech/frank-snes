@@ -15,6 +15,11 @@ if(USB_HID_ENABLED)
         ${CMAKE_CURRENT_LIST_DIR}/hid_app.c
         ${CMAKE_CURRENT_LIST_DIR}/xinput_host.c
         ${CMAKE_CURRENT_LIST_DIR}/gamepad_cal.c
+        # HID Report Item Parser (RIP) from fruit-bat/pico-hid-host (MIT).
+        # Used as a fallback when tinyusb's stock tuh_hid_parse_report_descriptor
+        # fails to find any reports in a descriptor.
+        ${CMAKE_CURRENT_LIST_DIR}/hid_ri.c
+        ${CMAKE_CURRENT_LIST_DIR}/hid_rip.c
     )
     
     # Include this directory for tusb_config_usbhid.h (renamed to avoid conflict)
