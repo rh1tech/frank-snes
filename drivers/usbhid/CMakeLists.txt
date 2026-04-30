@@ -14,6 +14,7 @@ if(USB_HID_ENABLED)
     target_sources(usbhid INTERFACE
         ${CMAKE_CURRENT_LIST_DIR}/hid_app.c
         ${CMAKE_CURRENT_LIST_DIR}/xinput_host.c
+        ${CMAKE_CURRENT_LIST_DIR}/gamepad_cal.c
     )
     
     # Include this directory for tusb_config_usbhid.h (renamed to avoid conflict)
@@ -25,10 +26,15 @@ if(USB_HID_ENABLED)
         USB_HID_ENABLED=1
     )
     
-    # Link TinyUSB Host
+    # Link TinyUSB Host and FatFs (gamepad_cal.c reads/writes SD)
     target_link_libraries(usbhid INTERFACE
         tinyusb_host
         tinyusb_board
+        fatfs
+    )
+
+    target_include_directories(usbhid INTERFACE
+        ${CMAKE_SOURCE_DIR}/src/fatfs
     )
     
     # If using PIO-USB for secondary USB port

@@ -124,6 +124,9 @@ static unsigned char hid_to_snes(uint8_t code) {
         // F11 = back to ROM selector during gameplay
         case 0x44: return SNES_KEY_F11;    // F11
 
+        // Tab = toggle carousel / file browser
+        case 0x2B: return SNES_KEY_TAB;    // Tab
+
         default: return 0;
     }
 }
@@ -201,6 +204,7 @@ static uint16_t key_to_state_bit(uint8_t key) {
         case SNES_KEY_ESC:    return KBD_STATE_ESC;
         case SNES_KEY_F12:   return KBD_STATE_F12;
         case SNES_KEY_F11:   return KBD_STATE_F11;
+        case SNES_KEY_TAB:   return KBD_STATE_TAB;
         default: return 0;
     }
 }

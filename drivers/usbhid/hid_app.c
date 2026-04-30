@@ -41,15 +41,28 @@ static volatile int mouse_has_motion = 0;
 //--------------------------------------------------------------------
 // Gamepad button map
 //
-// Different HID gamepads lay out their 8-byte reports differently.
+// Different HID gamepads lay out their 8+-byte reports differently.
 // Each entry picks a byte index + bitmask for every logical SNES-facing
-// button. D-pad is always treated as two analog axes (bytes dpad_x/dpad_y)
-// and decoded with the standard <0x40 / >0xC0 thresholds.
+// button. D-pad decoding supports three modes:
+//   DPAD_AXIS: two analog bytes, 0x00=min 0x7F=centre 0xFF=max
+//   DPAD_HAT:  single byte low-nibble hat (0=U, 2=R, 4=D, 6=L, 8=neutral;
+//              1/3/5/7 are diagonals)
+//   DPAD_BITS: four bits in byte 0 (XInput wButtons low) — UP/DOWN/LEFT/RIGHT
 //
 // Canonical output bits (what main.c's usbgp_bits[] expects):
 //   0x0001=A 0x0002=B 0x0004=X 0x0008=Y
 //   0x0010=L 0x0020=R 0x0040=Start 0x0080=Select
+//
+// The known_hid_maps[] table is regenerated from the gamepads/*.txt
+// captures by scripts/gen_gamepad_maps.py — edit captures, rerun script,
+// commit. Manual edits inside the BEGIN/END block will be overwritten.
 //--------------------------------------------------------------------
+
+typedef enum {
+    DPAD_AXIS = 0,   // analog axes on dpad_x, dpad_y
+    DPAD_HAT,        // 8-way hat in byte dpad_x low nibble
+    DPAD_BITS,       // UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08 in byte 0
+} dpad_mode_t;
 
 typedef struct {
     uint8_t byte;
@@ -59,8 +72,9 @@ typedef struct {
 typedef struct {
     uint16_t vid;
     uint16_t pid;
-    uint8_t  dpad_x;        // byte index for d-pad X axis (0xFF = none)
-    uint8_t  dpad_y;        // byte index for d-pad Y axis (0xFF = none)
+    dpad_mode_t dpad_mode;
+    uint8_t  dpad_x;        // AXIS: X axis byte. HAT: hat byte. BITS: unused.
+    uint8_t  dpad_y;        // AXIS: Y axis byte. Otherwise unused.
     btn_bit_t a;
     btn_bit_t b;
     btn_bit_t x;
@@ -71,14 +85,12 @@ typedef struct {
     btn_bit_t select;
 } gamepad_map_t;
 
-// Known HID gamepads harvested via frank-gamepad's capture tool.
-// The three families we actually see on the bench.
+// BEGIN GENERATED GAMEPAD MAPS — do not hand-edit (see scripts/gen_gamepad_maps.py)
 static const gamepad_map_t known_hid_maps[] = {
-    // SNES USB clone (iNNEXT / Retrolink style). Capture: gamepad_081F_E401.txt
-    // baseline: 7F 7F 00 80 80 0F 00 00
+    // Capture: gamepad_0079_0006.txt  baseline: 7F 7F 00 80 80 0F 00 00
     {
-        .vid = 0x081F, .pid = 0xE401,
-        .dpad_x = 0, .dpad_y = 1,
+        .vid = 0x0079, .pid = 0x0006,
+        .dpad_mode = DPAD_AXIS, .dpad_x = 0, .dpad_y = 1,
         .a      = { .byte = 5, .mask = 0x20 },
         .b      = { .byte = 5, .mask = 0x40 },
         .x      = { .byte = 5, .mask = 0x10 },
@@ -88,11 +100,36 @@ static const gamepad_map_t known_hid_maps[] = {
         .start  = { .byte = 6, .mask = 0x20 },
         .select = { .byte = 6, .mask = 0x10 },
     },
-    // SpeedLink / cheap clone layout. Capture: gamepad_11FF_3331.txt
-    // baseline: 7F 7F 7F 7F 7F 0F 00 A0
+    // Capture: gamepad_046D_C219.txt  baseline: 01 80 7F 80 7F 08 00 74
+    {
+        .vid = 0x046D, .pid = 0xC219,
+        .dpad_mode = DPAD_HAT, .dpad_x = 5, .dpad_y = 0,
+        .a      = { .byte = 5, .mask = 0x20 },
+        .b      = { .byte = 5, .mask = 0x40 },
+        .x      = { .byte = 5, .mask = 0x10 },
+        .y      = { .byte = 5, .mask = 0x80 },
+        .l      = { .byte = 6, .mask = 0x01 },
+        .r      = { .byte = 6, .mask = 0x02 },
+        .start  = { .byte = 6, .mask = 0x20 },
+        .select = { .byte = 6, .mask = 0x10 },
+    },
+    // Capture: gamepad_081F_E401.txt  baseline: 7F 7F 00 80 80 0F 00 00
+    {
+        .vid = 0x081F, .pid = 0xE401,
+        .dpad_mode = DPAD_AXIS, .dpad_x = 0, .dpad_y = 1,
+        .a      = { .byte = 5, .mask = 0x20 },
+        .b      = { .byte = 5, .mask = 0x40 },
+        .x      = { .byte = 5, .mask = 0x10 },
+        .y      = { .byte = 5, .mask = 0x80 },
+        .l      = { .byte = 6, .mask = 0x01 },
+        .r      = { .byte = 6, .mask = 0x02 },
+        .start  = { .byte = 6, .mask = 0x20 },
+        .select = { .byte = 6, .mask = 0x10 },
+    },
+    // Capture: gamepad_11FF_3331.txt  baseline: 7F 7F 7F 7F 7F 0F 00 A0
     {
         .vid = 0x11FF, .pid = 0x3331,
-        .dpad_x = 0, .dpad_y = 1,
+        .dpad_mode = DPAD_AXIS, .dpad_x = 0, .dpad_y = 1,
         .a      = { .byte = 5, .mask = 0x80 },
         .b      = { .byte = 5, .mask = 0x40 },
         .x      = { .byte = 5, .mask = 0x20 },
@@ -102,13 +139,40 @@ static const gamepad_map_t known_hid_maps[] = {
         .start  = { .byte = 6, .mask = 0x20 },
         .select = { .byte = 6, .mask = 0x10 },
     },
+    // Capture: gamepad_2563_0575.txt  baseline: 00 00 08 80 80 80 80 00 00 00 00 00 00 00 00 00 00 00 00 00 02 80 01 00 02 00 02
+    {
+        .vid = 0x2563, .pid = 0x0575,
+        .dpad_mode = DPAD_HAT, .dpad_x = 2, .dpad_y = 0,
+        .a      = { .byte = 0, .mask = 0x04 },
+        .b      = { .byte = 0, .mask = 0x02 },
+        .x      = { .byte = 0, .mask = 0x08 },
+        .y      = { .byte = 0, .mask = 0x01 },
+        .l      = { .byte = 0, .mask = 0x10 },
+        .r      = { .byte = 0, .mask = 0x20 },
+        .start  = { .byte = 1, .mask = 0x02 },
+        .select = { .byte = 1, .mask = 0x01 },
+    },
+    // Capture: gamepad_FEED_2320.txt  baseline: 07 80 80 80 80 08 00 00
+    {
+        .vid = 0xFEED, .pid = 0x2320,
+        .dpad_mode = DPAD_HAT, .dpad_x = 5, .dpad_y = 0,
+        .a      = { .byte = 6, .mask = 0x01 },
+        .b      = { .byte = 6, .mask = 0x02 },
+        .x      = { .byte = 6, .mask = 0x08 },
+        .y      = { .byte = 6, .mask = 0x04 },
+        .l      = { .byte = 6, .mask = 0x10 },
+        .r      = { .byte = 6, .mask = 0x20 },
+        .start  = { .byte = 7, .mask = 0x08 },
+        .select = { .byte = 7, .mask = 0x04 },
+    },
 };
+// END GENERATED GAMEPAD MAPS
 
-// Fallback layout — matches the original hardcoded table for unknown pads.
-// Same bits as the 0x081F/0xE401 pad; close enough for most SNES clones.
+// Fallback layout for unknown HID pads — same bits as the 0x081F/0xE401
+// SNES clone, since that's what most cheap pads look like.
 static const gamepad_map_t fallback_hid_map = {
     .vid = 0, .pid = 0,
-    .dpad_x = 3, .dpad_y = 4,   // old heuristic used bytes 3/4 for d-pad
+    .dpad_mode = DPAD_AXIS, .dpad_x = 3, .dpad_y = 4,
     .a      = { .byte = 5, .mask = 0x20 },
     .b      = { .byte = 5, .mask = 0x40 },
     .x      = { .byte = 5, .mask = 0x10 },
@@ -119,12 +183,13 @@ static const gamepad_map_t fallback_hid_map = {
     .select = { .byte = 6, .mask = 0x10 },
 };
 
-// XInput synthetic frame layout — see tuh_xinput_report_received_cb() below:
+// XInput synthetic frame layout — see tuh_xinput_report_received_cb() below.
+// The generic Xbox face layout; overridden per VID/PID in known_xinput_maps.
 //   byte[0] = wButtons low  (DPAD + START/BACK + LS/RS)
 //   byte[1] = wButtons high (LB=0x01 RB=0x02 A=0x10 B=0x20 X=0x40 Y=0x80)
-static const gamepad_map_t xinput_map = {
+static const gamepad_map_t xinput_default_map = {
     .vid = 0, .pid = 0,
-    .dpad_x = 0xFF, .dpad_y = 0xFF,  // dpad encoded as bits in byte 0
+    .dpad_mode = DPAD_BITS, .dpad_x = 0xFF, .dpad_y = 0xFF,
     .a      = { .byte = 1, .mask = 0x10 },
     .b      = { .byte = 1, .mask = 0x20 },
     .x      = { .byte = 1, .mask = 0x40 },
@@ -135,6 +200,38 @@ static const gamepad_map_t xinput_map = {
     .select = { .byte = 0, .mask = 0x20 },
 };
 
+// BEGIN GENERATED XINPUT MAPS — do not hand-edit (see scripts/gen_gamepad_maps.py)
+static const gamepad_map_t known_xinput_maps[] = {
+    // Capture: gamepad_045E_028E.txt  baseline: 00 00 00 00 00 00 00 00
+    {
+        .vid = 0x045E, .pid = 0x028E,
+        .dpad_mode = DPAD_BITS, .dpad_x = 0xFF, .dpad_y = 0xFF,
+        .a      = { .byte = 1, .mask = 0x20 },
+        .b      = { .byte = 1, .mask = 0x10 },
+        .x      = { .byte = 1, .mask = 0x80 },
+        .y      = { .byte = 1, .mask = 0x40 },
+        .l      = { .byte = 1, .mask = 0x01 },
+        .r      = { .byte = 1, .mask = 0x02 },
+        .start  = { .byte = 0, .mask = 0x10 },
+        .select = { .byte = 0, .mask = 0x20 },
+    },
+    // Capture: gamepad_046D_C21F.txt  baseline: 00 00 00 00 00 00 00 00
+    {
+        .vid = 0x046D, .pid = 0xC21F,
+        .dpad_mode = DPAD_BITS, .dpad_x = 0xFF, .dpad_y = 0xFF,
+        .a      = { .byte = 1, .mask = 0x10 },
+        .b      = { .byte = 1, .mask = 0x20 },
+        .x      = { .byte = 1, .mask = 0x40 },
+        .y      = { .byte = 1, .mask = 0x80 },
+        .l      = { .byte = 1, .mask = 0x01 },
+        .r      = { .byte = 1, .mask = 0x02 },
+        .start  = { .byte = 0, .mask = 0x10 },
+        .select = { .byte = 0, .mask = 0x20 },
+    },
+};
+static const size_t known_xinput_map_count = sizeof(known_xinput_maps) / sizeof(known_xinput_maps[0]);
+// END GENERATED XINPUT MAPS
+
 static const gamepad_map_t *find_hid_map(uint16_t vid, uint16_t pid) {
     for (size_t i = 0; i < sizeof(known_hid_maps) / sizeof(known_hid_maps[0]); i++) {
         if (known_hid_maps[i].vid == vid && known_hid_maps[i].pid == pid)
@@ -143,8 +240,19 @@ static const gamepad_map_t *find_hid_map(uint16_t vid, uint16_t pid) {
     return &fallback_hid_map;
 }
 
+static const gamepad_map_t *find_xinput_map(uint16_t vid, uint16_t pid) {
+    for (size_t i = 0; i < known_xinput_map_count; i++) {
+        if (known_xinput_maps[i].vid == vid && known_xinput_maps[i].pid == pid)
+            return &known_xinput_maps[i];
+    }
+    return &xinput_default_map;
+}
+
 // Gamepad state — two slots for two USB gamepads
 #define MAX_GAMEPADS 2
+
+// Max report length we track for calibration (covers every known pad).
+#define GP_RAW_MAX_LEN 32
 
 typedef enum {
     GP_SRC_NONE = 0,
@@ -162,9 +270,112 @@ typedef struct {
     uint8_t instance;
     gp_source_t source;
     const gamepad_map_t *map;
+
+    // Calibration / learn-mode support.
+    // Menu A/B are independent of the slot's in-game map: the wizard only
+    // teaches us which bits to treat as A and B for menu navigation, so
+    // in-game button mapping (settings->btnmap_usb) is untouched.
+    uint16_t vid;
+    uint16_t pid;
+    // needs_calibration: set when no compiled-in or saved profile matches
+    // VID/PID on mount. Cleared when the wizard finishes (or is skipped).
+    volatile int needs_calibration;
+    // Last raw report captured (truncated to GP_RAW_MAX_LEN). Used by the
+    // wizard to diff against the resting baseline and detect a button press.
+    uint8_t raw_report[GP_RAW_MAX_LEN];
+    uint8_t raw_len;
+    // Baseline = first raw report observed after mount.
+    uint8_t raw_baseline[GP_RAW_MAX_LEN];
+    int     raw_baseline_valid;
+    // Menu A/B bit descriptors. ab_valid bit 0 = A taught, bit 1 = B taught.
+    btn_bit_t menu_a;
+    btn_bit_t menu_b;
+    uint8_t   ab_valid;
 } gamepad_slot_t;
 
 static gamepad_slot_t gamepad_slots[MAX_GAMEPADS] = {0};
+
+// Runtime table of learned menu-A/B profiles, populated at boot by
+// usbhid_learned_ab_add() (called for each /snes/gamepads/*.txt file).
+typedef struct {
+    uint16_t vid;
+    uint16_t pid;
+    gp_source_t source;
+    btn_bit_t a;
+    btn_bit_t b;
+} learned_ab_t;
+
+#define MAX_LEARNED_AB 16
+static learned_ab_t learned_ab_table[MAX_LEARNED_AB];
+static size_t learned_ab_count = 0;
+
+// Session-seen table: (vid, pid, source) tuples that have already been
+// through the calibration wizard since power-on. We intentionally do NOT
+// persist this — the user wants the wizard to run once per boot for every
+// gamepad that physically connects, even if we already have a saved
+// profile on SD or a compiled-in map. A hot-unplug/replug during the
+// same session is suppressed.
+#define MAX_SESSION_SEEN 8
+typedef struct {
+    uint16_t vid;
+    uint16_t pid;
+    gp_source_t source;
+} session_seen_t;
+static session_seen_t session_seen[MAX_SESSION_SEEN];
+static size_t session_seen_count = 0;
+
+static bool session_seen_contains(uint16_t vid, uint16_t pid, gp_source_t src) {
+    for (size_t i = 0; i < session_seen_count; i++) {
+        if (session_seen[i].vid == vid && session_seen[i].pid == pid &&
+            session_seen[i].source == src)
+            return true;
+    }
+    return false;
+}
+
+static void session_seen_add(uint16_t vid, uint16_t pid, gp_source_t src) {
+    if (session_seen_contains(vid, pid, src)) return;
+    if (session_seen_count >= MAX_SESSION_SEEN) return;
+    session_seen[session_seen_count].vid = vid;
+    session_seen[session_seen_count].pid = pid;
+    session_seen[session_seen_count].source = src;
+    session_seen_count++;
+}
+
+// Look up a previously learned menu-A/B profile (loaded from SD at boot).
+static const learned_ab_t *find_learned_ab(uint16_t vid, uint16_t pid, gp_source_t src) {
+    for (size_t i = 0; i < learned_ab_count; i++) {
+        if (learned_ab_table[i].vid == vid && learned_ab_table[i].pid == pid &&
+            learned_ab_table[i].source == src)
+            return &learned_ab_table[i];
+    }
+    return NULL;
+}
+
+// Seed menu A/B bits for a slot from the best available mapping:
+//   1. SD-loaded learned profile (user ran the wizard before),
+//   2. Compiled-in map's .a/.b bits (trust the curated default),
+//   3. Nothing — slot stays ab_valid=0 until the wizard teaches it.
+//
+// This always runs at mount; the wizard decision is independent — see
+// should_run_wizard(). The wizard runs even when A/B bits are already
+// seeded, so the user can re-confirm A/B on every physical connect.
+static void seed_menu_ab(int slot, uint16_t vid, uint16_t pid,
+                         gp_source_t src, const gamepad_map_t *compiled_map,
+                         const gamepad_map_t *fallback) {
+    const learned_ab_t *p = find_learned_ab(vid, pid, src);
+    if (p) {
+        gamepad_slots[slot].menu_a = p->a;
+        gamepad_slots[slot].menu_b = p->b;
+        gamepad_slots[slot].ab_valid = 0x03;
+        return;
+    }
+    if (compiled_map && compiled_map != fallback) {
+        gamepad_slots[slot].menu_a = compiled_map->a;
+        gamepad_slots[slot].menu_b = compiled_map->b;
+        gamepad_slots[slot].ab_valid = 0x03;
+    }
+}
 
 static int find_or_alloc_gamepad_slot(uint8_t dev_addr, uint8_t inst, gp_source_t src) {
     for (int i = 0; i < MAX_GAMEPADS; i++) {
@@ -328,22 +539,57 @@ static void process_gamepad_report(int slot, uint8_t const *report, uint16_t len
     gamepad_slot_t *gp = &gamepad_slots[slot];
     const gamepad_map_t *m = gp->map ? gp->map : &fallback_hid_map;
 
-    // D-pad. Two decoding strategies:
-    //   * analog axes (dpad_x/dpad_y byte indices): 0x00=min 0x7F=centre 0xFF=max
-    //   * bit-packed (dpad_x == 0xFF): XInput-style UP/DOWN/LEFT/RIGHT in byte 0
+    // Snapshot raw report for the calibration wizard. We truncate, not
+    // reject, so the wizard can still diff shorter reports.
+    uint8_t copy_len = len > GP_RAW_MAX_LEN ? GP_RAW_MAX_LEN : (uint8_t)len;
+    memcpy(gp->raw_report, report, copy_len);
+    gp->raw_len = copy_len;
+    if (!gp->raw_baseline_valid) {
+        memcpy(gp->raw_baseline, report, copy_len);
+        // Zero any tail past what we just captured.
+        if (copy_len < GP_RAW_MAX_LEN)
+            memset(gp->raw_baseline + copy_len, 0, GP_RAW_MAX_LEN - copy_len);
+        gp->raw_baseline_valid = 1;
+    }
+
+    // D-pad decoding depends on the map's dpad_mode. See gamepad_map_t.
     uint8_t dpad = 0;
-    if (m->dpad_x != 0xFF && m->dpad_y != 0xFF &&
-        m->dpad_x < len && m->dpad_y < len) {
-        if (report[m->dpad_x] < 0x40) dpad |= 0x04; // Left
-        if (report[m->dpad_x] > 0xC0) dpad |= 0x08; // Right
-        if (report[m->dpad_y] < 0x40) dpad |= 0x01; // Up
-        if (report[m->dpad_y] > 0xC0) dpad |= 0x02; // Down
-    } else if (len >= 1) {
-        // XInput wButtons low byte: DPAD_UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08
-        if (report[0] & 0x01) dpad |= 0x01; // Up
-        if (report[0] & 0x02) dpad |= 0x02; // Down
-        if (report[0] & 0x04) dpad |= 0x04; // Left
-        if (report[0] & 0x08) dpad |= 0x08; // Right
+    switch (m->dpad_mode) {
+        case DPAD_AXIS:
+            if (m->dpad_x < len && m->dpad_y < len) {
+                if (report[m->dpad_x] < 0x40) dpad |= 0x04; // Left
+                if (report[m->dpad_x] > 0xC0) dpad |= 0x08; // Right
+                if (report[m->dpad_y] < 0x40) dpad |= 0x01; // Up
+                if (report[m->dpad_y] > 0xC0) dpad |= 0x02; // Down
+            }
+            break;
+        case DPAD_HAT:
+            if (m->dpad_x < len) {
+                // 8-way hat in the low nibble: 0=U, 1=UR, 2=R, 3=DR,
+                // 4=D, 5=DL, 6=L, 7=UL, 8=neutral.
+                uint8_t h = report[m->dpad_x] & 0x0F;
+                switch (h) {
+                    case 0: dpad = 0x01; break;                 // U
+                    case 1: dpad = 0x01 | 0x08; break;          // U+R
+                    case 2: dpad = 0x08; break;                 // R
+                    case 3: dpad = 0x02 | 0x08; break;          // D+R
+                    case 4: dpad = 0x02; break;                 // D
+                    case 5: dpad = 0x02 | 0x04; break;          // D+L
+                    case 6: dpad = 0x04; break;                 // L
+                    case 7: dpad = 0x01 | 0x04; break;          // U+L
+                    default: dpad = 0; break;                   // neutral/invalid
+                }
+            }
+            break;
+        case DPAD_BITS:
+            // XInput wButtons low byte: UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08
+            if (len >= 1) {
+                if (report[0] & 0x01) dpad |= 0x01;
+                if (report[0] & 0x02) dpad |= 0x02;
+                if (report[0] & 0x04) dpad |= 0x04;
+                if (report[0] & 0x08) dpad |= 0x08;
+            }
+            break;
     }
     gp->dpad = dpad;
 
@@ -475,10 +721,35 @@ void tuh_xinput_mount_cb(uint8_t dev_addr, uint8_t instance, const xinputh_inter
         tuh_xinput_receive_report(dev_addr, instance);
         return;
     }
+    uint16_t vid = 0, pid = 0;
+    tuh_vid_pid_get(dev_addr, &vid, &pid);
     gamepad_slots[slot].connected = 1;
-    gamepad_slots[slot].map = &xinput_map;
+    gamepad_slots[slot].vid = vid;
+    gamepad_slots[slot].pid = pid;
+    gamepad_slots[slot].map = find_xinput_map(vid, pid);
     gamepad_slots[slot].buttons = 0;
     gamepad_slots[slot].dpad = 0;
+    gamepad_slots[slot].raw_len = 0;
+    gamepad_slots[slot].raw_baseline_valid = 0;
+    gamepad_slots[slot].ab_valid = 0;
+    // Need calibration only when we don't already have a saved A/B profile
+    // for this VID/PID. (A compiled-in xinput map still drives in-game
+    // input, but we want explicit menu A/B persistence.)
+    seed_menu_ab(slot, vid, pid, GP_SRC_XINPUT,
+                 gamepad_slots[slot].map, &xinput_default_map);
+    /* Wizard policy:
+     *   - SD profile exists for this VID/PID -> trust it, skip wizard
+     *     (the user has already taught us and it survives reboot);
+     *   - otherwise run the wizard on every physical connect within a
+     *     session, and remember it in session_seen so a hot-replug
+     *     of the same pad doesn't re-prompt;
+     *   - rebooting wipes session_seen so the wizard re-arms. */
+    bool have_sd_profile = find_learned_ab(vid, pid, GP_SRC_XINPUT) != NULL;
+    gamepad_slots[slot].needs_calibration =
+        (have_sd_profile || session_seen_contains(vid, pid, GP_SRC_XINPUT)) ? 0 : 1;
+    printf("  -> VID=0x%04X PID=0x%04X (%s)\n", vid, pid,
+           have_sd_profile ? "sd-profile" :
+           gamepad_slots[slot].needs_calibration ? "wizard-pending" : "seen-this-session");
 
     // Light the player-1 quadrant LED on 360 pads so the user sees the
     // association; XBone ignores the command.
@@ -594,10 +865,22 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
                 uint16_t vid = 0, pid = 0;
                 tuh_vid_pid_get(dev_addr, &vid, &pid);
                 gamepad_slots[slot].connected = 1;
+                gamepad_slots[slot].vid = vid;
+                gamepad_slots[slot].pid = pid;
                 gamepad_slots[slot].map = find_hid_map(vid, pid);
+                gamepad_slots[slot].raw_len = 0;
+                gamepad_slots[slot].raw_baseline_valid = 0;
+                gamepad_slots[slot].ab_valid = 0;
+                seed_menu_ab(slot, vid, pid, GP_SRC_HID,
+                             gamepad_slots[slot].map, &fallback_hid_map);
+                bool have_sd_profile = find_learned_ab(vid, pid, GP_SRC_HID) != NULL;
+                gamepad_slots[slot].needs_calibration =
+                    (have_sd_profile || session_seen_contains(vid, pid, GP_SRC_HID))
+                        ? 0 : 1;
                 printf("  -> GAMEPAD slot %d VID=0x%04X PID=0x%04X (%s)\n",
                        slot, vid, pid,
-                       gamepad_slots[slot].map == &fallback_hid_map ? "fallback" : "known");
+                       have_sd_profile ? "sd-profile" :
+                       gamepad_slots[slot].needs_calibration ? "wizard-pending" : "seen-this-session");
             } else {
                 printf("  -> GAMEPAD slots full, ignored\n");
             }
@@ -763,6 +1046,9 @@ static uint16_t hid_to_kbd_state_bit(uint8_t keycode) {
         // F11 -> back to ROM selector during gameplay
         case 0x44: return (1 << 14); // F11 -> KBD_STATE_F11
 
+        // Tab -> toggle carousel / file browser
+        case 0x2B: return (1 << 15); // Tab -> KBD_STATE_TAB
+
         default: return 0;
     }
 }
@@ -833,6 +1119,154 @@ void usbhid_get_gamepad_state(usbhid_gamepad_state_t *state) {
             state->connected = 1;
         }
     }
+}
+
+//--------------------------------------------------------------------
+// Menu-A/B calibration API
+//--------------------------------------------------------------------
+
+int usbhid_gamepad_needs_calibration(int idx) {
+    if (idx < 0 || idx >= MAX_GAMEPADS) return 0;
+    if (!gamepad_slots[idx].connected) return 0;
+    return gamepad_slots[idx].needs_calibration;
+}
+
+void usbhid_gamepad_clear_calibration(int idx) {
+    if (idx < 0 || idx >= MAX_GAMEPADS) return;
+    gamepad_slot_t *gp = &gamepad_slots[idx];
+    gp->needs_calibration = 0;
+    /* Record this VID/PID+source as seen so a hot-replug during the
+     * same session doesn't trigger the wizard again. */
+    if (gp->connected && gp->source != GP_SRC_NONE)
+        session_seen_add(gp->vid, gp->pid, gp->source);
+}
+
+int usbhid_gamepad_get_raw_info(int idx, usbhid_gamepad_raw_info_t *out) {
+    if (!out || idx < 0 || idx >= MAX_GAMEPADS) return 0;
+    gamepad_slot_t *gp = &gamepad_slots[idx];
+    if (!gp->connected || !gp->raw_baseline_valid || gp->raw_len == 0) return 0;
+    out->vid = gp->vid;
+    out->pid = gp->pid;
+    out->source = (gp->source == GP_SRC_XINPUT) ? USBHID_GP_SRC_XINPUT :
+                  (gp->source == GP_SRC_HID)    ? USBHID_GP_SRC_HID    :
+                                                   USBHID_GP_SRC_NONE;
+    out->report_len = gp->raw_len;
+    memcpy(out->baseline, gp->raw_baseline, sizeof(out->baseline));
+    memcpy(out->raw, gp->raw_report, sizeof(out->raw));
+    return 1;
+}
+
+int usbhid_gamepad_find_pressed_bit(int idx, uint8_t *byte_idx, uint8_t *mask) {
+    if (idx < 0 || idx >= MAX_GAMEPADS) return 0;
+    gamepad_slot_t *gp = &gamepad_slots[idx];
+    if (!gp->connected || !gp->raw_baseline_valid || gp->raw_len == 0) return 0;
+
+    // XOR against baseline so we detect both press-to-1 and press-to-0.
+    int found_byte = -1;
+    uint8_t found_mask = 0;
+    int popcount = 0;
+    for (uint8_t b = 0; b < gp->raw_len; b++) {
+        uint8_t diff = gp->raw_report[b] ^ gp->raw_baseline[b];
+        if (!diff) continue;
+        // Skip analog-stick drift: if baseline and current are both in
+        // the centre band (0x60-0xA0), we're almost certainly seeing a
+        // ±1 LSB wiggle, not a button. XInput pads do this constantly.
+        uint8_t base = gp->raw_baseline[b];
+        uint8_t cur  = gp->raw_report[b];
+        if (base >= 0x60 && base <= 0xA0 && cur >= 0x60 && cur <= 0xA0) continue;
+        for (int bit = 0; bit < 8; bit++) {
+            if (diff & (1u << bit)) {
+                if (found_byte < 0) {
+                    found_byte = b;
+                    found_mask = 1u << bit;
+                }
+                popcount++;
+            }
+        }
+    }
+    if (popcount != 1) return 0;
+    if (byte_idx) *byte_idx = (uint8_t)found_byte;
+    if (mask)     *mask     = found_mask;
+    return 1;
+}
+
+void usbhid_gamepad_set_menu_ab(int idx,
+                                uint8_t a_byte, uint8_t a_mask,
+                                uint8_t b_byte, uint8_t b_mask) {
+    if (idx < 0 || idx >= MAX_GAMEPADS) return;
+    gamepad_slots[idx].menu_a.byte = a_byte;
+    gamepad_slots[idx].menu_a.mask = a_mask;
+    gamepad_slots[idx].menu_b.byte = b_byte;
+    gamepad_slots[idx].menu_b.mask = b_mask;
+    gamepad_slots[idx].ab_valid = 0x03;
+}
+
+int usbhid_learned_ab_add(usbhid_gp_src_t source,
+                          uint16_t vid, uint16_t pid,
+                          uint8_t a_byte, uint8_t a_mask,
+                          uint8_t b_byte, uint8_t b_mask) {
+    if (learned_ab_count >= MAX_LEARNED_AB) return -1;
+    gp_source_t src = (source == USBHID_GP_SRC_XINPUT) ? GP_SRC_XINPUT :
+                      (source == USBHID_GP_SRC_HID)    ? GP_SRC_HID    :
+                                                          GP_SRC_NONE;
+    // Replace existing entry with the same (vid, pid, source) instead
+    // of appending — keeps the table tidy if a user re-runs the wizard.
+    for (size_t i = 0; i < learned_ab_count; i++) {
+        if (learned_ab_table[i].vid == vid && learned_ab_table[i].pid == pid &&
+            learned_ab_table[i].source == src) {
+            learned_ab_table[i].a.byte = a_byte;
+            learned_ab_table[i].a.mask = a_mask;
+            learned_ab_table[i].b.byte = b_byte;
+            learned_ab_table[i].b.mask = b_mask;
+            return 0;
+        }
+    }
+    learned_ab_table[learned_ab_count].vid = vid;
+    learned_ab_table[learned_ab_count].pid = pid;
+    learned_ab_table[learned_ab_count].source = src;
+    learned_ab_table[learned_ab_count].a.byte = a_byte;
+    learned_ab_table[learned_ab_count].a.mask = a_mask;
+    learned_ab_table[learned_ab_count].b.byte = b_byte;
+    learned_ab_table[learned_ab_count].b.mask = b_mask;
+    learned_ab_count++;
+    return 0;
+}
+
+void usbhid_learned_ab_clear(void) {
+    learned_ab_count = 0;
+    /* Also forget this session's "already-calibrated" record so the
+     * wizard re-prompts on the next physical connect of any pad. */
+    session_seen_count = 0;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        gamepad_slot_t *gp = &gamepad_slots[i];
+        if (!gp->connected) continue;
+        // Wipe the learned A/B, then re-seed from the compiled map
+        // (if any) and re-arm calibration so the next selector visit
+        // runs the wizard again for this pad.
+        gp->ab_valid = 0;
+        const gamepad_map_t *fallback = (gp->source == GP_SRC_XINPUT)
+            ? &xinput_default_map : &fallback_hid_map;
+        seed_menu_ab(i, gp->vid, gp->pid, gp->source, gp->map, fallback);
+        gp->needs_calibration = 1;
+    }
+}
+
+int usbhid_gamepad_get_menu_ab(int idx, int *out_a, int *out_b) {
+    if (idx < 0 || idx >= MAX_GAMEPADS) return 0;
+    gamepad_slot_t *gp = &gamepad_slots[idx];
+    if (!gp->connected || !gp->ab_valid || gp->raw_len == 0) {
+        if (out_a) *out_a = 0;
+        if (out_b) *out_b = 0;
+        return 0;
+    }
+    int a = 0, b = 0;
+    if ((gp->ab_valid & 0x01) && gp->menu_a.byte < gp->raw_len)
+        a = (gp->raw_report[gp->menu_a.byte] & gp->menu_a.mask) ? 1 : 0;
+    if ((gp->ab_valid & 0x02) && gp->menu_b.byte < gp->raw_len)
+        b = (gp->raw_report[gp->menu_b.byte] & gp->menu_b.mask) ? 1 : 0;
+    if (out_a) *out_a = a;
+    if (out_b) *out_b = b;
+    return 1;
 }
 
 #endif // CFG_TUH_ENABLED

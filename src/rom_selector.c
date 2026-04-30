@@ -845,7 +845,9 @@ static void draw_selector_text(int selected) {
     if (info_state == INFO_SHOWN)
         fb_text_center(SCREEN_H - 14, "DOWN   A:START", PAL_GRAY);
     else if (info_state == INFO_HIDDEN)
-        fb_text_center(SCREEN_H - 14, "A:START SEL+A:FIND SEL+START:BROWSE", PAL_GRAY);
+        fb_text_center(SCREEN_H - 14,
+                       "A:START  SEL+A:FIND  TAB:BROWSE  F12:MENU",
+                       PAL_GRAY);
 }
 
 static void draw_scene(int selected, uint32_t frame_count) {
@@ -883,6 +885,7 @@ static void draw_scene(int selected, uint32_t frame_count) {
 #define BTN_F12   0x0080
 #define BTN_B     0x0100
 #define BTN_ESC   0x0200   /* ESC (distinct from F12 so file browser can tell them apart) */
+#define BTN_TAB   0x0400   /* Tab: toggle between carousel and file browser */
 
 static int read_selector_buttons(void) {
     nespad_read();
@@ -911,6 +914,7 @@ static int read_selector_buttons(void) {
     if (kbd & KBD_STATE_SELECT) buttons |= BTN_SEL;
     if (kbd & KBD_STATE_F12)   buttons |= BTN_F12;
     if (kbd & KBD_STATE_ESC)   buttons |= BTN_ESC;
+    if (kbd & KBD_STATE_TAB)   buttons |= BTN_TAB;
 #ifdef USB_HID_ENABLED
     usbhid_task();
     if (usbhid_gamepad_connected()) {
@@ -920,10 +924,22 @@ static int read_selector_buttons(void) {
         if (gp.dpad & 0x02) buttons |= BTN_DOWN;
         if (gp.dpad & 0x04) buttons |= BTN_LEFT;
         if (gp.dpad & 0x08) buttons |= BTN_RIGHT;
+        /* Merged-pad fallback A/B: matches whatever the compiled map
+         * says, which is correct for known pads. */
         if (gp.buttons & 0x01) buttons |= BTN_A;
         if (gp.buttons & 0x02) buttons |= BTN_B;
         if (gp.buttons & 0x40) buttons |= BTN_START;
         if (gp.buttons & 0x80) buttons |= BTN_SEL;
+        /* Per-slot menu A/B override from the calibration wizard:
+         * overrides the fallback interpretation for pads the user has
+         * taught. OR'd so a learned A/B also fires the normal handler. */
+        for (int i = 0; i < 2; i++) {
+            int ma = 0, mb = 0;
+            if (usbhid_gamepad_get_menu_ab(i, &ma, &mb)) {
+                if (ma) buttons |= BTN_A;
+                if (mb) buttons |= BTN_B;
+            }
+        }
     }
 #endif
     return buttons;
@@ -1077,7 +1093,9 @@ static void fb_draw_browser(const char *path, int selected, int scroll) {
 
     /* Footer */
     fb_hline(0, SCREEN_H - 22, SCREEN_W, PAL_GRAY);
-    fb_text_center(SCREEN_H - 19, "A:OPEN B:BACK SEL+A:FIND", PAL_GRAY);
+    fb_text_center(SCREEN_H - 19,
+                   "A:OPEN B:BACK TAB:CAROUSEL F12:MENU",
+                   PAL_GRAY);
 }
 
 /* Persistent state across browser calls */
@@ -1191,10 +1209,50 @@ static fb_result_t file_browser_show(char *out_path, size_t out_sz, int *out_idx
         }
         prev_buttons = buttons;
 
-        /* Select+Start: back to carousel (checked FIRST so it never leaks) */
-        bool sel_start = ((pressed & BTN_SEL) && (buttons & BTN_START)) ||
-                         ((pressed & BTN_START) && (buttons & BTN_SEL));
-        if (sel_start) {
+        /* Select+Start+A opens Settings, Select+Start alone toggles back
+         * to carousel. Buffer the Select+Start edge and only fire the
+         * toggle on full release, so pressing A during the hold routes
+         * to Settings instead. See matching block in the carousel loop. */
+        static bool fb_ss_held = false;
+        static bool fb_ss_consumed = false;
+        bool ss_now = (buttons & BTN_SEL) && (buttons & BTN_START);
+
+        bool open_settings =
+            (ss_now && (pressed & BTN_A)) ||
+            (pressed & BTN_F12);
+        if (open_settings) {
+            fb_ss_consumed = true;
+            graphics_set_buffer(SCREEN[0]);
+            graphics_set_res(SCREEN_W, SCREEN_H);
+            settings_menu_show(SCREEN[0], false);
+            settings_save();
+            setup_selector_palette();
+            /* Swallow still-held buttons so the next frame doesn't
+             * re-trigger a combo. */
+            for (int i = 0; i < 30; i++) {
+                if (read_selector_buttons() == 0) break;
+                sleep_ms(16);
+            }
+            prev_buttons = read_selector_buttons();
+            hold_counter = 0;
+            fb_ss_held = false;
+            fb_ss_consumed = false;
+            continue;
+        }
+
+        bool sel_start_release = false;
+        if (ss_now) {
+            fb_ss_held = true;
+        } else if (fb_ss_held) {
+            if (!(buttons & (BTN_SEL | BTN_START))) {
+                sel_start_release = !fb_ss_consumed;
+                fb_ss_held = false;
+                fb_ss_consumed = false;
+            }
+        }
+
+        /* Select+Start-release or Tab: back to carousel */
+        if (sel_start_release || (pressed & BTN_TAB)) {
             g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
             fb_save_path(cur_path);
             fb_persist_selected = selected;
@@ -1203,8 +1261,8 @@ static fb_result_t file_browser_show(char *out_path, size_t out_sz, int *out_idx
             return FB_RESULT_BACK;
         }
 
-        /* B / ESC / F12: back to carousel */
-        if (pressed & (BTN_B | BTN_ESC | BTN_F12)) {
+        /* B / ESC: back to carousel */
+        if (pressed & (BTN_B | BTN_ESC)) {
             g_settings.selector_mode = SELECTOR_MODE_CAROUSEL;
             fb_save_path(cur_path);
             fb_persist_selected = selected;
@@ -1256,8 +1314,10 @@ static fb_result_t file_browser_show(char *out_path, size_t out_sz, int *out_idx
         if (selected >= scroll + FB_VISIBLE_LINES)
             scroll = selected - FB_VISIBLE_LINES + 1;
 
-        /* A / Start: open directory or pick ROM */
-        if ((pressed & (BTN_A | BTN_START)) && fb_entry_count > 0) {
+        /* A only: open directory or pick ROM. Start is reserved for the
+         * Select+Start / Select+Start+A combos so it never accidentally
+         * dives into a directory while the user is reaching for a combo. */
+        if ((pressed & BTN_A) && fb_entry_count > 0) {
             fb_entry_t *e = &fb_entries[selected];
 
             if (e->is_dir) {
@@ -1678,6 +1738,158 @@ static void rom_selector_no_roms_notice(void) {
     }
 }
 
+/* ─── USB gamepad menu-A/B calibration wizard ────────────────────── */
+
+#ifdef USB_HID_ENABLED
+#include "usbhid/gamepad_cal.h"
+
+/* Draw the wizard panel for one step. Called once per frame while the
+ * wizard is active; present() flips to screen after. */
+static void wizard_draw(int slot_idx, uint16_t vid, uint16_t pid,
+                        const char *prompt, const char *sub) {
+    fb_fill(PAL_BG);
+
+    /* Framed panel centered in the screen. */
+    const int panel_w = 220;
+    const int panel_h = 140;
+    const int panel_x = (SCREEN_W - panel_w) / 2;
+    const int panel_y = (SCREEN_H - panel_h) / 2;
+    fb_rect(panel_x, panel_y, panel_w, panel_h, PAL_CART_LABEL);
+    fb_rect(panel_x + 1, panel_y + 1, panel_w - 2, panel_h - 2, PAL_BG);
+    fb_hline(panel_x + 4, panel_y + 22, panel_w - 8, PAL_GRAY);
+
+    fb_text_center(panel_y + 10, "NEW USB GAMEPAD", PAL_WHITE);
+
+    char idline[48];
+    snprintf(idline, sizeof(idline), "SLOT %d   VID %04X   PID %04X",
+             slot_idx + 1, vid, pid);
+    fb_text_center(panel_y + 32, idline, PAL_GRAY);
+
+    fb_text_center(panel_y + 62, prompt, PAL_WHITE);
+    if (sub)
+        fb_text_center(panel_y + 80, sub, PAL_CART_LIGHT);
+
+    fb_text_center(panel_y + panel_h - 14, "START: SKIP", PAL_GRAY);
+}
+
+/* Debounce: wait until the raw report matches baseline again
+ * (= user released the button). Returns after release or timeout. */
+static void wizard_wait_for_release(int slot_idx) {
+    uint32_t watchdog = 0;
+    for (; watchdog < 600; watchdog++) {  /* ~10s max */
+        usbhid_task();
+        uint8_t b = 0xFF, m = 0;
+        if (!usbhid_gamepad_find_pressed_bit(slot_idx, &b, &m)) {
+            /* No single-bit delta == either baseline matches or ambiguous.
+             * Require a handful of quiet frames so a noisy axis doesn't
+             * trip the release check. */
+            int quiet = 0;
+            for (; quiet < 4; quiet++) {
+                sleep_ms(16);
+                usbhid_task();
+                if (usbhid_gamepad_find_pressed_bit(slot_idx, &b, &m)) break;
+            }
+            if (quiet >= 4) return;
+        }
+        sleep_ms(16);
+    }
+}
+
+/* Run the wizard for one newly-connected USB gamepad slot. Blocks until
+ * complete or the user presses START to skip. */
+static void run_calibration_wizard(int slot_idx) {
+    usbhid_gamepad_raw_info_t info;
+    if (!usbhid_gamepad_get_raw_info(slot_idx, &info)) {
+        /* No raw report yet — pad just mounted. Pump USB until we have
+         * a baseline, but give up after ~1 second. */
+        for (int i = 0; i < 60; i++) {
+            usbhid_task();
+            sleep_ms(16);
+            if (usbhid_gamepad_get_raw_info(slot_idx, &info)) break;
+        }
+        if (info.report_len == 0) {
+            usbhid_gamepad_clear_calibration(slot_idx);
+            return;
+        }
+    }
+
+    const char *source_str = (info.source == USBHID_GP_SRC_XINPUT) ? "XINPUT" : "HID";
+
+    uint8_t a_byte = 0, a_mask = 0;
+    uint8_t b_byte = 0, b_mask = 0;
+    int step = 0;        /* 0 = A, 1 = B */
+    int skip = 0;
+
+    /* Re-acquire baseline: the pad may have been wiggled while plugging
+     * in. Give it a quiet moment at rest before first prompt. */
+    for (int i = 0; i < 30; i++) { usbhid_task(); sleep_ms(16); }
+
+    while (step < 2) {
+        const char *prompt = (step == 0) ? "PRESS THE A BUTTON" : "PRESS THE B BUTTON";
+        const char *sub    = (step == 0) ? "USED TO SELECT" : "USED TO CANCEL";
+
+        wizard_draw(slot_idx, info.vid, info.pid, prompt, sub);
+        present();
+
+        usbhid_task();
+        ps2kbd_tick();
+        nespad_read();
+
+        /* Allow skipping with onboard NES pad / PS2 Start / USB Start
+         * from another pad — don't require the unknown pad for escape. */
+        if ((ps2kbd_get_state() & KBD_STATE_START) ||
+            ((nespad_state | nespad_state2) & DPAD_START)) {
+            skip = 1;
+            break;
+        }
+
+        uint8_t bi = 0, mk = 0;
+        if (usbhid_gamepad_find_pressed_bit(slot_idx, &bi, &mk)) {
+            /* Reject accidental same-bit re-detection across steps. */
+            if (step == 1 && bi == a_byte && mk == a_mask) {
+                /* User is still holding A — wait for release before
+                 * re-prompting. Skip this frame. */
+            } else {
+                if (step == 0) { a_byte = bi; a_mask = mk; }
+                else           { b_byte = bi; b_mask = mk; }
+                wizard_wait_for_release(slot_idx);
+                step++;
+            }
+        }
+
+        sleep_ms(16);
+    }
+
+    if (!skip) {
+        usbhid_gamepad_set_menu_ab(slot_idx, a_byte, a_mask, b_byte, b_mask);
+        usbhid_learned_ab_add(info.source, info.vid, info.pid,
+                              a_byte, a_mask, b_byte, b_mask);
+        gamepad_cal_save(source_str, info.vid, info.pid,
+                         a_byte, a_mask, b_byte, b_mask);
+
+        /* Confirmation flash. */
+        wizard_draw(slot_idx, info.vid, info.pid, "SAVED", NULL);
+        present();
+        sleep_ms(600);
+    }
+
+    usbhid_gamepad_clear_calibration(slot_idx);
+}
+
+/* Called once per frame from the selector loop. Scans both USB slots
+ * and runs the wizard on the first one that needs calibration. */
+static void check_and_run_calibration(void) {
+    for (int i = 0; i < 2; i++) {
+        if (usbhid_gamepad_needs_calibration(i)) {
+            run_calibration_wizard(i);
+            /* Only run one wizard per frame so the second pad's baseline
+             * has time to settle before we prompt. */
+            break;
+        }
+    }
+}
+#endif /* USB_HID_ENABLED */
+
 /* ─── Main selector ───────────────────────────────────────────────── */
 
 bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *screen_buffer) {
@@ -1761,11 +1973,26 @@ bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *scr
 
     load_rom_image(selected);
 
+#ifdef USB_HID_ENABLED
+    /* If a USB pad was plugged in before the selector opened, its
+     * needs_calibration flag is still set from mount — show the wizard
+     * once, before the user interacts with the carousel. */
+    check_and_run_calibration();
+    setup_selector_palette();
+    draw_buf = 0;
+    fb = SCREEN[draw_buf];
+#endif
+
     while (1) {
         draw_scene(selected, frame_count);
         present();
         frame_count++;
         sleep_ms(16);
+
+#ifdef USB_HID_ENABLED
+        /* Hot-plugged pad: catch it the frame after mount. */
+        check_and_run_calibration();
+#endif
 
         /* Advance scroll animation */
         if (scroll_dir != 0) {
@@ -1803,13 +2030,72 @@ bool rom_selector_show(char *selected_rom_path, size_t buffer_size, uint8_t *scr
         }
         prev_buttons = buttons;
 
-        /* Select+Start: switch to file browser. Checked BEFORE anything
-         * else so the combo never leaks to per-button handlers. Settings
-         * is intentionally NOT available from the carousel — it only
-         * opens while a ROM is running. */
-        bool sel_start = ((pressed & BTN_SEL) && (buttons & BTN_START)) ||
-                         ((pressed & BTN_START) && (buttons & BTN_SEL));
-        if (sel_start || (pressed & BTN_F12)) {
+        /* Select+Start / Select+Start+A resolution:
+         *
+         *   Select+Start alone  -> toggle file browser
+         *   Select+Start+A      -> open Settings menu
+         *
+         * Problem: when the user presses Select, then Start, then A, the
+         * Select+Start edge fires before A gets added. To let A decide the
+         * outcome we buffer the Select+Start edge: once both are held we
+         * suppress the browser-toggle until BOTH are released. If A is
+         * pressed during the hold, Settings fires and the combo is marked
+         * consumed (browser-toggle skipped). */
+        static bool carousel_ss_held = false;
+        static bool carousel_ss_consumed = false;
+        bool ss_now = (buttons & BTN_SEL) && (buttons & BTN_START);
+
+        bool open_settings =
+            (ss_now && (pressed & BTN_A)) ||
+            (pressed & BTN_F12);
+        if (open_settings) {
+            carousel_ss_consumed = true;
+            /* Defensive: reset HDMI buffer so settings' draw path lines
+             * up with what Core 1 expects, in case the selector diverged. */
+            graphics_set_buffer(SCREEN[0]);
+            graphics_set_res(SCREEN_W, SCREEN_H);
+            settings_menu_show(SCREEN[0], false);
+            settings_save();
+            /* Settings clobbered palette / draw state — restore. */
+            setup_selector_palette();
+            draw_buf = 0;
+            fb = SCREEN[draw_buf];
+            cur_img_idx = -1;
+            load_rom_image(selected);
+            /* Swallow whatever is still held so it doesn't immediately
+             * re-enter a combo. */
+            for (int i = 0; i < 30; i++) {
+                if (read_selector_buttons() == 0) break;
+                sleep_ms(16);
+            }
+            prev_buttons = read_selector_buttons();
+            hold_counter = 0;
+            carousel_ss_held = false;
+            carousel_ss_consumed = false;
+            info_state = INFO_HIDDEN;
+            info_anim_frame = 0;
+            scroll_dir = 0;
+            scroll_frame = 0;
+            continue;
+        }
+
+        /* Track Select+Start hold — fire browser-toggle on release only
+         * if no A was pressed during the hold. */
+        bool sel_start_release = false;
+        if (ss_now) {
+            carousel_ss_held = true;
+        } else if (carousel_ss_held) {
+            /* At least one of Select/Start released. If neither remains,
+             * the combo is complete. */
+            if (!(buttons & (BTN_SEL | BTN_START))) {
+                sel_start_release = !carousel_ss_consumed;
+                carousel_ss_held = false;
+                carousel_ss_consumed = false;
+            }
+        }
+
+        /* Select+Start-release or Tab: switch to file browser. */
+        if (sel_start_release || (pressed & BTN_TAB)) {
             g_settings.selector_mode = SELECTOR_MODE_BROWSER;
             int fb_idx = -1;
             fb_result_t fr = file_browser_show(selected_rom_path, buffer_size, &fb_idx);

@@ -50,6 +50,7 @@
 #include "ps2/ps2.h"
 #ifdef USB_HID_ENABLED
 #include "usbhid/usbhid.h"
+#include "usbhid/gamepad_cal.h"
 #endif
 
 // ROM selector and settings
@@ -1699,6 +1700,10 @@ int main(void) {
     // Initialize USB HID
     usbhid_init();
     LOG("USB HID initialized\n");
+    // Load any previously-learned menu A/B profiles. Done after SD mount
+    // so files in /snes/gamepads/ are visible; before tuh_task() fires a
+    // mount callback so newly-plugged known pads don't trigger the wizard.
+    gamepad_cal_load_all();
 #endif
 
 #ifndef FRANK_SNES_AUTOBOOT

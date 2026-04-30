@@ -21,6 +21,7 @@ extern "C" {
 #define SNES_KEY_ESC    0x0D
 #define SNES_KEY_F12    0x0E
 #define SNES_KEY_F11    0x0F
+#define SNES_KEY_TAB    0x10
 
 // Keyboard state bits for ps2kbd_get_state()
 #define KBD_STATE_UP     (1 << 0)
@@ -38,6 +39,7 @@ extern "C" {
 #define KBD_STATE_ESC    (1 << 12)
 #define KBD_STATE_F12    (1 << 13)
 #define KBD_STATE_F11    (1 << 14)
+#define KBD_STATE_TAB    (1 << 15)
 
 void ps2kbd_init(void);
 void ps2kbd_tick(void);

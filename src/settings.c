@@ -21,6 +21,7 @@
 
 #ifdef USB_HID_ENABLED
 #include "usbhid/usbhid.h"
+#include "usbhid/gamepad_cal.h"
 #endif
 
 bool settings_mouse_connected(void) {
@@ -428,6 +429,16 @@ static int read_menu_buttons(void) {
         if (gp.buttons & 0x0002) buttons |= BTN_B;
         if (gp.buttons & 0x0040) buttons |= BTN_START;
         if (gp.buttons & 0x0080) buttons |= BTN_SEL;
+        /* Learned menu A/B (from the calibration wizard) overlays the
+         * fallback interpretation so menu navigation matches the
+         * physically labelled buttons on pads with odd layouts. */
+        for (int i = 0; i < 2; i++) {
+            int ma = 0, mb = 0;
+            if (usbhid_gamepad_get_menu_ab(i, &ma, &mb)) {
+                if (ma) buttons |= BTN_A;
+                if (mb) buttons |= BTN_B;
+            }
+        }
     }
 #endif
 
@@ -476,7 +487,7 @@ static const char *main_label(int item) {
         case MAIN_AUDIO:     return "AUDIO SETTINGS...";
         case MAIN_RESTART:   return "RESTART GAME";
         case MAIN_BACK_GAME: return "BACK TO GAME";
-        case MAIN_BACK_ROM:  return menu_in_game ? "CHANGE ROM" : "BACK";
+        case MAIN_BACK_ROM:  return menu_in_game ? "CHANGE ROM" : "BACK TO ROMS";
         default:             return "";
     }
 }
@@ -655,6 +666,7 @@ typedef enum {
     BTN_DEV_NES,
     BTN_DEV_USB,
     BTN_DEV_SEP,
+    BTN_DEV_CLEAN_USB,
     BTN_DEV_BACK,
     BTN_DEV_ITEM_COUNT
 } btn_dev_item_t;
@@ -664,11 +676,12 @@ static bool is_selectable_btndev(int item) { return !is_separator_btndev(item); 
 
 static const char *btndev_label(int item) {
     switch (item) {
-        case BTN_DEV_KEYBOARD: return "KEYBOARD";
-        case BTN_DEV_NES:      return "NES/SNES GAMEPAD";
-        case BTN_DEV_USB:      return "USB GAMEPAD";
-        case BTN_DEV_BACK:     return "BACK";
-        default:               return "";
+        case BTN_DEV_KEYBOARD:  return "KEYBOARD";
+        case BTN_DEV_NES:       return "NES/SNES GAMEPAD";
+        case BTN_DEV_USB:       return "USB GAMEPAD";
+        case BTN_DEV_CLEAN_USB: return "CLEAN USB CACHE";
+        case BTN_DEV_BACK:      return "BACK";
+        default:                return "";
     }
 }
 
@@ -1073,8 +1086,10 @@ void settings_apply_runtime(void) {
 /* ─── Hotkey detection ────────────────────────────────────────────── */
 
 bool settings_check_hotkey(void) {
-    /* NES/SNES gamepad: Start + Select */
-    bool triggered = (nespad_state & DPAD_SELECT) && (nespad_state & DPAD_START);
+    /* NES/SNES gamepad: Select + Start + A */
+    bool triggered = (nespad_state & DPAD_SELECT) &&
+                     (nespad_state & DPAD_START)  &&
+                     (nespad_state & DPAD_A);
 
     /* PS/2 / USB keyboard: F12 */
     uint16_t kbd = ps2kbd_get_state();
@@ -1084,11 +1099,14 @@ bool settings_check_hotkey(void) {
     if (kbd & KBD_STATE_F12) triggered = true;
 
 #ifdef USB_HID_ENABLED
-    /* USB gamepad: Start + Select */
+    /* USB gamepad: Select + Start + A */
     if (usbhid_gamepad_connected()) {
         usbhid_gamepad_state_t gp;
         usbhid_get_gamepad_state(&gp);
-        if ((gp.buttons & 0x0040) && (gp.buttons & 0x0080)) triggered = true;
+        if ((gp.buttons & 0x0040) &&   /* Start */
+            (gp.buttons & 0x0080) &&   /* Select */
+            (gp.buttons & 0x0001))     /* A */
+            triggered = true;
     }
 #endif
 
@@ -1326,6 +1344,36 @@ settings_result_t settings_menu_show(uint8_t *screen_buffer, bool in_game) {
                     edit_btnmap = &edit.btnmap_usb;
                     current_page = PAGE_BTNMAP_USB;
                     selected = BMAP_A; scan_active = -1;
+                } else if (selected == BTN_DEV_CLEAN_USB) {
+#ifdef USB_HID_ENABLED
+                    /* Delete gamepad_*.txt on SD + reset in-memory table.
+                     * Flash the result briefly before returning to menu. */
+                    int removed = gamepad_cal_clear();
+                    char msg[32];
+                    snprintf(msg, sizeof(msg),
+                             removed == 1 ? "CLEARED %d FILE" : "CLEARED %d FILES",
+                             removed);
+                    for (int i = 0; i < 60; i++) {
+                        uint8_t *buf = SCREEN[draw_buf];
+                        draw_menu(buf, "BUTTON MAPPING", BTN_DEV_ITEM_COUNT,
+                                  btndev_label, btndev_value,
+                                  is_separator_btndev, NULL, NULL, selected);
+                        /* Overlay toast near the bottom, above the help bar. */
+                        int ty = SCREEN_HEIGHT - 30;
+                        draw_rect(buf, 0, ty - 3, SCREEN_WIDTH, 13, PAL_BG);
+                        draw_text_centered(buf, ty, msg, PAL_YELLOW);
+                        current_buffer = !draw_buf;
+                        draw_buf ^= 1;
+                        sleep_ms(16);
+                    }
+                    /* Swallow whatever held A produced while we waited. */
+                    for (int i = 0; i < 30; i++) {
+                        if (read_menu_buttons() == 0) break;
+                        sleep_ms(16);
+                    }
+                    prev_buttons = read_menu_buttons();
+                    hold_counter = 0;
+#endif
                 } else if (selected == BTN_DEV_BACK) {
                     current_page = PAGE_MAIN;
                     selected = MAIN_BUTTONS;
