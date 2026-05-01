@@ -1,5 +1,5 @@
 /*
- * MurmSNES - Settings Menu
+ * FRANK SNES - Settings Menu
  *
  * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>
  * https://rh1.tech

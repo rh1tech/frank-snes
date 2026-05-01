@@ -1,5 +1,5 @@
 /*
- * MurmSNES - ROM Selector with SNES cartridge display and cover art
+ * FRANK SNES - ROM Selector with SNES cartridge display and cover art
  *
  * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>
  * https://rh1.tech
@@ -2449,7 +2449,7 @@ void welcome_screen_show(void) {
         fb_text_center_shadow(118, "FRANK SNES", PAL_WHITE, PAL_BLACK);
         fb_text_center_shadow(132, version_str, PAL_LOGO_LGRAY, PAL_BLACK);
         fb_text_center_shadow(152, "BY MIKHAIL MATVEEV", PAL_LOGO_LGRAY, PAL_BLACK);
-        fb_text_center_shadow(164, "GITHUB.COM/RH1TECH/MURMSNES", PAL_LOGO_LGRAY, PAL_BLACK);
+        fb_text_center_shadow(164, "GITHUB.COM/RH1TECH/FRANK-SNES", PAL_LOGO_LGRAY, PAL_BLACK);
         fb_text_center_shadow(184, "RH1.TECH", PAL_LOGO_LGRAY, PAL_BLACK);
 
         /* Blinking "PRESS START" after 2 seconds */

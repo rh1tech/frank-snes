@@ -1,5 +1,5 @@
 /*
- * MurmSNES - SNES Emulator for RP2350
+ * FRANK SNES - SNES Emulator for RP2350
  * Based on Snes9x and pico-snes
  *
  * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>

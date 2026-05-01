@@ -1,5 +1,5 @@
 /*
- * MurmSNES - Board pin configuration (M1/M2 variants)
+ * FRANK SNES - Board pin configuration (M1/M2 variants)
  *
  * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>
  * https://rh1.tech

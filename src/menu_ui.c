@@ -1,5 +1,5 @@
 /*
- * MurmSNES - Menu UI rendering primitives
+ * FRANK SNES - Menu UI rendering primitives
  *
  * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>
  * https://rh1.tech

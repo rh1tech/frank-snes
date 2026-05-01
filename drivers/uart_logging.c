@@ -1,5 +1,5 @@
 /*
- * MurmSNES - Raw UART stdio driver
+ * FRANK SNES - Raw UART stdio driver
  * Registers a lightweight stdio driver that writes to UART TX
  * without the overhead of pico_enable_stdio_uart's mutex/IRQ.
  *
