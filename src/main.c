@@ -259,12 +259,22 @@ static const uint32_t snes_masks[BTNMAP_COUNT] = {
     SNES_TL_MASK, SNES_TR_MASK, SNES_START_MASK, SNES_SELECT_MASK
 };
 
-/* NES/SNES pad physical button bits indexed by BTNMAP_*
- * Note: DPAD_A/DPAD_B are NES-era names that don't match SNES labels.
- * Physical SNES A = DPAD_Y, B = DPAD_A, X = DPAD_X, Y = DPAD_B */
-static const uint32_t nespad_bits[BTNMAP_COUNT] = {
+/* Physical button bits for SNES pads indexed by BTNMAP_*.
+ * The DPAD_* names are NES-era: on an SNES pad the shift-register order is
+ * B, Y, Select, Start, D-pad, A, X, L, R — so physical SNES
+ *   A=DPAD_Y, B=DPAD_A, X=DPAD_X, Y=DPAD_B, L=DPAD_LT, R=DPAD_RT. */
+static const uint32_t nespad_bits_snes[BTNMAP_COUNT] = {
     DPAD_Y, DPAD_A, DPAD_X, DPAD_B,
     DPAD_LT, DPAD_RT, DPAD_START, DPAD_SELECT
+};
+
+/* Physical button bits for NES pads indexed by BTNMAP_*.
+ * NES pads only have A and B; we send the NES "A" to SNES A and NES "B" to
+ * SNES B (so the thumb-adjacent button acts as A). X/Y/L/R have no source,
+ * so we leave those entries 0 (no physical bit will match). */
+static const uint32_t nespad_bits_nes[BTNMAP_COUNT] = {
+    DPAD_A, DPAD_B, 0, 0,
+    0, 0, DPAD_START, DPAD_SELECT
 };
 
 /* Keyboard state bits indexed by BTNMAP_* */
@@ -279,8 +289,11 @@ static const uint16_t usbgp_bits[BTNMAP_COUNT] = {
     0x0010, 0x0020, 0x0040, 0x0080
 };
 
-/* Helper: merge NES/SNES pad bits into SNES joypad mask (with button remap) */
-static inline uint32_t nespad_to_snes(uint32_t pad) {
+/* Helper: merge NES/SNES pad bits into SNES joypad mask (with button remap).
+ * is_snes selects the physical-bit table: SNES pads carry A/X/L/R on the
+ * upper shift-register bits, NES pads only carry A/B. See nespad.h for how
+ * this flag is latched by the PIO reader. */
+static inline uint32_t nespad_to_snes(uint32_t pad, bool is_snes) {
     uint32_t j = 0;
     /* D-pad is always direct (no remap) */
     if (pad & DPAD_UP)     j |= SNES_UP_MASK;
@@ -288,9 +301,10 @@ static inline uint32_t nespad_to_snes(uint32_t pad) {
     if (pad & DPAD_LEFT)   j |= SNES_LEFT_MASK;
     if (pad & DPAD_RIGHT)  j |= SNES_RIGHT_MASK;
     /* Face/shoulder buttons use remap table */
+    const uint32_t *bits = is_snes ? nespad_bits_snes : nespad_bits_nes;
     const uint8_t *map = g_settings.btnmap_nes.map;
     for (int i = 0; i < BTNMAP_COUNT; i++) {
-        if (pad & nespad_bits[i])
+        if (bits[i] && (pad & bits[i]))
             j |= snes_masks[map[i]];
     }
     return j;
@@ -344,8 +358,8 @@ uint32_t S9xReadJoypad(const int32_t port) {
 
     if (mode == INPUT_MODE_ANY) {
         // Merge ALL input sources
-        joypad |= nespad_to_snes(nespad_state);
-        joypad |= nespad_to_snes(nespad_state2);
+        joypad |= nespad_to_snes(nespad_state, nespad_is_snes);
+        joypad |= nespad_to_snes(nespad_state2, nespad2_is_snes);
         uint16_t kbd = ps2kbd_get_state();
 #ifdef USB_HID_ENABLED
         kbd |= usbhid_get_kbd_state();
@@ -362,10 +376,10 @@ uint32_t S9xReadJoypad(const int32_t port) {
         // Specific input mode
         switch (mode) {
             case INPUT_MODE_NES1:
-                joypad |= nespad_to_snes(nespad_state);
+                joypad |= nespad_to_snes(nespad_state, nespad_is_snes);
                 break;
             case INPUT_MODE_NES2:
-                joypad |= nespad_to_snes(nespad_state2);
+                joypad |= nespad_to_snes(nespad_state2, nespad2_is_snes);
                 break;
             case INPUT_MODE_KEYBOARD: {
                 uint16_t kbd = ps2kbd_get_state();

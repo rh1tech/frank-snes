@@ -887,19 +887,28 @@ static void draw_scene(int selected, uint32_t frame_count) {
 #define BTN_ESC   0x0200   /* ESC (distinct from F12 so file browser can tell them apart) */
 #define BTN_TAB   0x0400   /* Tab: toggle between carousel and file browser */
 
+/* Per-port: map one pad's bits into the selector button set. Physical A/B
+ * differ by pad type (SNES pads report A on DPAD_Y, B on DPAD_A). D-pad /
+ * Start / Select are identical across NES and SNES pads. */
+static void selector_pad_to_buttons(uint32_t pad, bool is_snes, int *buttons) {
+    uint32_t a_mask = is_snes ? DPAD_Y : DPAD_A;
+    uint32_t b_mask = is_snes ? DPAD_A : DPAD_B;
+    if (pad & DPAD_LEFT)   *buttons |= BTN_LEFT;
+    if (pad & DPAD_RIGHT)  *buttons |= BTN_RIGHT;
+    if (pad & DPAD_UP)     *buttons |= BTN_UP;
+    if (pad & DPAD_DOWN)   *buttons |= BTN_DOWN;
+    if (pad & a_mask)      *buttons |= BTN_A;
+    if (pad & b_mask)      *buttons |= BTN_B;
+    if (pad & DPAD_START)  *buttons |= BTN_START;
+    if (pad & DPAD_SELECT) *buttons |= BTN_SEL;
+}
+
 static int read_selector_buttons(void) {
     nespad_read();
     ps2kbd_tick();
     int buttons = 0;
-    uint32_t pad = nespad_state | nespad_state2;
-    if (pad & DPAD_LEFT)   buttons |= BTN_LEFT;
-    if (pad & DPAD_RIGHT)  buttons |= BTN_RIGHT;
-    if (pad & DPAD_UP)     buttons |= BTN_UP;
-    if (pad & DPAD_DOWN)   buttons |= BTN_DOWN;
-    if (pad & DPAD_A)      buttons |= BTN_A;
-    if (pad & DPAD_B)      buttons |= BTN_B;
-    if (pad & DPAD_START)  buttons |= BTN_START;
-    if (pad & DPAD_SELECT) buttons |= BTN_SEL;
+    selector_pad_to_buttons(nespad_state,  nespad_is_snes,  &buttons);
+    selector_pad_to_buttons(nespad_state2, nespad2_is_snes, &buttons);
     uint16_t kbd = ps2kbd_get_state();
 #ifdef USB_HID_ENABLED
     kbd |= usbhid_get_kbd_state();

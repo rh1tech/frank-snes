@@ -39,6 +39,8 @@ static PIO pio = pio1;
 static uint8_t sm = -1;
 uint32_t nespad_state = 0;  // Joystick 1
 uint32_t nespad_state2 = 0; // Joystick 2
+bool nespad_is_snes = false;   // Port 1: latched once any SNES-only bit seen
+bool nespad2_is_snes = false;  // Port 2
 
 bool nespad_begin(uint32_t cpu_khz, uint8_t clkPin, uint8_t dataPin, uint8_t latPin) {
     if (pio_can_add_program(pio, &nespad_program) &&
@@ -96,4 +98,11 @@ void nespad_read() {
     temp ^= 0xFFFFFFFF;
     nespad_state = temp & 0x555555;        // Joy1
     nespad_state2 = temp >> 1 & 0x555555;  // Joy2
+
+    /* SNES pads shift 16 bits with A/X/L/R in bits 8-11; NES pads shift 8
+     * bits and leave those positions high (read as 0 after inversion). The
+     * first time we see any SNES-only bit, latch the port as SNES. This is
+     * sticky to stay robust against frames where only D-pad or B/Y are held. */
+    if (nespad_state & NESPAD_SNES_ONLY_MASK)   nespad_is_snes = true;
+    if (nespad_state2 & NESPAD_SNES_ONLY_MASK)  nespad2_is_snes = true;
 }

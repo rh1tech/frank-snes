@@ -114,7 +114,7 @@ static const gamepad_map_t known_hid_maps[] = {
         .start  = { .byte = 6, .mask = 0x20 },
         .select = { .byte = 6, .mask = 0x10 },
     },
-    // Capture: gamepad_081F_E401.txt  baseline: 7F 7F 00 80 80 0F 00 00
+    // Capture: gamepad_081F_E401 2.txt  baseline: 7F 7F 00 80 80 0F 00 00
     {
         .vid = 0x081F, .pid = 0xE401,
         .dpad_mode = DPAD_AXIS, .dpad_x = 0, .dpad_y = 1,

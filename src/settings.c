@@ -384,22 +384,30 @@ static bool do_load_game(void) {
 #define BTN_START 0x08
 #define BTN_SEL   0x04
 
+/* Per-port menu A/B mask. On an SNES pad, physical A is DPAD_Y and physical
+ * B is DPAD_A; on an NES pad A is DPAD_A and B is DPAD_B. */
+static inline void menu_pad_to_buttons(uint32_t pad, bool is_snes, int *buttons) {
+    uint32_t a_mask = is_snes ? DPAD_Y : DPAD_A;
+    uint32_t b_mask = is_snes ? DPAD_A : DPAD_B;
+    if (pad & a_mask)      *buttons |= BTN_A;
+    if (pad & b_mask)      *buttons |= BTN_B;
+    if (pad & DPAD_SELECT) *buttons |= BTN_SEL;
+    if (pad & DPAD_START)  *buttons |= BTN_START;
+    if (pad & DPAD_UP)     *buttons |= BTN_UP;
+    if (pad & DPAD_DOWN)   *buttons |= BTN_DOWN;
+    if (pad & DPAD_LEFT)   *buttons |= BTN_LEFT;
+    if (pad & DPAD_RIGHT)  *buttons |= BTN_RIGHT;
+}
+
 static int read_menu_buttons(void) {
     nespad_read();
     ps2kbd_tick();
 
     int buttons = 0;
 
-    /* NES/SNES gamepad (either player) */
-    uint32_t pad = nespad_state | nespad_state2;
-    if (pad & DPAD_A)      buttons |= BTN_A;
-    if (pad & DPAD_B)      buttons |= BTN_B;
-    if (pad & DPAD_SELECT) buttons |= BTN_SEL;
-    if (pad & DPAD_START)  buttons |= BTN_START;
-    if (pad & DPAD_UP)     buttons |= BTN_UP;
-    if (pad & DPAD_DOWN)   buttons |= BTN_DOWN;
-    if (pad & DPAD_LEFT)   buttons |= BTN_LEFT;
-    if (pad & DPAD_RIGHT)  buttons |= BTN_RIGHT;
+    /* NES/SNES gamepad (each port picks its own layout) */
+    menu_pad_to_buttons(nespad_state,  nespad_is_snes,  &buttons);
+    menu_pad_to_buttons(nespad_state2, nespad2_is_snes, &buttons);
 
     /* PS/2 keyboard */
     uint16_t kbd = ps2kbd_get_state();
@@ -1086,10 +1094,11 @@ void settings_apply_runtime(void) {
 /* ─── Hotkey detection ────────────────────────────────────────────── */
 
 bool settings_check_hotkey(void) {
-    /* NES/SNES gamepad: Select + Start + A */
+    /* NES/SNES gamepad: Select + Start + A (physical A differs by pad type) */
+    uint32_t a_mask = nespad_is_snes ? DPAD_Y : DPAD_A;
     bool triggered = (nespad_state & DPAD_SELECT) &&
                      (nespad_state & DPAD_START)  &&
-                     (nespad_state & DPAD_A);
+                     (nespad_state & a_mask);
 
     /* PS/2 / USB keyboard: F12 */
     uint16_t kbd = ps2kbd_get_state();
