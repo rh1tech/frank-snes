@@ -30,9 +30,13 @@
 #define SELECTOR_MODE_CAROUSEL 0
 #define SELECTOR_MODE_BROWSER  1
 
-// SNES mouse port assignment
-#define MOUSE_PORT_1 0
-#define MOUSE_PORT_2 1
+// SNES mouse port assignment. MOUSE_PORT_OFF lets the user force the mouse
+// off even while a real mouse is physically attached — useful for games that
+// lock up or refuse to boot when they see a mouse on either controller port
+// (e.g. King Arthur & The Knights of Justice).
+#define MOUSE_PORT_1   0
+#define MOUSE_PORT_2   1
+#define MOUSE_PORT_OFF 2
 
 // Button mapping: 8 remappable SNES buttons (D-pad is always fixed)
 // Each entry maps a SNES button to a physical button index (0-7)

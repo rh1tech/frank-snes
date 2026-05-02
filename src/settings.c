@@ -519,7 +519,12 @@ static const char *main_value(int item) {
         case MAIN_PLAYER2:
             return input_mode_names[edit.p2_mode];
         case MAIN_MOUSE:
-            return edit.mouse_port == MOUSE_PORT_1 ? "GAMEPAD 1" : "GAMEPAD 2";
+            switch (edit.mouse_port) {
+                case MOUSE_PORT_1:   return "GAMEPAD 1";
+                case MOUSE_PORT_2:   return "GAMEPAD 2";
+                case MOUSE_PORT_OFF: return "OFF";
+                default:             return "GAMEPAD 2";
+            }
         default:
             return NULL;
     }
@@ -578,9 +583,11 @@ static void main_change_value(int item, int dir) {
             }
             break;
         }
-        case MAIN_MOUSE:
-            edit.mouse_port = (edit.mouse_port == MOUSE_PORT_1) ? MOUSE_PORT_2 : MOUSE_PORT_1;
+        case MAIN_MOUSE: {
+            int step = dir >= 0 ? 1 : 2;  /* 3 states; -1 wraps via +2 */
+            edit.mouse_port = (uint8_t)((edit.mouse_port + step) % 3);
             break;
+        }
         default:
             break;
     }
@@ -969,7 +976,8 @@ void settings_load(void) {
             g_settings.interpolation = (atoi(value) != 0);
         } else if (strcmp(key, "mouse_port") == 0) {
             int v = atoi(value);
-            g_settings.mouse_port = (v == MOUSE_PORT_1) ? MOUSE_PORT_1 : MOUSE_PORT_2;
+            if (v < 0 || v > MOUSE_PORT_OFF) v = MOUSE_PORT_2;
+            g_settings.mouse_port = (uint8_t)v;
         } else if (strcmp(key, "btnmap_kbd") == 0) {
             sscanf(value, "%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",
                    &g_settings.btnmap_kbd.map[0], &g_settings.btnmap_kbd.map[1],
@@ -1077,12 +1085,19 @@ void settings_apply_runtime(void) {
     Settings.InterpolatedSound = g_settings.interpolation;
     Settings.Mute = (g_settings.volume == 0);
 
-    /* Emulation: SNES Mouse — enabled only while a real mouse is connected.
+    /* Emulation: SNES Mouse — enabled only while a real mouse is connected
+     * AND the user hasn't explicitly forced the port to OFF. Some games
+     * (e.g. King Arthur & The Knights of Justice) refuse to run whenever
+     * they detect a mouse on either port, so expose MOUSE_PORT_OFF as an
+     * escape hatch that keeps the physical mouse usable in menus but hides
+     * it from the emulated bus.
      * Port routing (1 or 2) is handled inside the PPU via Settings.MousePort. */
-    bool mouse_on = settings_mouse_connected();
+    bool mouse_on = settings_mouse_connected() &&
+                    (g_settings.mouse_port != MOUSE_PORT_OFF);
     Settings.Mouse = mouse_on;
     Settings.MouseMaster = mouse_on;
-    Settings.MousePort = g_settings.mouse_port;
+    Settings.MousePort = (g_settings.mouse_port == MOUSE_PORT_1) ? 0 : 1;
+    Settings.ControllerOption = mouse_on ? SNES_MOUSE : SNES_JOYPAD;
 
     /* CRT effect */
     graphics_set_crt_active(g_settings.crt_effect);

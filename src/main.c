@@ -580,6 +580,9 @@ static void poll_host_mouse(void) {
     // Once-per-second heartbeat so we can tell whether the mouse pipeline
     // is alive even when no motion is arriving. Shows PS/2 init state,
     // raw-byte count from the IRQ, packet count, ring depth, and errors.
+    // Skip entirely when nothing is plugged in — otherwise it spams the
+    // UART every second for the 99% of users who never attach a mouse.
+    if (!mouse_is_connected()) return;
     static uint32_t last_heartbeat_us = 0;
     uint32_t now_us = time_us_32();
     if ((now_us - last_heartbeat_us) >= 1000000u) {
@@ -641,8 +644,11 @@ static inline void snes9x_init(void) {
     Settings.FrameTimeNTSC = 16667;
     // If a mouse is physically attached at boot, put the controller in
     // SNES_MOUSE mode so S9xProcessMouse() actually drives the bus.
+    // MOUSE_PORT_OFF lets the user force the mouse off — needed for games
+    // like King Arthur & The Knights of Justice that lock up on any mouse.
     // Settings.MousePort decides whether the packet lands on port 1 or 2.
-    bool have_mouse = mouse_is_connected();
+    bool have_mouse = mouse_is_connected() &&
+                      (g_settings.mouse_port != MOUSE_PORT_OFF);
     Settings.ControllerOption = have_mouse ? SNES_MOUSE : SNES_JOYPAD;
     Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
     Settings.SoundPlaybackRate = AUDIO_SAMPLE_RATE;
@@ -651,7 +657,7 @@ static inline void snes9x_init(void) {
     Settings.Mute = (g_settings.volume == 0);
     Settings.Mouse = have_mouse;
     Settings.MouseMaster = have_mouse;
-    Settings.MousePort = g_settings.mouse_port;
+    Settings.MousePort = (g_settings.mouse_port == MOUSE_PORT_1) ? 0 : 1;
 
     S9xInitDisplay();
     S9xInitMemory();
