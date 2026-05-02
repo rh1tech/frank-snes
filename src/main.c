@@ -1311,8 +1311,13 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                             ? SubScreenBuffer : GFX.Screen;
         }
 
-        // Update palette if brightness changed during frame
-        if (g_palette_needs_update) {
+        // Update palette if brightness changed during frame. Skip when
+        // PPU.Brightness is 0 — at end-of-frame, games often sit at
+        // force-blank/brt=0 while doing VRAM/CGRAM uploads, and pushing
+        // the palette with brightness 0 blacks out the HDMI frame we
+        // just displayed (Cybernator regression). The $2100 write
+        // handler pushes eagerly on non-zero brightness.
+        if (g_palette_needs_update && PPU.Brightness != 0) {
             S9xFixColourBrightness();
             g_palette_needs_update = false;
         }

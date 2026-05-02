@@ -139,7 +139,22 @@ PPU_HOT void S9xSetPPU(uint8_t Byte, uint16_t Address)
             {
                IPPU.ColorsChanged = true;
                PPU.Brightness = Byte & 0xF;
-               g_palette_needs_update = true;  // Defer palette update to main loop
+               /* Eagerly push the HDMI palette whenever the game *raises*
+                * brightness, so tiles rendered at peak brightness don't
+                * get displayed through a stale zero-brightness palette.
+                *
+                * Why not push on drops-to-zero too? Games like Cybernator
+                * write $2100=0x80 (force-blank + brt=0) during VBlank,
+                * which would repaint the HDMI palette to all-black and
+                * darken the just-rendered frame. The SNES PPU hides this
+                * behind force-blank; we keep the last non-zero palette
+                * live on HDMI to match that behaviour. */
+               if (PPU.Brightness != 0) {
+                  S9xFixColourBrightness();
+                  g_palette_needs_update = false;
+               } else {
+                  g_palette_needs_update = true;  /* refresh at next non-zero */
+               }
             }
             if ((Memory.FillRAM[0x2100] & 0x80) != (Byte & 0x80))
             {
