@@ -277,7 +277,12 @@ static uint32_t crc32_file(FIL *fil, int skip) {
 #define MAX_ROMS 48
 
 typedef struct {
-    char filename[48];
+    /* FatFs LFN gives us up to 255 bytes; 48 was too tight for long
+     * translation-patch names like
+     * "Assault Suits Valken (Japan) [T-En by Aeon Genesis v1.1].sfc"
+     * which got truncated mid-name and then failed f_open with
+     * FR_INVALID_NAME. 128 fits MAX_ROM_PATH minus the "/snes/" prefix. */
+    char filename[128];
     uint32_t crc;
     bool crc_valid;
 } rom_entry_t;
@@ -408,7 +413,7 @@ static int last_selected_rom = 0;
 static void load_last_rom(void) {
     static FIL fil;
     if (f_open(&fil, LAST_ROM_PATH, FA_READ) != FR_OK) return;
-    char name[64];
+    char name[128];
     if (f_gets(name, sizeof(name), &fil)) {
         size_t len = strlen(name);
         while (len > 0 && (name[len-1] == '\n' || name[len-1] == '\r'))

@@ -12,8 +12,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// Maximum length of ROM filename (including path)
-#define MAX_ROM_PATH 128
+// Maximum length of ROM path including "/snes/" prefix and null terminator.
+// Must be at least "/snes/" (6) + rom_entry_t::filename (128) + 1 = 135.
+// FatFs LFN supports up to 255 bytes per filename, so long T-En patches
+// like "Assault Suits Valken (Japan) [T-En by Aeon Genesis v1.1].sfc" fit.
+#define MAX_ROM_PATH 144
 
 /**
  * Display ROM selection screen and wait for user to select a ROM
