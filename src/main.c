@@ -1281,10 +1281,17 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             __dmb();
 
 #ifdef FRANK_SNES_HDMI_ALT
-            // Forward packed stereo (L<<16|R per uint32) to HDMI audio
-            // data-island ring.  Drops samples silently if the ring is
-            // full — emulation must not block on audio.
+            // HDMI_ALT path: forward packed stereo (L<<16|R per uint32)
+            // straight into the HDMI audio data-island ring on Core 1.
+            // Drops samples silently if the ring is full — emulation
+            // must not block on audio.  There is no I2S consumer to
+            // drain audio_packed_buffer, so we also advance the
+            // consumer cursor here; otherwise the SRAM ring fills up
+            // permanently and Core 0 stops producing.
             hdmi_alt_audio_write((const int16_t *)dst32, AUDIO_BUFFER_LENGTH);
+            __dmb();
+            audio_cons_seq = prod + 1;
+            __dmb();
 #endif
         }
 
@@ -1330,6 +1337,9 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                 __dmb();
 #ifdef FRANK_SNES_HDMI_ALT
                 hdmi_alt_audio_write((const int16_t *)edst, AUDIO_BUFFER_LENGTH);
+                __dmb();
+                audio_cons_seq = p2 + 1;
+                __dmb();
 #endif
                 audio_acc_us -= TARGET_FRAME_US;
                 extra++;

@@ -125,10 +125,8 @@ struct dvi_inst dvi0;
 static uint16_t __attribute__((aligned(4)))
     scanline_buf[HDMI_N_SCANLINE_BUFS][HDMI_LOGICAL_WIDTH];
 
-#if 0  /* HDMI audio temporarily disabled — see graphics_init */
 static audio_sample_t __attribute__((aligned(4)))
     audio_ring_storage[HDMI_AUDIO_RING_SAMPLES];
-#endif
 
 /* ------------------------------------------------------------------ */
 /* Frame buffer hookup with main.c                                    */
@@ -427,14 +425,12 @@ void graphics_init(g_out g_out) {
     dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
 
 
-    /* Audio data-island setup. */
+    /* Audio data-island setup.  CTS = pixel_clk * N / (128 * fs). */
     dvi_get_blank_settings(&dvi0)->top    = 0;
     dvi_get_blank_settings(&dvi0)->bottom = 0;
-#if 0  /* keep TMDS as bare DVI (no audio packets) for now */
     dvi_audio_sample_buffer_set(&dvi0, audio_ring_storage, HDMI_AUDIO_RING_SAMPLES);
     int cts = DVI_TIMING_PRESET.bit_clk_khz * HDMI_AUDIO_N / (HDMI_AUDIO_RATE / 100) / 128;
     dvi_set_audio_freq(&dvi0, HDMI_AUDIO_RATE, cts, HDMI_AUDIO_N);
-#endif
 
     /* Pre-fill the static pillarbox columns of every scanline buffer
      * with black RGB565.  fill_scanline() never rewrites these
