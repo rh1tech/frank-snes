@@ -75,18 +75,12 @@ extern void hdmi_alt_run_core1(void);
 #define SCREEN_WIDTH     SNES_WIDTH    // 256
 #define SCREEN_HEIGHT    SNES_HEIGHT   // 224
 
-// Audio sample rate.  Real SNES is 32000 Hz; the I2S path used 32040
-// because (a) it divides evenly by 60 (534 samples/frame) and (b) the
-// I2S DAC is rate-agnostic.  HDMI audio is rate-locked to whatever the
-// info-frame declares (HDMI_AUDIO_RATE in hdmi_alt.c, 32 kHz), so we
-// must produce at exactly the same rate or the receiver re-pitches the
-// stream.  Use 32000 on HDMI_ALT and accept the 0.33 sample/frame
-// deficit (handled by the wall-clock catch-up loop below).
-#ifdef FRANK_SNES_HDMI_ALT
-#define AUDIO_SAMPLE_RATE   (32000)
-#else
+// Audio sample rate.  Use 32040 on both paths so AUDIO_BUFFER_LENGTH
+// divides exactly by 60 (534 samples/frame) and the producer doesn't
+// drift relative to the wall clock.  HDMI declares 32 kHz on the wire
+// (the closest CEA-861 standard rate); the resulting 0.125% pitch
+// shift is well below audible.
 #define AUDIO_SAMPLE_RATE   (32040)
-#endif
 #define AUDIO_BUFFER_LENGTH (AUDIO_SAMPLE_RATE / 60)
 
 //=============================================================================
