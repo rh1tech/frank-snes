@@ -109,10 +109,12 @@ static const struct dvi_serialiser_cfg frank_snes_dvi_cfg = {
 #define HDMI_AUDIO_RATE   32000
 #define HDMI_AUDIO_N      4096    /* CEA-861 N for 32 kHz */
 
-/* Power-of-two size for the data-island ring.  Restored to 512 (= 2 KB)
- * once audio is re-enabled; while the audio data-island path is
- * disabled for video bring-up the ring storage is not allocated. */
-#define HDMI_AUDIO_RING_SAMPLES (512)
+/* Power-of-two size for the data-island ring.  Core 0 produces in
+ * bursts of AUDIO_BUFFER_LENGTH (~533 frames per video frame); the
+ * ring must absorb at least one chunk plus a couple of catch-up
+ * bursts.  2048 frames = 8 KB and ~64 ms of buffering — small
+ * enough to fit alongside the rest of frank-snes's SRAM footprint. */
+#define HDMI_AUDIO_RING_SAMPLES (2048)
 
 /* ------------------------------------------------------------------ */
 /* libdvi state and buffers                                           */
@@ -389,20 +391,12 @@ static void __not_in_flash_func(hdmi_alt_core1_main)(void) {
 void graphics_init(g_out g_out) {
     (void)g_out;
 
-    /* libdvi runs the TMDS serialiser straight off sys_clock with a
-     * fixed PIO program — the system clock MUST equal the TMDS bit
-     * clock (252 MHz for 640x480p60).  main.c will already have
-     * overclocked to e.g. 504 MHz for emulation, but at 504 MHz the
-     * TMDS line rate is 2x spec and no display will lock.  Force the
-     * clock down here.  This costs SNES emulation throughput but is
-     * the only way to get a valid HDMI signal without a redesign of
-     * libdvi's PIO program. */
-    uint target_khz = DVI_TIMING_PRESET.bit_clk_khz;
-    if (clock_get_hz(clk_sys) / 1000 != target_khz) {
-        if (!set_sys_clock_khz(target_khz, false)) {
-            set_sys_clock_khz(252000, true);
-        }
-    }
+    /* libdvi's TMDS serialiser SMs and PWM pixel clock are configured
+     * with DVI_SM_CLKDIV=2 (see drivers/libdvi/CMakeLists.txt) so they
+     * stay at spec rate when sys_clock runs at 2x the TMDS bit clock.
+     * Concretely: main.c overclocks to 504 MHz for SNES emulation and
+     * we drive a 252 MHz TMDS link from that.  We do not change the
+     * CPU clock here — emulator throughput depends on it. */
 
     /* Give Core 1 (which is going to drive DVI) bus priority so its
      * encoded scanlines reach SRAM in time, and ALSO promote DMA bus
@@ -429,6 +423,13 @@ void graphics_init(g_out g_out) {
     dvi_get_blank_settings(&dvi0)->top    = 0;
     dvi_get_blank_settings(&dvi0)->bottom = 0;
     dvi_audio_sample_buffer_set(&dvi0, audio_ring_storage, HDMI_AUDIO_RING_SAMPLES);
+    /* Phase-shift the producer half a ring ahead of the consumer so
+     * the consumer never drains to empty while waiting for the next
+     * Core 0 burst (and the producer never overflows during a
+     * catch-up burst).  Without this initial offset the rate-matched
+     * producer/consumer pair runs at the boundary of underrun and
+     * the audio is full of short gaps. */
+    set_write_offset(&dvi0.audio_ring, HDMI_AUDIO_RING_SAMPLES >> 1);
     int cts = DVI_TIMING_PRESET.bit_clk_khz * HDMI_AUDIO_N / (HDMI_AUDIO_RATE / 100) / 128;
     dvi_set_audio_freq(&dvi0, HDMI_AUDIO_RATE, cts, HDMI_AUDIO_N);
 

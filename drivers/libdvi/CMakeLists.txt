@@ -29,6 +29,13 @@ target_include_directories(libdvi INTERFACE ${CMAKE_CURRENT_LIST_DIR})
 # the FIFOs and flash a red "late scanline" indicator.
 target_compile_definitions(libdvi INTERFACE
     DVI_N_TMDS_BUFFERS=3
+    # frank-snes patch: run sys_clock at 2x the TMDS bit clock (504
+    # MHz CPU drives a 252 MHz TMDS link) and divide both the
+    # serialiser SMs and the PWM pixel-clock output by the same 2.
+    # The SNES emulator needs the headroom — at 252 MHz it skips
+    # frames and audio chunks under load, which manifests as red
+    # "late scanline" flashes plus audio glitches.
+    DVI_SM_CLKDIV=2
 )
 
 target_link_libraries(libdvi INTERFACE

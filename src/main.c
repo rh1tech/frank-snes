@@ -75,10 +75,18 @@ extern void hdmi_alt_run_core1(void);
 #define SCREEN_WIDTH     SNES_WIDTH    // 256
 #define SCREEN_HEIGHT    SNES_HEIGHT   // 224
 
-// Audio sample rate - real SNES is 32000 Hz but we use 32040 which
-// divides evenly by 60 (534 samples/frame), avoiding the 0.33 sample/frame
-// deficit that causes periodic audio pops from buffer underruns.
+// Audio sample rate.  Real SNES is 32000 Hz; the I2S path used 32040
+// because (a) it divides evenly by 60 (534 samples/frame) and (b) the
+// I2S DAC is rate-agnostic.  HDMI audio is rate-locked to whatever the
+// info-frame declares (HDMI_AUDIO_RATE in hdmi_alt.c, 32 kHz), so we
+// must produce at exactly the same rate or the receiver re-pitches the
+// stream.  Use 32000 on HDMI_ALT and accept the 0.33 sample/frame
+// deficit (handled by the wall-clock catch-up loop below).
+#ifdef FRANK_SNES_HDMI_ALT
+#define AUDIO_SAMPLE_RATE   (32000)
+#else
 #define AUDIO_SAMPLE_RATE   (32040)
+#endif
 #define AUDIO_BUFFER_LENGTH (AUDIO_SAMPLE_RATE / 60)
 
 //=============================================================================
@@ -126,7 +134,9 @@ volatile uint32_t current_buffer = 0;
 // AUDIO_QUEUE_DEPTH SRAM ring is dead weight.  Shrink it to 2 to
 // recover ~12 KB SRAM that the libdvi TMDS buffers can use.
 #ifdef FRANK_SNES_HDMI_ALT
-#define AUDIO_QUEUE_DEPTH 2
+/* The HDMI ring is the real consumer queue; this SRAM ring just holds
+ * the in-flight chunk Core 0 just packed.  Depth 1 is sufficient. */
+#define AUDIO_QUEUE_DEPTH 1
 #else
 #define AUDIO_QUEUE_DEPTH 8
 #endif

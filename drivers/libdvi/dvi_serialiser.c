@@ -59,6 +59,12 @@ void dvi_serialiser_init(struct dvi_serialiser_cfg *cfg) {
 	pwm_config pwm_cfg = pwm_get_default_config();
 	pwm_config_set_output_polarity(&pwm_cfg, true, false);
 	pwm_config_set_wrap(&pwm_cfg, 9);
+	// PATCH (frank-snes): when sys_clock is an integer multiple of the
+	// TMDS bit clock, divide the PWM clock by the same factor so the
+	// pixel-clock output runs at spec while the CPU stays fast.
+#ifdef DVI_SM_CLKDIV
+	pwm_config_set_clkdiv_int(&pwm_cfg, DVI_SM_CLKDIV);
+#endif
 	pwm_init(slice, &pwm_cfg, false);
 	pwm_set_both_levels(slice, 5, 5);
 #else

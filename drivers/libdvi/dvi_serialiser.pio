@@ -47,6 +47,13 @@ static inline void dvi_serialiser_program_init(PIO pio, uint sm, uint offset, ui
 	    sm_config_set_out_pins(&c, data_pins, 1);
     sm_config_set_out_shift(&c, true, !debug, 10 * DVI_SYMBOLS_PER_WORD);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    /* PATCH (frank-snes): when sys_clock runs at an integer multiple
+     * of the TMDS bit clock (e.g. 504 MHz CPU vs 252 MHz TMDS), apply
+     * the matching clkdiv to the serialiser SM so TMDS comes out at
+     * spec rate without forcing the CPU down to TMDS speed. */
+#ifdef DVI_SM_CLKDIV
+    sm_config_set_clkdiv(&c, DVI_SM_CLKDIV);
+#endif
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, false);
 }
