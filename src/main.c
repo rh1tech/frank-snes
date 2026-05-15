@@ -44,6 +44,12 @@
 // Audio optimizations
 #include "audio_opt.h"
 
+#ifdef FRANK_SNES_HDMI_ALT
+// HDMI_ALT (libdvi-backed) entry points and audio ring write.
+#include "hdmi_alt.h"
+extern void hdmi_alt_run_core1(void);
+#endif
+
 // Input drivers
 #include "nespad/nespad.h"
 #include "ps2kbd/ps2kbd_wrapper.h"
@@ -114,7 +120,16 @@ volatile uint32_t current_buffer = 0;
 //
 // Key goal: keep Core 1 work minimal so HDMI activity doesn't starve audio.
 // 16 frames (~267ms) - absorbs CPU spikes during scene transitions
+//
+// On HDMI_ALT, Core 0 forwards each packed chunk directly into the
+// dvi0.audio_ring after pack — there is no I2S consumer, so the
+// AUDIO_QUEUE_DEPTH SRAM ring is dead weight.  Shrink it to 2 to
+// recover ~12 KB SRAM that the libdvi TMDS buffers can use.
+#ifdef FRANK_SNES_HDMI_ALT
+#define AUDIO_QUEUE_DEPTH 2
+#else
 #define AUDIO_QUEUE_DEPTH 8
+#endif
 // NOTE: With fixed 60Hz emulation producing exactly one audio chunk per frame,
 // the producer cannot stay "ahead" of the consumer by >1 chunk in steady state.
 // Using queue-fill watermarks to decide frame skipping will therefore
@@ -774,12 +789,23 @@ void __time_critical_func(render_core)(void) {
         test_tone[i * 2] = sample;      // Left
         test_tone[i * 2 + 1] = sample;  // Right
     }
-    
+
     // Initialize APU Core 1 support
 #if APU_ON_CORE1
     apu_core1_init();
 #endif
-    
+
+#ifdef FRANK_SNES_HDMI_ALT
+    // HDMI_ALT path: Core 1 is the libdvi worker.  Audio rides HDMI
+    // data-island packets, fed directly from Core 0 after packing —
+    // there is no I2S consumer here.  Signal ready then enter the
+    // libdvi loop, which never returns.
+    __dmb();
+    core1_ready = true;
+    __dmb();
+    hdmi_alt_run_core1();
+    __builtin_unreachable();
+#else
     // Initialize audio on Core 1
     static i2s_config_t i2s_config;
     i2s_config = i2s_get_default_config();
@@ -793,7 +819,7 @@ void __time_critical_func(render_core)(void) {
     __dmb();
     core1_ready = true;
     __dmb();
-    
+
     // Audio playback - continuously stream from ring buffer to DMA
     static uint32_t __attribute__((aligned(32))) fadeout_buf[AUDIO_BUFFER_LENGTH];
     memset(fadeout_buf, 0, sizeof(fadeout_buf));
@@ -897,6 +923,7 @@ void __time_critical_func(render_core)(void) {
             diag_timer = 0;
         }
     }
+#endif /* !FRANK_SNES_HDMI_ALT */
 }
 
 //=============================================================================
@@ -1252,6 +1279,13 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             __dmb();
             audio_prod_seq = prod + 1;
             __dmb();
+
+#ifdef FRANK_SNES_HDMI_ALT
+            // Forward packed stereo (L<<16|R per uint32) to HDMI audio
+            // data-island ring.  Drops samples silently if the ring is
+            // full — emulation must not block on audio.
+            hdmi_alt_audio_write((const int16_t *)dst32, AUDIO_BUFFER_LENGTH);
+#endif
         }
 
         // Wall-clock audio catch-up: produce extra chunks so I2S never starves.
@@ -1294,6 +1328,9 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                 __dmb();
                 audio_prod_seq = p2 + 1;
                 __dmb();
+#ifdef FRANK_SNES_HDMI_ALT
+                hdmi_alt_audio_write((const int16_t *)edst, AUDIO_BUFFER_LENGTH);
+#endif
                 audio_acc_us -= TARGET_FRAME_US;
                 extra++;
             }
@@ -1621,13 +1658,11 @@ int main(void) {
     
     stdio_init_all();
 #if LIB_PICO_STDIO_USB
-    // Dev builds (USB_HID=0): USB CDC is the stdio sink. Wait until the
-    // host terminal opens the port, THEN sleep 3 more seconds before any
-    // LOG() fires, so the whole boot log lands in the console.
-    while (!stdio_usb_connected()) {
-        sleep_ms(10);
-    }
-    sleep_ms(3000);
+    // Give the host a moment to open the CDC port — long enough that
+    // most of the boot log lands in the console when a terminal is
+    // attached, short enough that we still come up with no host
+    // present (so the HDMI display is usable standalone).
+    sleep_ms(2000);
 #endif
     
     LOG("\n\n");

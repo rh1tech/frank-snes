@@ -33,6 +33,14 @@ option(FRANK_SNES_FAST_MODE "Enable fast mode (reduced quality for higher FPS)" 
 # USB HID gamepad/keyboard support (enabled by default)
 option(USB_HID_ENABLED "Enable USB HID host for gamepads and keyboards" ON)
 
+# HDMI driver selection.  PIO (default) is the bespoke palette-indexed
+# scanline driver in drivers/HDMI.c; ALT switches to the libdvi-backed
+# path with HDMI audio data-island support, vendored under
+# drivers/libdvi/.
+set(HDMI_DRIVER "PIO" CACHE STRING "HDMI driver: PIO or ALT")
+set_property(CACHE HDMI_DRIVER PROPERTY STRINGS PIO ALT)
+message(STATUS "HDMI driver: ${HDMI_DRIVER}")
+
 # CPU voltage selection based on speed
 if(CPU_SPEED GREATER_EQUAL 504)
     set(CPU_VOLTAGE "VREG_VOLTAGE_1_65")
@@ -64,10 +72,20 @@ add_subdirectory(drivers/ps2)
 add_subdirectory(src/ps2kbd)
 add_subdirectory(drivers/usbhid)
 
+if(HDMI_DRIVER STREQUAL "ALT")
+    add_subdirectory(drivers/libdvi)
+endif()
+
+# Per-driver source set
+if(HDMI_DRIVER STREQUAL "ALT")
+    set(HDMI_DRIVER_SOURCES drivers/hdmi_alt.c)
+else()
+    set(HDMI_DRIVER_SOURCES drivers/HDMI.c drivers/hdmi_scanline.S)
+endif()
+
 # Driver library
 add_library(drivers
-    drivers/HDMI.c
-    drivers/hdmi_scanline.S
+    ${HDMI_DRIVER_SOURCES}
     drivers/psram_init.c
     drivers/psram_allocator.c
     drivers/audio.c
@@ -78,6 +96,11 @@ target_compile_definitions(drivers PRIVATE
     BOARD_${BOARD_VARIANT}
     PSRAM_MAX_FREQ_MHZ=${PSRAM_SPEED}
 )
+
+if(HDMI_DRIVER STREQUAL "ALT")
+    target_compile_definitions(drivers PUBLIC FRANK_SNES_HDMI_ALT=1)
+    target_link_libraries(drivers libdvi)
+endif()
 
 pico_generate_pio_header(drivers ${CMAKE_CURRENT_LIST_DIR}/drivers/audio_i2s.pio)
 
@@ -184,6 +207,10 @@ endif()
 if(FRANK_SNES_FAST_MODE)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_FAST_MODE=1)
     message(STATUS "FAST MODE enabled")
+endif()
+
+if(HDMI_DRIVER STREQUAL "ALT")
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_HDMI_ALT=1)
 endif()
 
 
