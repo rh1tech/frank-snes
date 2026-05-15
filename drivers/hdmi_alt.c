@@ -470,7 +470,12 @@ void __not_in_flash_func(hdmi_alt_run_core1)(void) {
 /* ------------------------------------------------------------------ */
 
 uint32_t hdmi_alt_audio_free(void) {
-    return get_write_size(&dvi0.audio_ring, false);
+    /* Pass full=true so the helper uses the accurate "wp >= rp"
+     * arithmetic; the full=false branch in libdvi's get_write_size
+     * over-reports free space by up to rp-1 frames, which causes the
+     * producer to overwrite samples the consumer hasn't read yet —
+     * audible as glitches/discontinuities mid-waveform. */
+    return get_write_size(&dvi0.audio_ring, true);
 }
 
 /* Caller passes a pointer to packed uint32_t frames where each word is
@@ -484,7 +489,7 @@ uint32_t __not_in_flash_func(hdmi_alt_audio_write)(const int16_t *frames_lr,
                                                    uint32_t num_frames) {
     if (!dvi_is_started(&dvi0)) return 0;
 
-    uint32_t free_frames = get_write_size(&dvi0.audio_ring, false);
+    uint32_t free_frames = get_write_size(&dvi0.audio_ring, true);
     if (free_frames == 0) {
         /* Ring is full — drop and return 0 so caller doesn't spin. */
         return 0;
