@@ -72,10 +72,21 @@ bool S9xSaveState(FIL *fp)
    chunks += write_chunk(fp, Memory.RAM, RAM_SIZE);
    chunks += write_chunk(fp, Memory.SRAM, SRAM_SIZE);
    chunks += write_chunk(fp, Memory.FillRAM, FILLRAM_SIZE);
+#ifdef USE_BLARGG_APU
+   /* The accurate core keeps the SPC700, its RAM and the DSP in two
+    * self-contained blocks with no internal pointers, so it saves as
+    * two chunks where the legacy core needed three plus a fix-up pass.
+    * Kept at three chunks so the chunk count below is unchanged. */
+   chunks += write_chunk(fp, S9xAPUStateBlock(), S9xAPUStateSize());
+   chunks += write_chunk(fp, spc_apuram(), 0x10000);
+   chunks += write_chunk(fp, spc_dsp_state(), spc_dsp_state_size());
+   chunks += 1;   /* the legacy build's fourth chunk */
+#else
    chunks += write_chunk(fp, &APU, sizeof(APU));
    chunks += write_chunk(fp, &IAPU, sizeof(IAPU));
    chunks += write_chunk(fp, IAPU.RAM, 0x10000);
    chunks += write_chunk(fp, &SoundData, sizeof(SoundData));
+#endif
 
    printf("Saved chunks = %d\n", chunks);
 
@@ -96,7 +107,9 @@ bool S9xLoadState(FIL *fp)
    /* At this point we can't go back and a failure will corrupt the state anyway */
    S9xReset();
 
+#ifndef USE_BLARGG_APU
    uint8_t *IAPU_RAM = IAPU.RAM;
+#endif
 
    chunks += read_chunk(fp, &CPU, sizeof(CPU));
    chunks += read_chunk(fp, &ICPU, sizeof(ICPU));
@@ -106,27 +119,38 @@ bool S9xLoadState(FIL *fp)
    chunks += read_chunk(fp, Memory.RAM, RAM_SIZE);
    chunks += read_chunk(fp, Memory.SRAM, SRAM_SIZE);
    chunks += read_chunk(fp, Memory.FillRAM, FILLRAM_SIZE);
+#ifdef USE_BLARGG_APU
+   chunks += read_chunk(fp, S9xAPUStateBlock(), S9xAPUStateSize());
+   chunks += read_chunk(fp, spc_apuram(), 0x10000);
+   chunks += read_chunk(fp, spc_dsp_state(), spc_dsp_state_size());
+   chunks += 1;
+#else
    chunks += read_chunk(fp, &APU, sizeof(APU));
    chunks += read_chunk(fp, &IAPU, sizeof(IAPU));
    chunks += read_chunk(fp, IAPU.RAM, 0x10000);
    chunks += read_chunk(fp, &SoundData, sizeof(SoundData));
+#endif
 
    printf("Loaded chunks = %d\n", chunks);
 
    /* Fixing up registers and pointers: */
 
+#ifndef USE_BLARGG_APU
    IAPU.PC = IAPU.PC - IAPU.RAM + IAPU_RAM;
    IAPU.DirectPage = IAPU.DirectPage - IAPU.RAM + IAPU_RAM;
    IAPU.WaitAddress1 = IAPU.WaitAddress1 - IAPU.RAM + IAPU_RAM;
    IAPU.WaitAddress2 = IAPU.WaitAddress2 - IAPU.RAM + IAPU_RAM;
    IAPU.RAM = IAPU_RAM;
+#endif
 
    FixROMSpeed();
    IPPU.ColorsChanged = true;
    IPPU.OBJChanged = true;
    CPU.InDMA = false;
    S9xFixColourBrightness();
+#ifndef USE_BLARGG_APU
    S9xAPUUnpackStatus();
+#endif
    S9xFixSoundAfterSnapshotLoad();
    ICPU.ShiftedPB = ICPU.Registers.PB << 16;
    ICPU.ShiftedDB = ICPU.Registers.DB << 16;

@@ -1385,6 +1385,16 @@ void S9xPlaySample(int32_t channel)
    ch->gauss_buf[0] = ch->gauss_buf[1] = ch->gauss_buf[2] = ch->gauss_buf[3] = 0;
    dir = S9xGetSampleAddress(ch->sample_number);
    ch->block_pointer = READ_WORD(dir);
+#ifdef FRANK_SNES_AUDIO_CAPTURE
+   /* Diagnosis only: record what this key-on actually resolved to, so a
+    * voice that produces no sound can be traced to its sample data. */
+   {
+      extern void s9x_diag_kon(int, int, unsigned, unsigned, const uint8_t *);
+      s9x_diag_kon(channel, ch->sample_number, ch->block_pointer,
+                   (unsigned)READ_WORD(dir + 2),
+                   &IAPU.RAM[ch->block_pointer & 0xffff]);
+   }
+#endif
    ch->sample_pointer = 0;
    ch->env_error = 0;
    ch->next_sample = 0;

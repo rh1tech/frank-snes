@@ -2,8 +2,13 @@
 #
 # release.sh - Build release firmware for frank-snes
 #
-# Builds two variants: M1 and M2
-# Output: frank-snes_m1_A_BB.uf2, frank-snes_m2_A_BB.uf2
+# Builds three variants: M1, M2 and C2
+# Output: frank-snes_m1_A_BB.uf2, frank-snes_m2_A_BB.uf2,
+#         frank-snes_c2_A_BB.uf2 and frank-snes_c2-slave_A_BB.uf2
+#
+# C2 (FRANK Core 2) is two chips and ships as two images: the emulator
+# for the RP2350B master and the sound slave for the RP2350A. Both must
+# be flashed — see docs/C2_SOUND_SPLIT.md.
 #
 # Flags:
 #   -t, --test     Build at the current version (no increment, no version.txt
@@ -33,7 +38,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            sed -n '3,12p' "$0"
+            sed -n '3,18p' "$0"
             exit 0
             ;;
         *)
@@ -127,8 +132,10 @@ fi
 RELEASE_DIR="$SCRIPT_DIR/release"
 mkdir -p "$RELEASE_DIR"
 
-VARIANTS=("M1" "M2")
+VARIANTS=("M1" "M2" "C2")
 FAIL=0
+
+JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 for VARIANT in "${VARIANTS[@]}"; do
     VARIANT_LOWER=$(echo "$VARIANT" | tr '[:upper:]' '[:lower:]')
@@ -145,7 +152,7 @@ for VARIANT in "${VARIANTS[@]}"; do
 
     cmake .. -DBOARD_VARIANT=${VARIANT} -DUSB_HID_ENABLED=ON > /dev/null 2>&1
 
-    if make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) > /dev/null 2>&1; then
+    if make -j${JOBS} > /dev/null 2>&1; then
         if [[ -f "frank-snes.uf2" ]]; then
             cp "frank-snes.uf2" "$RELEASE_DIR/$OUTPUT_NAME"
             echo -e "  ${GREEN}✓ ${VARIANT}${NC} → release/$OUTPUT_NAME"
@@ -159,6 +166,31 @@ for VARIANT in "${VARIANTS[@]}"; do
     fi
 
     cd "$SCRIPT_DIR"
+
+    # C2 ships as two images: the master above and the sound slave. The
+    # slave is built at the same CPU_SPEED the master defaults to, since
+    # the link's PIO timing is derived from each side's system clock.
+    if [[ "$VARIANT" == "C2" ]]; then
+        SLAVE_NAME="frank-snes_c2-slave_${VERSION}${POSTFIX}.uf2"
+        echo -e "${CYAN}Building: $SLAVE_NAME${NC}"
+
+        rm -rf slave/build
+        mkdir -p slave/build
+        cd slave/build
+
+        cmake .. -DPICO_PLATFORM=rp2350 > /dev/null 2>&1
+
+        if make -j${JOBS} > /dev/null 2>&1 && [[ -f "frank-snes-slave.uf2" ]]; then
+            cp "frank-snes-slave.uf2" "$RELEASE_DIR/$SLAVE_NAME"
+            echo -e "  ${GREEN}✓ C2 slave${NC} → release/$SLAVE_NAME"
+        else
+            echo -e "  ${RED}✗ C2 slave build failed${NC}"
+            FAIL=1
+        fi
+
+        cd "$SCRIPT_DIR"
+        rm -rf slave/build
+    fi
 done
 
 rm -rf build

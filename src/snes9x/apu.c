@@ -134,6 +134,21 @@ void S9xAPUWritePort(int32_t Address, uint8_t Byte)
 volatile uint32_t dsp_log_frame = 0;
 volatile uint32_t dsp_write_count = 0; /* total DSP writes — for hang detection */
 
+/*
+ * S9xSetAPUDSP(), S9xGetAPUDSP() and S9xFixEnvelope() below belong to
+ * the legacy soundux.c mixer, and are compiled only when that is the
+ * sound core and sound is generated locally.
+ *
+ * With SOUND_CORE_DSP they come from src/snes9x/apu_dsp.c, which drives
+ * the accurate S-DSP; with C2_SOUND_LINK they come from
+ * src/sound_backend_link.c, which forwards the write to the slave.
+ *
+ * Everything else in this file — the port handshake, the timers, the
+ * IPL ROM window — is shared by every board and every sound core, and
+ * compiles unchanged. See docs/C2_SOUND_SPLIT.md.
+ */
+#if !defined(C2_SOUND_LINK) && !defined(SOUND_CORE_DSP)
+
 #ifdef PICO_ON_DEVICE
 __attribute__((hot, section(".time_critical.apu_dsp")))
 #endif
@@ -462,6 +477,8 @@ void S9xFixEnvelope(int32_t channel, uint8_t gain, uint8_t adsr1, uint8_t adsr2)
    }
 }
 
+#endif /* legacy soundux mixer */
+
 void S9xSetAPUControl(uint8_t byte)
 {
    if ((byte & 1) && !APU.TimerEnabled [0])
@@ -513,7 +530,17 @@ void S9xSetAPUControl(uint8_t byte)
       memcpy(&IAPU.RAM [0xffc0], APU.ExtraRAM, sizeof(APUROM));
    }
    IAPU.RAM [0xf1] = byte;
+
+#ifdef C2_SOUND_LINK
+   /* Showing or hiding the IPL ROM rewrites 0xFFC0..0xFFFF behind the
+    * general write path, so the slave's copy of that page has to be
+    * marked by hand. It is the one place outside S9xAPUSetByte() that
+    * changes APU RAM the mixer can read. */
+   s9x_apu_ram_dirty(0xffc0);
+#endif
 }
+
+#if !defined(C2_SOUND_LINK) && !defined(SOUND_CORE_DSP)
 
 uint8_t S9xGetAPUDSP()
 {
@@ -550,5 +577,7 @@ uint8_t S9xGetAPUDSP()
    }
    return byte;
 }
+
+#endif /* legacy soundux mixer */
 
 #endif

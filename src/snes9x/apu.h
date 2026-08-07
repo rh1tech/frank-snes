@@ -69,6 +69,14 @@ static INLINE void S9xAPUPackStatus(void)
       IAPU.Registers.P |= Negative;
 }
 
+#ifdef C2_SOUND_LINK
+/* C2 only: mark the 256-byte page containing `address` as changed, so
+ * the next frame exchange carries it to the slave's copy of APU RAM.
+ * Implemented in src/sound_backend_link.c; called from the one general
+ * write path in spc700.c and from the IPL ROM toggle in apu.c. */
+void s9x_apu_ram_dirty(uint32_t address);
+#endif
+
 void S9xResetAPU(void);
 bool S9xInitAPU(void);
 void S9xDeinitAPU(void);
@@ -128,9 +136,30 @@ extern const uint8_t S9xAPUCycleLengths [256]; /* Raw data. */
 #endif
 
 #else
-#include "apu_blargg.h"
+/* The accurate core. Upstream pointed this at apu_blargg.h, which was a
+ * single file holding both the SPC700 and the DSP; here they are split
+ * so the C2 sound offload can hook the DSP seam on its own. */
+#include "spc700_blargg.h"
+#include "spc_dsp.h"
 #define ONE_APU_CYCLE 21
 #define APU_EXECUTE1() do {} while(0)
 #define APU_EXECUTE()  do {} while(0)
+
+/* The sound API main.c calls. On the legacy path these come from
+ * soundux.h; that header is empty under this branch, so they are
+ * declared here and implemented by src/snes9x/apu_dsp.c. */
+bool S9xInitSound(int32_t buffer_ms, int32_t lag_ms);
+void S9xResetSound(bool full);
+void S9xFixSoundAfterSnapshotLoad(void);
+void S9xSetPlaybackRate(uint32_t rate);
+void S9xMixSamples(int16_t *buffer, int32_t sample_count);
+void S9xMixSamplesMono(int16_t *buffer, int32_t sample_count);
+void S9xMixSamplesLowPass(int16_t *buffer, int32_t sample_count,
+                          int32_t low_pass_range);
+
+/* Input-side hooks the legacy mixer used for its SFX auto-release; that
+ * mechanism was already disabled, and the accurate DSP has no use for
+ * them. main.c still calls this one. */
+static inline void S9xNotifyButtonPress(void) { }
 
 #endif

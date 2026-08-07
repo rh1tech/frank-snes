@@ -37,6 +37,11 @@
 
 // APU on Core 1
 #include "snes9x/apu_core1.h"
+#ifdef C2_SOUND_LINK
+/* C2 only: hand the frame's sound work to the slave. Defined in
+ * src/sound_backend_link.c. */
+void s9x_link_frame(void);
+#endif
 
 // Audio driver (exact copy from pico-snes-master)
 #include "audio.h"
@@ -142,6 +147,243 @@ volatile uint32_t current_buffer = 0;
 #define AUDIO_LOW_WATERMARK 4
 static uint32_t __attribute__((aligned(32))) audio_packed_buffer[AUDIO_QUEUE_DEPTH][AUDIO_BUFFER_LENGTH];
 static uint32_t __attribute__((aligned(32))) audio_packed_discard[AUDIO_BUFFER_LENGTH];
+
+/* Audio pacing diagnostics. A discard is a whole 534-sample chunk the
+ * emulator produced and threw away because the I2S ring was full — the
+ * emulated frame rate running ahead of the DAC. An underrun is the
+ * opposite. Either one is an audible seam: a discard skips ~8.9 ms of
+ * the song, an underrun fades it to silence and back. Both are common
+ * to every sound core and every board, which is why they survived
+ * replacing the mixer. */
+static uint32_t g_render_cost_us = 4000;   /* estimated cost of rendering  */
+static uint32_t g_emu_only_us   = 8000;   /* cost of a skipped-render frame */
+volatile uint32_t audio_discards;
+volatile uint32_t audio_underruns;
+
+#ifndef C2_SOUND_LINK
+/* --- Audio pacing -------------------------------------------------------
+ *
+ * Audio is produced at the rate emulation advances and consumed at a fixed
+ * 32040 Hz. When emulation runs below 60 fps the two diverge, and the old
+ * fix was to call S9xMixSamples extra times to top the ring up.
+ *
+ * That is not a rendering-only operation. The mixer writes ENDX (and clears
+ * KON) back into APU.DSP, and the emulated SPC700 reads those registers to
+ * decide when a sample has finished. Mixing ahead of emulated time therefore
+ * tells the driver a sample ended before it did, and the driver keys it
+ * again — the same sound plays twice. It scales with load, because the
+ * number of extra mixes is exactly how far behind 60 fps we are.
+ *
+ * So the mixer now runs exactly once per emulated frame, and the shortfall
+ * is covered by resampling audio that was really produced. Emulator state
+ * is never advanced by the audio clock.
+ */
+#ifdef FRANK_SNES_FAST_MODE
+#define AUDIO_CH 1                  /* S9xMixSamplesMono output */
+#else
+#define AUDIO_CH 2
+#endif
+/* Buffer depth decides how long an fps dip can last before the resampler
+ * has to stretch hard enough to be audible. M1 has almost no SRAM spare,
+ * so only the larger boards get the deeper FIFO. */
+#ifdef BOARD_C2
+#define SFIFO_CHUNKS 8
+#else
+#define SFIFO_CHUNKS 4
+#endif
+#define SFIFO_FRAMES (AUDIO_BUFFER_LENGTH * SFIFO_CHUNKS)
+
+static int16_t  sfifo[SFIFO_FRAMES * AUDIO_CH];
+/* Both cursors stay wrapped inside the ring. A free-running q16 read cursor
+ * only spans 65535 frames — two seconds at 32 kHz — before it wraps and
+ * starts reading stale samples. */
+#define SFIFO_SPAN_Q16 ((uint32_t)SFIFO_FRAMES << 16)
+static uint32_t sfifo_rd;        /* read cursor, frames, q16 fixed point  */
+static uint32_t sfifo_wr;        /* write cursor, whole frames            */
+static uint32_t sfifo_fill;      /* frames available                      */
+
+static void sfifo_push(const int16_t *src, uint32_t frames)
+{
+    for (uint32_t i = 0; i < frames; i++) {
+        int16_t *d = &sfifo[sfifo_wr * AUDIO_CH];
+        for (uint32_t c = 0; c < AUDIO_CH; c++) d[c] = src[i * AUDIO_CH + c];
+        if (++sfifo_wr >= SFIFO_FRAMES) sfifo_wr = 0;
+        if (sfifo_fill < SFIFO_FRAMES) {
+            sfifo_fill++;
+        } else {                            /* overwrote the oldest frame */
+            sfifo_rd += 1u << 16;
+            if (sfifo_rd >= SFIFO_SPAN_Q16) sfifo_rd -= SFIFO_SPAN_Q16;
+            audio_discards++;               /* the only place audio is lost */
+        }
+    }
+}
+
+/* Pull one chunk, resampling at `ratio` (q16 input frames per output frame).
+ * The caller derives the ratio from ring depth, which is the only signal
+ * that reflects the DAC's true rate. */
+static void sfifo_pull(int16_t *dst, uint32_t frames, int32_t ratio)
+{
+
+    for (uint32_t i = 0; i < frames; i++) {
+        uint32_t whole = sfifo_rd >> 16;
+        if (sfifo_fill < 2) {              /* genuinely dry: hold, don't mix */
+            for (uint32_t c = 0; c < AUDIO_CH; c++) dst[i * AUDIO_CH + c] = 0;
+            continue;
+        }
+        uint32_t frac = sfifo_rd & 0xffff;
+        uint32_t nxt  = (whole + 1 >= SFIFO_FRAMES) ? 0 : whole + 1;
+        const int16_t *a = &sfifo[whole * AUDIO_CH];
+        const int16_t *b = &sfifo[nxt   * AUDIO_CH];
+        for (uint32_t c = 0; c < AUDIO_CH; c++)
+            dst[i * AUDIO_CH + c] =
+                (int16_t)(a[c] + (((int32_t)(b[c] - a[c]) * (int32_t)frac) >> 16));
+        sfifo_rd += ratio;
+        uint32_t consumed = (sfifo_rd >> 16) - whole;
+        if (sfifo_rd >= SFIFO_SPAN_Q16) {
+            sfifo_rd -= SFIFO_SPAN_Q16;
+            consumed = (sfifo_rd >> 16) + SFIFO_FRAMES - whole;
+        }
+        if (consumed)
+            sfifo_fill = (sfifo_fill > consumed) ? sfifo_fill - consumed : 0;
+    }
+}
+#endif /* !C2_SOUND_LINK */
+
+/* PSRAM integrity check.
+ *
+ * The ROM — and therefore every BRR sample the game uploads to the APU —
+ * lives in PSRAM. apu.c already documents that "PSRAM read latency at
+ * 504MHz/166MHz can cause SPC700 to read corrupted data", which is why
+ * APU RAM itself was moved to SRAM. If the ROM image in PSRAM is not
+ * stable at the speeds build.sh uses, the sample data the game uploads
+ * is occasionally wrong, and that is indistinguishable by ear from the
+ * emulator mishandling the sample: bits of speech repeat, cut, or turn
+ * to noise, no matter which sound core renders them.
+ *
+ * This re-hashes the ROM once a second and counts mismatches against
+ * the first pass. Non-zero means the PSRAM overclock is the problem and
+ * no amount of work on the audio path will fix it. */
+/* Audio capture.
+ *
+ * Records the exact stream handed to the I2S DMA — post-gain, post-pack,
+ * the last thing before the DAC — into PSRAM, so it can be pulled off
+ * over SWD and looked at. Every diagnosis so far has been indirect;
+ * this is the actual signal.
+ */
+volatile uint32_t *audio_cap_buf;      /* PSRAM, stereo pairs as u32   */
+volatile uint32_t  audio_cap_len;      /* chunks captured (total)      */
+volatile uint32_t  audio_cap_max;      /* capacity in chunks           */
+volatile uint32_t  audio_cap_arm;      /* 1 = recording, 0 = frozen    */
+volatile uint32_t  audio_cap_wr;       /* write cursor, wraps at _max  */
+volatile uint32_t  audio_cap_start;    /* first frame to capture        */
+
+/* Sound diagnosis: the mixer emitting exact zeros for many consecutive
+ * chunks means no voice is playing at all. That is what "no FIGHT" looks
+ * like in the capture. When it happens, freeze a snapshot of everything
+ * the mixer decides from — APU RAM, the DSP file, and the recent key-on
+ * history with the sample data each one resolved to — so the failure can
+ * be read out over SWD instead of guessed at. */
+typedef struct {
+   uint32_t frame, ch, srcn, start, loop;
+   uint8_t  brr[16];        /* BRR header + first block at `start` */
+} kon_rec_t;
+
+/* Long-run key-on log in PSRAM. A duplicated sample is, by definition, an
+ * extra key-on, so comparing this sequence against a host render of the
+ * same ROM shows divergence directly and covers minutes in a few hundred
+ * KB — raw audio for the same span would not fit beside the ROM. */
+typedef struct { uint32_t frame; uint16_t start; uint8_t ch, srcn; } konlog_rec_t;
+#define KONLOG_MAX 65536
+volatile uint32_t *diag_statecrc;   /* per frame: APU RAM crc, DSP crc */
+volatile konlog_rec_t *diag_konlog;
+volatile uint32_t diag_konlog_n;
+volatile uint32_t diag_emu_frame;
+#define KON_RING 64
+volatile kon_rec_t diag_kon[KON_RING];
+volatile uint32_t  diag_kon_wr;
+volatile uint32_t  diag_kon_total;
+volatile uint32_t  diag_silent_run;   /* consecutive all-zero chunks    */
+volatile uint32_t  diag_tripped;      /* 1 once the snapshot is taken   */
+volatile uint8_t  *diag_apuram_snap;  /* 64 KB copy of APU RAM          */
+volatile uint8_t   diag_ram_head[0x800]; /* zero page + directory, SRAM */
+volatile uint8_t   diag_dsp_snap[128];
+
+/* Every SPC700 write into the sample directory, so a directory entry
+ * found half-written can be traced to either a lost write (the store
+ * happened, the memory did not keep it) or a write that never issued. */
+typedef struct { uint32_t seq, addr; uint8_t val; } dirw_rec_t;
+#define DIRW_RING 512
+volatile dirw_rec_t diag_dirw[DIRW_RING];
+volatile uint32_t   diag_dirw_wr, diag_dirw_total;
+
+void s9x_diag_dirw(unsigned addr, uint8_t val)
+{
+   if (diag_tripped) return;
+   uint32_t i = diag_dirw_wr % DIRW_RING;
+   diag_dirw[i].seq  = diag_dirw_total;
+   diag_dirw[i].addr = addr;
+   diag_dirw[i].val  = val;
+   diag_dirw_wr = i + 1;
+   diag_dirw_total++;
+}
+
+/* Set by the mixer when a voice is keyed onto a sample whose directory
+ * entry has no start address: the voice then decodes whatever sits at
+ * APU RAM 0x0000. That is what "clicks instead of FIGHT" is, and it is
+ * a far sharper trigger than waiting for silence, which also fires on
+ * legitimate sound-bank switches. */
+volatile uint32_t diag_trip_on_null_kon = 0;  /* off: it disarmed the audio capture */
+volatile uint32_t diag_null_kon_count;
+
+void s9x_diag_kon(int ch, int srcn, unsigned start, unsigned loop,
+                  const uint8_t *brr)
+{
+   if (diag_konlog && diag_konlog_n < KONLOG_MAX) {
+      uint32_t i = diag_konlog_n;
+      diag_konlog[i].frame = diag_emu_frame;
+      diag_konlog[i].start = (uint16_t)start;
+      diag_konlog[i].ch    = (uint8_t)ch;
+      diag_konlog[i].srcn  = (uint8_t)srcn;
+      diag_konlog_n = i + 1;
+   }
+   if (diag_tripped) return;
+   /* The driver legitimately keys voices onto empty slots while a sound
+    * bank is still loading, so ignore null key-ons until the game has
+    * been playing for a while. */
+   if (start == 0) {
+      diag_null_kon_count++;
+      if (diag_trip_on_null_kon && diag_kon_total >= 200) {
+         uint32_t i2 = diag_kon_wr % KON_RING;
+         diag_kon[i2].frame = diag_kon_total;
+         diag_kon[i2].ch = ch; diag_kon[i2].srcn = srcn;
+         diag_kon[i2].start = start; diag_kon[i2].loop = loop;
+         for (int k = 0; k < 16; k++) diag_kon[i2].brr[k] = brr[k];
+         diag_kon_wr = i2 + 1; diag_kon_total++;
+         /* Small and SRAM-resident: a 64 KB copy into PSRAM from inside
+          * the audio path starves Core 1's HDMI streaming long enough to
+          * lock it up. The zero page and the directory are all that is
+          * needed to see which sample a voice resolved to. */
+         memcpy((void *)diag_ram_head, IAPU.RAM, sizeof diag_ram_head);
+         memcpy((void *)diag_dsp_snap, APU.DSP, 128);
+         __dmb();
+         diag_tripped = 1;
+         audio_cap_arm = 0;
+         return;
+      }
+   }
+   uint32_t i = diag_kon_wr % KON_RING;
+   diag_kon[i].frame = diag_kon_total;
+   diag_kon[i].ch = ch; diag_kon[i].srcn = srcn;
+   diag_kon[i].start = start; diag_kon[i].loop = loop;
+   for (int k = 0; k < 16; k++) diag_kon[i].brr[k] = brr[k];
+   diag_kon_wr = i + 1;
+   diag_kon_total++;
+}
+
+volatile uint32_t psram_crc_checks;
+volatile uint32_t psram_crc_errors;
+volatile uint32_t psram_crc_first;
+volatile uint32_t psram_crc_last;
 static volatile uint32_t audio_prod_seq = 0; // total chunks produced
 static volatile uint32_t audio_cons_seq = 0; // total chunks consumed
 
@@ -677,6 +919,14 @@ static inline void snes9x_init(void) {
     Settings.Mouse = have_mouse;
     Settings.MouseMaster = have_mouse;
     Settings.MousePort = (g_settings.mouse_port == MOUSE_PORT_1) ? 0 : 1;
+#ifdef FRANK_SNES_AUDIO_CAPTURE
+    /* Pin every sound-affecting setting so a device capture is directly
+     * comparable with a host render of the same ROM. */
+    Settings.DisableSoundEcho = false;
+    Settings.InterpolatedSound = true;
+    Settings.SoundEnvelopeHeightReading = false;
+    Settings.Mute = false;
+#endif
 
     S9xInitDisplay();
     S9xInitMemory();
@@ -879,6 +1129,7 @@ void __time_critical_func(render_core)(void) {
             underrun_count = 0;
         } else {
             total_underruns++;
+            audio_underruns++;
             was_underrun = true;
             // Underrun: ramp from last sample to zero (no buffer replay).
             if (underrun_count == 0) {
@@ -990,6 +1241,27 @@ void set_frameskip_level(uint8_t level) {
 #define LATE_RESYNC_US (TARGET_FRAME_US * 4)
 
 static bool __time_critical_func(emulation_loop)(void) {  /* returns true if user wants ROM selector */
+#ifdef FRANK_SNES_AUDIO_CAPTURE
+    /* ~12 s of 32040 Hz stereo. */
+    audio_cap_max = 900;    /* 15 s of final packed stereo output */
+    audio_cap_buf = (volatile uint32_t *)
+        psram_malloc(audio_cap_max * AUDIO_BUFFER_LENGTH * sizeof(uint32_t));
+    audio_cap_len = 0;
+    audio_cap_wr  = 0;
+    /* audio_cap_start is set over SWD before emulation starts */
+    audio_cap_arm = audio_cap_buf ? 1 : 0;
+    diag_apuram_snap = (volatile uint8_t *)psram_malloc(0x10000);
+    diag_konlog = (volatile konlog_rec_t *)
+        psram_malloc(KONLOG_MAX * sizeof(konlog_rec_t));
+    diag_statecrc = (volatile uint32_t *)psram_malloc(1800 * 8 * sizeof(uint32_t));
+    diag_konlog_n = 0; diag_emu_frame = 0;
+    LOG("[cap] konlog=%p\n", (void *)diag_konlog);
+    diag_tripped = 0; diag_silent_run = 0; diag_kon_wr = 0; diag_kon_total = 0;
+    LOG("[cap] apuram snapshot=%p\n", (void *)diag_apuram_snap);
+    LOG("[cap] buffer=%p chunks=%u\n", (void *)audio_cap_buf,
+        (unsigned)audio_cap_max);
+#endif
+
     LOG("Starting emulation loop...\n");
     LOG("[build] %s %s | TARGET_FRAME_US=%u FRAMESKIP_LEVEL=%u LATE_RESYNC_US=%u\n",
         __DATE__, __TIME__,
@@ -1018,6 +1290,13 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 
     // Initialize frameskip from settings (runtime overrides compile-time default)
     set_frameskip_level(g_settings.frameskip);
+#ifdef FRANK_SNES_FORCE_FRAMESKIP
+    /* Test override: the emulator's own frameskip setting decides how
+     * many frames are rendered, but emulation still has to run every
+     * frame. When the CPU cannot sustain 60 fps of emulation, rendering
+     * fewer frames is the cheapest time back. */
+    set_frameskip_level(FRANK_SNES_FORCE_FRAMESKIP);
+#endif
     static const char* frameskip_level_names[] = {"NONE (60fps)", "LOW (50fps)", "MEDIUM (30fps)", "HIGH (20fps)", "EXTREME (20fps)"};
     LOG("[frameskip] level=%d (%s) pattern_len=%u mask=0x%02X\n",
         g_settings.frameskip, frameskip_level_names[g_settings.frameskip],
@@ -1070,8 +1349,21 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         static int32_t emu_overrun_us = 0;
         if (render_this_frame && emu_overrun_us > 0) {
             render_this_frame = false;
-            emu_overrun_us -= (int32_t)TARGET_FRAME_US;  // recover one frame worth
+            /* Credit only what skipping a render actually saves. Crediting a
+             * whole frame here assumed rendering costs the entire budget,
+             * so the loop stopped skipping while still behind and never
+             * recovered — emulation stayed below 60 fps and the audio
+             * pipeline starved. */
+            emu_overrun_us -= (int32_t)g_render_cost_us;
+            if (emu_overrun_us < 0) emu_overrun_us = 0;
         }
+
+        /* Video yields to audio. The ring draining means emulation is behind
+         * real time; dropping a video frame is the only way to catch up that
+         * does not touch emulator state. Audio must never be the thing that
+         * gives way — a dropped frame is invisible, a starved chunk is not. */
+        if (render_this_frame && q_fill <= (AUDIO_QUEUE_DEPTH / 4))
+            render_this_frame = false;
 
         // Safety: always render at least once every FRAMESKIP_MAX_CONSECUTIVE frames
         if (consecutive_skipped_frames >= FRAMESKIP_MAX_CONSECUTIVE) {
@@ -1225,6 +1517,14 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         /* Feed dynamic frameskip: if this frame exceeded the budget, accumulate overrun */
         {
             uint32_t this_emu_us = _diag_t1 - _diag_t0;
+            /* Rolling estimate of what rendering adds to a frame, used above
+             * to credit skips honestly. */
+            if (!skip_render) {
+                if (this_emu_us > g_emu_only_us)
+                    g_render_cost_us = this_emu_us - g_emu_only_us;
+            } else {
+                g_emu_only_us = this_emu_us;
+            }
             if (this_emu_us > TARGET_FRAME_US) {
                 emu_overrun_us += (int32_t)(this_emu_us - TARGET_FRAME_US);
             } else {
@@ -1237,118 +1537,201 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         (void)_diag_t0;
         (void)_diag_t1;
 
+#ifdef FRANK_SNES_PSRAM_CHECK
+        if ((frame_num % 60u) == 0u && Memory.ROM && Memory.CalculatedSize) {
+            const uint8_t *p = Memory.ROM;
+            uint32_t n = Memory.CalculatedSize;
+            uint32_t h = 2166136261u;          /* FNV-1a, cheap enough */
+            for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+            psram_crc_last = h;
+            if (psram_crc_checks == 0) psram_crc_first = h;
+            else if (h != psram_crc_first) psram_crc_errors++;
+            psram_crc_checks++;
+        }
+#endif
+
+#ifdef C2_SOUND_LINK
+        // C2: the mixer lives on the sound slave.  Ship this frame's DSP
+        // writes and dirty APU RAM and collect the samples it produced,
+        // so the S9xMixSamples* calls below have something to hand out.
+        // Must come after the emulated frame and before the first mix.
+        s9x_link_frame();
+#endif
+
         // Mix audio on Core 0 (always, even when skipping render), then apply
         // gain/limiting and pack to 32-bit stereo frames.
         static int16_t __attribute__((aligned(32))) mix16[AUDIO_BUFFER_LENGTH * 2];
     #ifdef FRANK_SNES_PROFILE
         uint32_t t2 = time_us_32();
     #endif
+#ifdef C2_SOUND_LINK
+        /* Mixing and then discarding costs real audio: the drain advances
+         * the resampler, so a discarded chunk is a hole in the waveform
+         * and therefore a click. Check first and skip the mix instead. */
+        if ((audio_prod_seq - audio_cons_seq) < AUDIO_QUEUE_DEPTH)
+#endif
+        {
     #ifdef FRANK_SNES_FAST_MODE
         // FAST MODE: Mix mono only (half the samples), then duplicate to stereo in packing
         S9xMixSamplesMono((void *)mix16, AUDIO_BUFFER_LENGTH);
     #else
         S9xMixSamples((void *)mix16, AUDIO_BUFFER_LENGTH * 2);
     #endif
+#ifdef FRANK_SNES_AUDIO_CAPTURE
+        /* Emulator-state fingerprint per frame, so divergence from a host
+         * render can be located exactly instead of inferred from audio
+         * (which matches trivially while everything is silent). */
+        if (diag_statecrc && diag_emu_frame < 1800) {
+            uint32_t h = 2166136261u;
+            const uint8_t *r = IAPU.RAM;
+            for (uint32_t i = 0; i < 0x10000; i++) { h ^= r[i]; h *= 16777619u; }
+            uint32_t w = 2166136261u;
+            const uint8_t *wr = Memory.RAM;
+            for (uint32_t i = 0; i < 0x20000; i++) { w ^= wr[i]; w *= 16777619u; }
+            volatile uint32_t *o = &diag_statecrc[diag_emu_frame * 8];
+            o[0] = h;
+            o[1] = w;
+            o[2] = ICPU.Registers.PC | ((uint32_t)ICPU.Registers.A.W << 16);
+            o[3] = ICPU.Registers.X.W | ((uint32_t)ICPU.Registers.Y.W << 16);
+            o[4] = ICPU.Registers.S.W | ((uint32_t)ICPU.Registers.D.W << 16);
+            o[5] = ICPU.Registers.PB | ((uint32_t)ICPU.Registers.DB << 8) |
+                   ((uint32_t)(ICPU.Registers.P.W & 0xff) << 16) |
+                   ((uint32_t)(CPU.Flags & 0xff) << 24);
+            o[1] = (uint32_t)CPU.IRQActive | ((uint32_t)CPU.NMIActive << 8) |
+                   ((uint32_t)CPU.WaitingForInterrupt << 16) |
+                   ((uint32_t)IPPU.HDMA << 24);
+            o[6] = ((uint32_t)CPU.V_Counter & 0xffff) |
+                   ((uint32_t)CPU.FastROMSpeed << 16) |
+                   ((uint32_t)Memory.FillRAM[0x420d] << 24);
+            o[7] = (uint32_t)CPU.Cycles;
+            if (diag_emu_frame == 41 && diag_apuram_snap)
+                memcpy((void *)diag_apuram_snap, Memory.MapInfo,
+                       MEMMAP_NUM_BLOCKS * sizeof(SMapInfo));
+        }
+        diag_emu_frame++;
+        /* Raw mixer output, one chunk per emulated frame, before gain and
+         * before the FIFO. This is the sound engine on its own, in a form
+         * directly comparable with a host render of the same ROM. */
+        /* Window start is settable over SWD before emulation begins, so the
+         * whole 5 minutes can be covered in successive deterministic runs
+         * without rebuilding. */
+
+#endif
+#ifndef C2_SOUND_LINK
+        /* Exactly one mix per emulated frame, straight into the FIFO. The
+         * chunks handed to the ring are resampled out of it below. */
+        sfifo_push(mix16, AUDIO_BUFFER_LENGTH);
+#endif
+        }
     #ifdef FRANK_SNES_PROFILE
         uint32_t t3 = time_us_32();
     #endif
 
-        uint32_t prod = audio_prod_seq;
-        uint32_t cons = audio_cons_seq;
-        bool ring_full = (prod - cons) >= AUDIO_QUEUE_DEPTH;
-        uint32_t *dst32 = ring_full ? audio_packed_discard : audio_packed_buffer[prod % AUDIO_QUEUE_DEPTH];
-
         // Mixer attenuates by >>11 (÷2048) to prevent hard clipping.
         // Boost with soft limiter to restore volume, scaled by volume setting.
-        // At volume=100: gain = 400/100 = 4x (full). At volume=50: 2x. At volume=10: 0.4x.
         const int gain_num = g_settings.volume * 4;
         const int gain_den = 100;
         const bool use_soft_limiter = true;
-#ifdef FRANK_SNES_PROFILE
-        uint32_t t4 = time_us_32();
-#endif
-        // Use optimized audio packing
-#ifdef FRANK_SNES_FAST_MODE
-        // FAST MODE: Pack mono to stereo (duplicate each sample)
-        audio_pack_mono_to_stereo(dst32, mix16, AUDIO_BUFFER_LENGTH, gain_num, gain_den, use_soft_limiter);
-#else
-        audio_pack_opt(dst32, mix16, AUDIO_BUFFER_LENGTH, gain_num, gain_den, use_soft_limiter);
-#endif
-#ifdef FRANK_SNES_PROFILE
-        uint32_t t5 = time_us_32();
-#endif
 
-        if (!ring_full) {
-            // Publish the new chunk after the samples are fully written.
+#ifndef C2_SOUND_LINK
+        /* Rate matching.
+         *
+         * Emulation produces AUDIO_BUFFER_LENGTH samples per frame; the DAC
+         * consumes at its own crystal-derived rate, which is never exactly
+         * 60 chunks per second. The two must be reconciled without ever
+         * creating audio (mixing ahead of emulated time corrupts the DSP and
+         * duplicates samples) or destroying it (discarding a mixed chunk
+         * punches a hole in the waveform).
+         *
+         * So the FIFO is drained by a resampler whose ratio is servoed on
+         * ring depth — the one signal that reflects the DAC's true rate.
+         * Ring filling means the DAC is slower than we assumed, so each
+         * output chunk consumes slightly more input; ring draining means the
+         * opposite. Audio is neither created nor destroyed, only stretched
+         * by a fraction of a percent, which is inaudible.
+         */
+        for (;;) {
+            uint32_t prod = audio_prod_seq;
+            uint32_t cons = audio_cons_seq;
+            uint32_t depth = prod - cons;
+            if (depth >= AUDIO_QUEUE_DEPTH)
+                break;                       /* ring full: leave it in the FIFO */
+
+            int32_t err = (int32_t)depth - (int32_t)(AUDIO_QUEUE_DEPTH / 2);
+            /* Proportional gain. Too low and the loop can only reach full
+             * stretch once the ring is already empty, so it starves on frame
+             * jitter; this holds the ring near 3 chunks even when emulation
+             * runs 8% slow. */
+            int32_t ratio = (1 << 16) + (err * (1 << 16)) /
+                            (int32_t)AUDIO_QUEUE_DEPTH;
+            /* Authority has to cover the whole rate range the pipeline can
+             * see: DAC crystal error (well under 1%) plus emulation running
+             * below 60 fps under load. At 53 fps the producer is 12% short,
+             * so the stretch limit is set there — beyond that the audio
+             * would starve and click instead. */
+            if (ratio < 57700) ratio = 57700;   /* 0.880x */
+            if (ratio > 74000) ratio = 74000;   /* 1.129x */
+
+            uint32_t need = ((AUDIO_BUFFER_LENGTH * (uint32_t)ratio) >> 16) + 2;
+            if (sfifo_fill < need)
+                break;                       /* not a chunk's worth yet */
+
+            sfifo_pull(mix16, AUDIO_BUFFER_LENGTH, ratio);
+            uint32_t *dst32 = audio_packed_buffer[prod % AUDIO_QUEUE_DEPTH];
+#ifdef FRANK_SNES_FAST_MODE
+            audio_pack_mono_to_stereo(dst32, mix16, AUDIO_BUFFER_LENGTH,
+                                      gain_num, gain_den, use_soft_limiter);
+#else
+            audio_pack_opt(dst32, mix16, AUDIO_BUFFER_LENGTH,
+                           gain_num, gain_den, use_soft_limiter);
+#endif
+#ifdef FRANK_SNES_AUDIO_CAPTURE
+            /* FINAL output: post gain, post soft-limiter, post resampler —
+             * exactly the stereo frames handed to I2S. */
+            if (audio_cap_arm && audio_cap_buf && diag_emu_frame >= audio_cap_start &&
+                audio_cap_len < audio_cap_max) {
+                memcpy((void *)&audio_cap_buf[audio_cap_len * AUDIO_BUFFER_LENGTH],
+                       dst32, AUDIO_BUFFER_LENGTH * sizeof(uint32_t));
+                if (++audio_cap_len >= audio_cap_max) audio_cap_arm = 0;
+            }
+#endif
             __dmb();
             audio_prod_seq = prod + 1;
             __dmb();
-
 #ifdef FRANK_SNES_HDMI_ALT
-            // HDMI_ALT path: forward packed stereo (L<<16|R per uint32)
-            // straight into the HDMI audio data-island ring on Core 1.
-            // Drops samples silently if the ring is full — emulation
-            // must not block on audio.  There is no I2S consumer to
-            // drain audio_packed_buffer, so we also advance the
-            // consumer cursor here; otherwise the SRAM ring fills up
-            // permanently and Core 0 stops producing.
             hdmi_alt_audio_write((const int16_t *)dst32, AUDIO_BUFFER_LENGTH);
             __dmb();
             audio_cons_seq = prod + 1;
             __dmb();
 #endif
         }
-
-        // Wall-clock audio catch-up: produce extra chunks so I2S never starves.
-        // Accumulate real elapsed time; each TARGET_FRAME_US owes one chunk.
-        // The normal mix above already covered one chunk worth of time.
-        #define AUDIO_CATCHUP_MAX 6  // cap burst after long stall
-        {
-            uint32_t now_ac = time_us_32();
-            audio_acc_us += (now_ac - audio_last_us);
-            audio_last_us = now_ac;
-
-            // The normal mix covered one chunk's worth of time
-            if (audio_acc_us >= TARGET_FRAME_US)
-                audio_acc_us -= TARGET_FRAME_US;
-            else
-                audio_acc_us = 0;
-
-            // Soft-cap: after a very long stall (loading, pause) don't burst
-            // dozens of chunks — just refill a modest amount.
-            if (audio_acc_us > TARGET_FRAME_US * AUDIO_CATCHUP_MAX)
-                audio_acc_us = TARGET_FRAME_US * 2;
-
-            // Produce extra chunks for the remaining accumulated time
-            uint32_t extra = 0;
-            while (audio_acc_us >= TARGET_FRAME_US && extra < AUDIO_CATCHUP_MAX) {
-                uint32_t p2 = audio_prod_seq;
-                if ((p2 - audio_cons_seq) >= AUDIO_QUEUE_DEPTH)
-                    break;
+#else   /* C2_SOUND_LINK keeps its own resampler in sound_backend_link.c */
+        uint32_t prod = audio_prod_seq;
+        uint32_t cons = audio_cons_seq;
+        bool ring_full = (prod - cons) >= AUDIO_QUEUE_DEPTH;
+        uint32_t *dst32 = ring_full ? audio_packed_discard
+                                    : audio_packed_buffer[prod % AUDIO_QUEUE_DEPTH];
 #ifdef FRANK_SNES_FAST_MODE
-                S9xMixSamplesMono((void *)mix16, AUDIO_BUFFER_LENGTH);
+        audio_pack_mono_to_stereo(dst32, mix16, AUDIO_BUFFER_LENGTH,
+                                  gain_num, gain_den, use_soft_limiter);
 #else
-                S9xMixSamples((void *)mix16, AUDIO_BUFFER_LENGTH * 2);
+        audio_pack_opt(dst32, mix16, AUDIO_BUFFER_LENGTH,
+                       gain_num, gain_den, use_soft_limiter);
 #endif
-                uint32_t *edst = audio_packed_buffer[p2 % AUDIO_QUEUE_DEPTH];
-#ifdef FRANK_SNES_FAST_MODE
-                audio_pack_mono_to_stereo(edst, mix16, AUDIO_BUFFER_LENGTH, gain_num, gain_den, use_soft_limiter);
-#else
-                audio_pack_opt(edst, mix16, AUDIO_BUFFER_LENGTH, gain_num, gain_den, use_soft_limiter);
-#endif
-                __dmb();
-                audio_prod_seq = p2 + 1;
-                __dmb();
+        if (ring_full) {
+            audio_discards++;
+        } else {
+            __dmb();
+            audio_prod_seq = prod + 1;
+            __dmb();
 #ifdef FRANK_SNES_HDMI_ALT
-                hdmi_alt_audio_write((const int16_t *)edst, AUDIO_BUFFER_LENGTH);
-                __dmb();
-                audio_cons_seq = p2 + 1;
-                __dmb();
+            hdmi_alt_audio_write((const int16_t *)dst32, AUDIO_BUFFER_LENGTH);
+            __dmb();
+            audio_cons_seq = prod + 1;
+            __dmb();
 #endif
-                audio_acc_us -= TARGET_FRAME_US;
-                extra++;
-            }
         }
+#endif  /* C2_SOUND_LINK */
 
         if (skip_render) {
             consecutive_skipped_frames++;
@@ -1685,10 +2068,15 @@ int main(void) {
     LOG("========================================\n");
     LOG("System Clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
     
-    // Initialize LED
+    // Initialize LED.  C2's LD1 is a WS2812B on GPIO46, not a plain
+    // level-driven LED, so the boot indicator is skipped there rather
+    // than spending a PIO state machine on it — the link already needs
+    // PIO2, and PIO0/PIO1 are HDMI and audio.
+#ifdef PICO_DEFAULT_LED_PIN
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, 1);
+#endif
     
     // Initialize PSRAM
     LOG("Initializing PSRAM...\n");
@@ -1794,9 +2182,15 @@ int main(void) {
 
     while (true) {
 #ifdef FRANK_SNES_AUTOBOOT
-        // Autoboot: skip welcome & selector, hardcode Doom path
-        snprintf(rom_path, sizeof(rom_path), "%s",
-                 "/SNES/Doom (USA).sfc");
+        // Autoboot: skip welcome & selector and load one ROM straight
+        // away.  AUTOBOOT_PATH overrides the default, which is what
+        // makes this usable on a board being driven over SWD with no
+        // keyboard attached:
+        //   ./build.sh C2  with -DAUTOBOOT_PATH="/snes/Some Game.sfc"
+#ifndef AUTOBOOT_PATH
+#define AUTOBOOT_PATH "/SNES/Doom (USA).sfc"
+#endif
+        snprintf(rom_path, sizeof(rom_path), "%s", AUTOBOOT_PATH);
         LOG("AUTOBOOT: %s\n", rom_path);
 #else
         // Show ROM selector (sets up its own palette and buffer management)
@@ -1863,7 +2257,9 @@ int main(void) {
             if (j == 0) strncpy(g_rom_name, "unknown", sizeof(g_rom_name));
         }
 
+#ifdef PICO_DEFAULT_LED_PIN
         gpio_put(PICO_DEFAULT_LED_PIN, 0);  // LED off = running
+#endif
 
         // Enable CRT effect if configured
         graphics_set_crt_active(g_settings.crt_effect);

@@ -16,12 +16,25 @@ Based on [Snes9x](https://github.com/snes9xgit/snes9x) / [snes9x2010](https://gi
 
 ## Supported Boards
 
-This firmware supports two board layouts (**M1** and **M2**) on RP2350-based boards with integrated HDMI, SD card, and PSRAM:
+This firmware supports three board layouts (**M1**, **M2** and **C2**) on RP2350-based boards with integrated HDMI, SD card, and PSRAM:
 
 - **[FRANK](https://rh1.tech/projects/frank?area=about)** — RP Pico 2 development board with HDMI and additional I/O
 - **[Murmulator](https://murmulator.ru)** — RP Pico 2 board with HDMI, SD card, and PSRAM
+- **FRANK Core 2 (C2)** — dual-RP2350 board: an RP2350B running the emulator and an RP2350A running the sound DSP
 
-Both boards have the required peripherals built in — no additional wiring needed.
+These boards have the required peripherals built in — no additional wiring needed.
+
+### FRANK Core 2 (C2)
+
+C2 carries two chips. The master (U3, RP2350B) runs the 65816, the PPU,
+video and the SPC700; the slave (U6, RP2350A) runs the S-DSP and the
+mixer, fed by the master over an 8-bit parallel link. It ships as **two
+firmware images and both must be flashed**.
+
+C2 has no NES pad header and no PS/2 header — those GPIOs are the link —
+so USB HID is the only input path.
+
+See [docs/C2_SOUND_SPLIT.md](docs/C2_SOUND_SPLIT.md) for the design.
 
 ## Features
 
@@ -277,10 +290,15 @@ Settings are saved to `snes/settings.ini` and persist across reboots.
 ```bash
 git clone https://github.com/rh1tech/frank-snes.git
 cd frank-snes
-./build.sh M2    # or M1 for M1 layout
+./build.sh M2    # or M1 for M1 layout, C2 for FRANK Core 2
 ```
 
 Output: `build/frank-snes.uf2`
+
+On C2 this also builds the sound slave into
+`slave/build/frank-snes-slave.uf2`. Both halves are built together
+because they share the wire protocol, and the master refuses to run
+against a slave whose protocol version or system clock disagrees.
 
 ### Release Build
 
@@ -288,13 +306,19 @@ Output: `build/frank-snes.uf2`
 ./release.sh
 ```
 
-Builds both M1 and M2 variants with USB HID enabled. Output files in `release/`:
+Builds all three variants with USB HID enabled. Output files in `release/`:
 - `frank-snes_m1_A_BB.uf2`
 - `frank-snes_m2_A_BB.uf2`
+- `frank-snes_c2_A_BB.uf2` — C2 master
+- `frank-snes_c2-slave_A_BB.uf2` — C2 sound slave
 
 ### Flashing
 
 Hold BOOTSEL and plug in the Pico 2 via USB, then copy the `.uf2` file to the mounted drive. Or use picotool:
+
+On C2 each chip has its own USB-C port and its own BOOTSEL button, so
+flash them one at a time — `./flash.sh --both` walks through it, or
+`./flash.sh --slave` for just the sound half.
 
 ```bash
 picotool load build/frank-snes.uf2

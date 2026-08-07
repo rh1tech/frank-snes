@@ -121,6 +121,22 @@ static void S9xAPUSetByte(uint8_t byte, uint32_t Address)
          if (!APU.ShowROM)
             IAPU.RAM [Address] = byte;
       }
+#ifdef C2_SOUND_LINK
+      /* The only path by which the SPC700 program can change APU RAM
+       * outside the zero page, the stack and the register file — which
+       * is to say, the only path that can move BRR sample data. Those
+       * three are re-sent every frame regardless, so this single mark
+       * is what the slave's copy depends on. */
+      s9x_apu_ram_dirty(Address);
+#endif
+#ifdef FRANK_SNES_AUDIO_CAPTURE
+      {
+         extern void s9x_diag_dirw(unsigned, uint8_t);
+         unsigned base = (unsigned)APU.DSP[APU_DIR] << 8;
+         if (Address >= base && Address < base + 0x40)
+            s9x_diag_dirw(Address - base, byte);
+      }
+#endif
    }
 }
 
