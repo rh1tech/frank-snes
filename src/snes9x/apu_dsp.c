@@ -66,12 +66,34 @@ static bool     ready;
  * here is the drain, and that does not coincide with V_Counter
  * wrapping.
  */
-#define APU_DSP_LINES 262
-
+/* Scanlines per frame is a region property, and so is how much audio a
+ * frame contains. Hardcoding the NTSC pair clamped every DSP write in
+ * scanlines 262..311 of a PAL frame onto one instant — and that band is
+ * most of PAL V-blank, which is exactly where a sound driver does its
+ * work. The link path already derives both; this one did not. */
 static uint32_t dsp_span;
 static uint32_t dsp_clocks_per_frame;
 static uint32_t dsp_clocks_done;
 static uint32_t dsp_pos_last;
+static uint32_t dsp_rate = 32040u;
+static bool     dsp_geom_pal;
+static bool     dsp_geom_valid;
+
+/* The ROM's region is not known when S9xSetPlaybackRate() first runs —
+ * snes9x_init() precedes LoadROM() — so the geometry is recomputed
+ * whenever Settings.PAL disagrees with what it was built from. */
+static void apu_dsp_geometry(void)
+{
+   if (dsp_geom_valid && dsp_geom_pal == (Settings.PAL != 0))
+      return;
+   dsp_geom_pal   = (Settings.PAL != 0);
+   dsp_geom_valid = true;
+   dsp_span = (uint32_t)(dsp_geom_pal ? SNES_MAX_PAL_VCOUNTER
+                                      : SNES_MAX_NTSC_VCOUNTER)
+            * (uint32_t)Settings.H_Max;
+   dsp_clocks_per_frame = (dsp_rate / (dsp_geom_pal ? 50u : 60u))
+                        * SPC_DSP_CLOCKS_PER_SAMPLE;
+}
 
 static void apu_dsp_finish_frame(void);
 
@@ -79,7 +101,7 @@ static INLINE uint32_t apu_dsp_now(void)
 {
    uint32_t pos = (uint32_t)CPU.V_Counter * (uint32_t)Settings.H_Max
                 + (uint32_t)CPU.Cycles;
-   if (!dsp_span) dsp_span = APU_DSP_LINES * (uint32_t)Settings.H_Max;
+   apu_dsp_geometry();
    if (pos > dsp_span)     pos = dsp_span;
    if (pos < dsp_pos_last) pos = dsp_pos_last;
    dsp_pos_last = pos;
@@ -116,11 +138,14 @@ static void rearm(void)
       /* Ran the buffer dry-side full: restart. Losing a fragment is
        * better than writing past the end. */
       out_head = 0;
-   #ifdef SPC700_ACCURATE
-   S9xAPUResetOutputCount();
-#endif
-   #ifdef SPC700_ACCURATE
-   S9xAPUSetOutput(out_buf, APU_OUT_PAIRS * 2);
+#ifdef SPC700_ACCURATE
+      S9xAPUResetOutputCount();
+      S9xAPUSetOutput(out_buf, APU_OUT_PAIRS * 2);
+#else
+      /* Same job for the original SPC700's DSP. Rewinding out_head
+       * without rewinding the DSP's write pointer leaves it writing on
+       * past the end of out_buf. */
+      spc_dsp_set_output(out_buf, APU_OUT_PAIRS * 2);
 #endif
    }
 }
@@ -132,9 +157,22 @@ bool S9xInitSound(int32_t buffer_ms, int32_t lag_ms)
    out_head = 0;
 #ifdef SPC700_ACCURATE
    S9xAPUResetOutputCount();
-#endif
-#ifdef SPC700_ACCURATE
    S9xAPUSetOutput(out_buf, APU_OUT_PAIRS * 2);
+#else
+   /*
+    * Nothing else in this configuration ever hands the DSP its RAM
+    * pointer or its output window: spc_dsp_init() is called only by the
+    * accurate SPC700, which is not compiled here, and by the slave.
+    * Without it dsp_m.ram stays NULL and the first BRR fetch reads
+    * NULL + the sample offset — a precise bus error at 0x8000 a couple
+    * of seconds after a ROM loads, which is why this build never ran.
+    */
+   spc_dsp_init(APU_DSP_RAM);
+   spc_dsp_reset();
+   spc_dsp_set_output(out_buf, APU_OUT_PAIRS * 2);
+   dsp_clocks_done = 0;
+   dsp_pos_last    = 0;
+   dsp_geom_valid  = false;
 #endif
    ready = true;
    return true;
@@ -147,9 +185,11 @@ void S9xResetSound(bool full)
    out_head = 0;
 #ifdef SPC700_ACCURATE
    S9xAPUResetOutputCount();
-#endif
-#ifdef SPC700_ACCURATE
    S9xAPUSetOutput(out_buf, APU_OUT_PAIRS * 2);
+#else
+   spc_dsp_set_output(out_buf, APU_OUT_PAIRS * 2);
+   dsp_clocks_done = 0;
+   dsp_pos_last    = 0;
 #endif
 }
 
@@ -168,10 +208,10 @@ void S9xSetPlaybackRate(uint32_t rate)
     * which is within a tenth of a percent. */
    if (!rate) rate = 32040u;
 #ifndef SPC700_ACCURATE
-   dsp_clocks_per_frame = (rate / 60u) * SPC_DSP_CLOCKS_PER_SAMPLE;
-   dsp_span             = APU_DSP_LINES * (uint32_t)Settings.H_Max;
-   dsp_clocks_done      = 0;
-   dsp_pos_last         = 0;
+   dsp_rate        = rate;
+   dsp_geom_valid  = false;      /* region may not be known yet */
+   dsp_clocks_done = 0;
+   dsp_pos_last    = 0;
 #endif
 }
 
