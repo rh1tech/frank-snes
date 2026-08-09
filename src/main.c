@@ -35,6 +35,24 @@
 #include "snes9x/cpuexec.h"
 #include "snes9x/srtc.h"
 
+/*
+ * APU RAM and the DSP register file, wherever the built sound core keeps
+ * them. The key-on and state-fingerprint diagnostics below are the same
+ * whichever SPC700 is compiled in — only the accessors differ — and
+ * naming IAPU/APU directly is what stopped SOUND_CORE=ACCURATE building
+ * at all, which is the one configuration worth comparing against the
+ * known-good 1.6x engine.
+ */
+#ifdef SPC700_ACCURATE
+#include "snes9x/spc700_blargg.h"
+#include "snes9x/spc_dsp.h"
+#define DIAG_APU_RAM   spc_apuram()
+#define DIAG_DSP_REGS  spc_dsp_regs()
+#else
+#define DIAG_APU_RAM   IAPU.RAM
+#define DIAG_DSP_REGS  APU.DSP
+#endif
+
 // APU on Core 1
 #include "snes9x/apu_core1.h"
 #ifdef C2_SOUND_LINK
@@ -87,6 +105,27 @@ extern void hdmi_alt_run_core1(void);
 // shift is well below audible.
 #define AUDIO_SAMPLE_RATE   (32040)
 #define AUDIO_BUFFER_LENGTH (AUDIO_SAMPLE_RATE / 60)
+
+/*
+ * How much audio ONE EMULATED FRAME is worth.
+ *
+ * AUDIO_BUFFER_LENGTH is a DAC chunk. The DAC's rate is fixed, so that
+ * number is fixed too. How much audio an emulated frame contains is not:
+ * a frame is 1/60 s on an NTSC machine and 1/50 s on a PAL one, so 534 or
+ * 641 samples. These are different quantities and only coincide on NTSC.
+ *
+ * Passing the NTSC figure to the mixer on a PAL ROM asks for five sixths
+ * of the frame and abandons the rest. It hid for so long because
+ * 60 x 534 is *exactly* the DAC rate: the pipeline stays perfectly
+ * balanced while doing it, so no underrun, discard or starvation counter
+ * ever moves. The loss is upstream of all of them. That silent 16.7% is
+ * what "some sounds are skipped" was, on every board, for every PAL ROM.
+ */
+#define AUDIO_FRAME_SAMPLES_NTSC (AUDIO_SAMPLE_RATE / 60)
+#define AUDIO_FRAME_SAMPLES_PAL  (AUDIO_SAMPLE_RATE / 50)
+#define AUDIO_FRAME_SAMPLES_MAX  AUDIO_FRAME_SAMPLES_PAL
+#define AUDIO_FRAME_SAMPLES      (Settings.PAL ? AUDIO_FRAME_SAMPLES_PAL \
+                                               : AUDIO_FRAME_SAMPLES_NTSC)
 
 //=============================================================================
 // Screen Buffers
@@ -160,7 +199,6 @@ static uint32_t g_emu_only_us   = 8000;   /* cost of a skipped-render frame */
 volatile uint32_t audio_discards;
 volatile uint32_t audio_underruns;
 
-#ifndef C2_SOUND_LINK
 /* --- Audio pacing -------------------------------------------------------
  *
  * Audio is produced at the rate emulation advances and consumed at a fixed
@@ -191,63 +229,19 @@ volatile uint32_t audio_underruns;
 #else
 #define SFIFO_CHUNKS 4
 #endif
-#define SFIFO_FRAMES (AUDIO_BUFFER_LENGTH * SFIFO_CHUNKS)
+#define SFIFO_FRAMES (AUDIO_FRAME_SAMPLES_MAX * SFIFO_CHUNKS)
 
-static int16_t  sfifo[SFIFO_FRAMES * AUDIO_CH];
-/* Both cursors stay wrapped inside the ring. A free-running q16 read cursor
- * only spans 65535 frames — two seconds at 32 kHz — before it wraps and
- * starts reading stale samples. */
-#define SFIFO_SPAN_Q16 ((uint32_t)SFIFO_FRAMES << 16)
-static uint32_t sfifo_rd;        /* read cursor, frames, q16 fixed point  */
-static uint32_t sfifo_wr;        /* write cursor, whole frames            */
-static uint32_t sfifo_fill;      /* frames available                      */
+/*
+ * The FIFO itself lives in a header so tests/audio_path_test.c compiles
+ * the *same text* the firmware does. It used to be inlined here and
+ * duplicated in the test, which meant the test could pass against code
+ * the device was not running — and it did: this copy still emitted zeros
+ * when the ring ran dry, which punches an audible hole rather than a
+ * click-free held sample.
+ */
+#include "audio_rate.h"
 
-static void sfifo_push(const int16_t *src, uint32_t frames)
-{
-    for (uint32_t i = 0; i < frames; i++) {
-        int16_t *d = &sfifo[sfifo_wr * AUDIO_CH];
-        for (uint32_t c = 0; c < AUDIO_CH; c++) d[c] = src[i * AUDIO_CH + c];
-        if (++sfifo_wr >= SFIFO_FRAMES) sfifo_wr = 0;
-        if (sfifo_fill < SFIFO_FRAMES) {
-            sfifo_fill++;
-        } else {                            /* overwrote the oldest frame */
-            sfifo_rd += 1u << 16;
-            if (sfifo_rd >= SFIFO_SPAN_Q16) sfifo_rd -= SFIFO_SPAN_Q16;
-            audio_discards++;               /* the only place audio is lost */
-        }
-    }
-}
-
-/* Pull one chunk, resampling at `ratio` (q16 input frames per output frame).
- * The caller derives the ratio from ring depth, which is the only signal
- * that reflects the DAC's true rate. */
-static void sfifo_pull(int16_t *dst, uint32_t frames, int32_t ratio)
-{
-
-    for (uint32_t i = 0; i < frames; i++) {
-        uint32_t whole = sfifo_rd >> 16;
-        if (sfifo_fill < 2) {              /* genuinely dry: hold, don't mix */
-            for (uint32_t c = 0; c < AUDIO_CH; c++) dst[i * AUDIO_CH + c] = 0;
-            continue;
-        }
-        uint32_t frac = sfifo_rd & 0xffff;
-        uint32_t nxt  = (whole + 1 >= SFIFO_FRAMES) ? 0 : whole + 1;
-        const int16_t *a = &sfifo[whole * AUDIO_CH];
-        const int16_t *b = &sfifo[nxt   * AUDIO_CH];
-        for (uint32_t c = 0; c < AUDIO_CH; c++)
-            dst[i * AUDIO_CH + c] =
-                (int16_t)(a[c] + (((int32_t)(b[c] - a[c]) * (int32_t)frac) >> 16));
-        sfifo_rd += ratio;
-        uint32_t consumed = (sfifo_rd >> 16) - whole;
-        if (sfifo_rd >= SFIFO_SPAN_Q16) {
-            sfifo_rd -= SFIFO_SPAN_Q16;
-            consumed = (sfifo_rd >> 16) + SFIFO_FRAMES - whole;
-        }
-        if (consumed)
-            sfifo_fill = (sfifo_fill > consumed) ? sfifo_fill - consumed : 0;
-    }
-}
-#endif /* !C2_SOUND_LINK */
+/* --- end audio pacing --- */
 
 /* PSRAM integrity check.
  *
@@ -363,8 +357,8 @@ void s9x_diag_kon(int ch, int srcn, unsigned start, unsigned loop,
           * the audio path starves Core 1's HDMI streaming long enough to
           * lock it up. The zero page and the directory are all that is
           * needed to see which sample a voice resolved to. */
-         memcpy((void *)diag_ram_head, IAPU.RAM, sizeof diag_ram_head);
-         memcpy((void *)diag_dsp_snap, APU.DSP, 128);
+         memcpy((void *)diag_ram_head, DIAG_APU_RAM, sizeof diag_ram_head);
+         memcpy((void *)diag_dsp_snap, DIAG_DSP_REGS, 128);
          __dmb();
          diag_tripped = 1;
          audio_cap_arm = 0;
@@ -1189,8 +1183,25 @@ void __time_critical_func(render_core)(void) {
 extern volatile bool g_palette_needs_update;
 extern void S9xFixColourBrightness(void);
 
-// Auto frame skip - target ~60fps (16.67ms per frame)
-#define TARGET_FRAME_US 16667
+/*
+ * Wall time for one emulated frame.
+ *
+ * A PAL machine's frame is 20 ms, not 16.67. Pacing every ROM at 60 Hz ran
+ * PAL games 20% fast, and — now that the mixer is asked for a whole
+ * emulated frame — would also overproduce audio by 20% against a
+ * fixed-rate DAC. Set from the ROM's region once it is known; the default
+ * covers the menu, before any ROM is loaded.
+ */
+static uint32_t g_target_frame_us = 16667;
+#define TARGET_FRAME_US g_target_frame_us
+
+void audio_set_region_pacing(bool pal)
+{
+    g_target_frame_us = pal ? 20000u : 16667u;
+    LOG("[pace] %s: %u us/frame, %u samples/frame\n",
+        pal ? "PAL" : "NTSC", (unsigned)g_target_frame_us,
+        (unsigned)(pal ? AUDIO_FRAME_SAMPLES_PAL : AUDIO_FRAME_SAMPLES_NTSC));
+}
 
 //=============================================================================
 // Constant Frameskip Configuration (from murmgenesis)
@@ -1560,22 +1571,18 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 
         // Mix audio on Core 0 (always, even when skipping render), then apply
         // gain/limiting and pack to 32-bit stereo frames.
-        static int16_t __attribute__((aligned(32))) mix16[AUDIO_BUFFER_LENGTH * 2];
+        static int16_t __attribute__((aligned(32)))
+            mix16[AUDIO_FRAME_SAMPLES_MAX * 2];
+        const uint32_t frame_samples = AUDIO_FRAME_SAMPLES;
     #ifdef FRANK_SNES_PROFILE
         uint32_t t2 = time_us_32();
     #endif
-#ifdef C2_SOUND_LINK
-        /* Mixing and then discarding costs real audio: the drain advances
-         * the resampler, so a discarded chunk is a hole in the waveform
-         * and therefore a click. Check first and skip the mix instead. */
-        if ((audio_prod_seq - audio_cons_seq) < AUDIO_QUEUE_DEPTH)
-#endif
         {
     #ifdef FRANK_SNES_FAST_MODE
         // FAST MODE: Mix mono only (half the samples), then duplicate to stereo in packing
-        S9xMixSamplesMono((void *)mix16, AUDIO_BUFFER_LENGTH);
+        S9xMixSamplesMono((void *)mix16, frame_samples);
     #else
-        S9xMixSamples((void *)mix16, AUDIO_BUFFER_LENGTH * 2);
+        S9xMixSamples((void *)mix16, frame_samples * 2);
     #endif
 #ifdef FRANK_SNES_AUDIO_CAPTURE
         /* Emulator-state fingerprint per frame, so divergence from a host
@@ -1583,7 +1590,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
          * (which matches trivially while everything is silent). */
         if (diag_statecrc && diag_emu_frame < 1800) {
             uint32_t h = 2166136261u;
-            const uint8_t *r = IAPU.RAM;
+            const uint8_t *r = DIAG_APU_RAM;
             for (uint32_t i = 0; i < 0x10000; i++) { h ^= r[i]; h *= 16777619u; }
             uint32_t w = 2166136261u;
             const uint8_t *wr = Memory.RAM;
@@ -1617,11 +1624,12 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
          * without rebuilding. */
 
 #endif
-#ifndef C2_SOUND_LINK
-        /* Exactly one mix per emulated frame, straight into the FIFO. The
-         * chunks handed to the ring are resampled out of it below. */
-        sfifo_push(mix16, AUDIO_BUFFER_LENGTH);
-#endif
+        /* Exactly one mix per emulated frame, straight into the FIFO.
+         * The whole frame goes in — 534 samples on NTSC, 641 on PAL — and
+         * the fixed-size chunks the DAC wants are resampled out of it
+         * below. Pushing a fixed 534 here is what threw away a sixth of
+         * every PAL frame. */
+        sfifo_push(mix16, frame_samples);
         }
     #ifdef FRANK_SNES_PROFILE
         uint32_t t3 = time_us_32();
@@ -1633,10 +1641,10 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         const int gain_den = 100;
         const bool use_soft_limiter = true;
 
-#ifndef C2_SOUND_LINK
         /* Rate matching.
          *
-         * Emulation produces AUDIO_BUFFER_LENGTH samples per frame; the DAC
+         * Emulation produces one emulated frame of audio — AUDIO_FRAME_SAMPLES,
+         * which is region-dependent — and the DAC
          * consumes at its own crystal-derived rate, which is never exactly
          * 60 chunks per second. The two must be reconciled without ever
          * creating audio (mixing ahead of emulated time corrupts the DSP and
@@ -1705,33 +1713,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             __dmb();
 #endif
         }
-#else   /* C2_SOUND_LINK keeps its own resampler in sound_backend_link.c */
-        uint32_t prod = audio_prod_seq;
-        uint32_t cons = audio_cons_seq;
-        bool ring_full = (prod - cons) >= AUDIO_QUEUE_DEPTH;
-        uint32_t *dst32 = ring_full ? audio_packed_discard
-                                    : audio_packed_buffer[prod % AUDIO_QUEUE_DEPTH];
-#ifdef FRANK_SNES_FAST_MODE
-        audio_pack_mono_to_stereo(dst32, mix16, AUDIO_BUFFER_LENGTH,
-                                  gain_num, gain_den, use_soft_limiter);
-#else
-        audio_pack_opt(dst32, mix16, AUDIO_BUFFER_LENGTH,
-                       gain_num, gain_den, use_soft_limiter);
-#endif
-        if (ring_full) {
-            audio_discards++;
-        } else {
-            __dmb();
-            audio_prod_seq = prod + 1;
-            __dmb();
-#ifdef FRANK_SNES_HDMI_ALT
-            hdmi_alt_audio_write((const int16_t *)dst32, AUDIO_BUFFER_LENGTH);
-            __dmb();
-            audio_cons_seq = prod + 1;
-            __dmb();
-#endif
-        }
-#endif  /* C2_SOUND_LINK */
+
 
         if (skip_render) {
             consecutive_skipped_frames++;
@@ -2238,6 +2220,12 @@ int main(void) {
 
         LOG("ROM loaded successfully!\n");
         LOG("ROM Name: %s\n", Memory.ROMName);
+
+        /* memmap.c has just derived Settings.PAL from the ROM's region
+         * byte. Everything downstream that is "per frame" — the frame
+         * deadline and the number of samples the mixer is asked for —
+         * depends on it, so pick it up here rather than assuming 60 Hz. */
+        audio_set_region_pacing(Settings.PAL);
         LOG("ROM Size: %lu KB\n", (unsigned long)(Memory.CalculatedSize / 1024));
 
         /* Set g_rom_name for save state file paths */
