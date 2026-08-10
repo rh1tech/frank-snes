@@ -1431,7 +1431,20 @@ void S9xPlaySample(int32_t channel)
             e->frame = soundux_frame;
             e->start = (uint16_t)ch->block_pointer;
             e->ch    = (uint8_t)channel;
-            e->srcn  = (uint8_t)ch->sample_number;
+            /* SRCN always equals the voice index in this game, so the byte
+             * is better spent on voice pressure: which voices are not
+             * SILENT at the instant of this key-on. If the driver is
+             * hammering two voices while the rest never free up, it is
+             * starved — and a starved driver drops sounds rather than
+             * playing them, which is what "too many samples together"
+             * looks like from the outside. */
+            {
+               uint8_t act = 0;
+               for (int q = 0; q < 8; q++)
+                  if (SoundData.channels[q].state != SOUND_SILENT)
+                     act |= (uint8_t)(1u << q);
+               e->srcn = act;
+            }
             konlog_w = w + 1;
          }
 #endif
