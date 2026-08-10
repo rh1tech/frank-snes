@@ -77,6 +77,83 @@ volatile uint32_t kon_total, kon_same_sample;
  * where the directory no longer holds what it held at key-on.
  */
 volatile uint32_t loop_dir_checked, loop_dir_stale;
+
+/*
+ * Duplicate key-on guard.
+ *
+ * The driver sometimes keys the same sample on the same voice again within
+ * a frame or two — far faster than any note — and it is heard as a repeat.
+ * This drops such a key-on and lets the sound already playing continue.
+ *
+ * It is a workaround, not a fix: the emulator is diverging from hardware
+ * here, and suppressing a key-on that was genuinely wanted turns a repeat
+ * into a missing sound. The window is therefore deliberately narrow.
+ * Measured spacing in MK3: legitimate rhythm re-keys at 5-7 frames, the
+ * suspect ones at 2 against medians of 52 and 184.
+ *
+ * kon_suppressed says how often it fires. If that number is large, the
+ * window is wrong and this is doing harm.
+ */
+#ifndef KON_DEDUP_FRAMES
+#define KON_DEDUP_FRAMES 3
+#endif
+static uint16_t kon_last_start[8];
+static uint32_t kon_last_frame[8];
+static uint8_t  kon_seen;
+/*
+ * How many times a voice takes the BRR loop path between key-on and going
+ * silent. A one-shot sample should be 0. Anything above that is the sample
+ * being played again from its loop point — which is what "the same sound
+ * twice" is, without any duplicate key-on. 1775 loop points against ~886
+ * key-ons in one run says this is happening a lot.
+ */
+/*
+ * Does the BRR data under a voice change between key-on and the moment the
+ * mixer actually decodes it?
+ *
+ * DecodeBlock() is deferred through ch->needs_decode and runs at mix time —
+ * the end of the frame — while the key-on happened somewhere inside it. MK3
+ * streams sample data through the APU ports and reuses buffers, so a buffer
+ * can be rewritten in between. The voice then plays whatever landed there
+ * instead of what was keyed: the intended word goes missing and the new one
+ * is heard an extra time.
+ */
+volatile uint32_t brr_checked, brr_CHANGED;
+/*
+ * Where a looping voice loops back to.
+ *
+ * A musical sustain loops to a point inside the sample; the repeat is a few
+ * milliseconds and inaudible. A voice whose loop address equals its START
+ * address replays the entire sample — that is hearing the same sound again.
+ * kon_loop_full counts key-ons set up that way; loop_full_taken counts the
+ * replays actually performed.
+ */
+volatile uint32_t kon_loop_full, loop_full_taken;
+/*
+ * Full replays split by how much audio gets replayed.
+ *
+ * BRR is 9 bytes per 16 samples, so at 32 kHz a block is ~0.5 ms. A
+ * sustained instrument loops over tens of bytes and is inaudible. Replaying
+ * kilobytes is replaying a word or an effect — the audible repeat.
+ *   short: < 512 bytes   (~28 ms)
+ *   long : >= 512 bytes
+ *   huge : >= 4096 bytes (~230 ms — speech)
+ */
+volatile uint32_t replay_short, replay_long, replay_huge, replay_max_span;
+static uint16_t kon_start_addr[8];
+static uint32_t kon_brr_hash[8];
+
+static uint32_t brr_hash_at(uint16_t at)
+{
+   uint32_t h = 2166136261u;
+   for (int i = 0; i < 9; i++) { h ^= IAPU.RAM[(at + i) & 0xffff]; h *= 16777619u; }
+   return h;
+}
+
+volatile uint32_t loops_per_kon[8];   /* histogram, index = loops, 7 = 7+ */
+static uint8_t loop_count[8];
+volatile uint32_t kon_suppressed;
+volatile uint32_t kon_dedup_frames = KON_DEDUP_FRAMES;
 static uint16_t kon_loop_addr[8];
 static uint8_t  kon_loop_valid;
 /* A music driver legitimately re-keys the same instrument on the same voice
@@ -651,6 +728,11 @@ static INLINE void MixStereoSegment(int32_t buf_offset, int32_t sample_count)
 
       if (ch->needs_decode)
       {
+         if (J < 8) {
+            brr_checked++;
+            if (kon_brr_hash[J] != brr_hash_at((uint16_t)ch->block_pointer))
+               brr_CHANGED++;
+         }
          DecodeBlock(ch);
          ch->needs_decode = false;
          ch->sample = ch->block[0];
@@ -852,10 +934,20 @@ static INLINE void MixStereoSegment(int32_t buf_offset, int32_t sample_count)
                      {
                         uint8_t *dir;
 
+                        uint16_t end_at = (uint16_t)ch->block_pointer;
                         S9xAPUSetEndX(J);
                         ch->last_block = false;
                         dir = S9xGetSampleAddress(ch->sample_number);
                         ch->block_pointer = READ_WORD(dir + 2);
+                        if (J < 8 && loop_count[J] < 255) loop_count[J]++;
+                        if (J < 8 && (uint16_t)ch->block_pointer == kon_start_addr[J]) {
+                           uint32_t span = (uint32_t)((uint16_t)(end_at - kon_start_addr[J]));
+                           loop_full_taken++;
+                           if (span >= 4096u)     replay_huge++;
+                           else if (span >= 512u) replay_long++;
+                           else                   replay_short++;
+                           if (span > replay_max_span) replay_max_span = span;
+                        }
                         if (J < 8 && (kon_loop_valid & (1u << J))) {
                            loop_dir_checked++;
                            if (kon_loop_addr[J] != (uint16_t)ch->block_pointer)
@@ -1479,6 +1571,33 @@ void S9xPlaySample(int32_t channel)
    ch->previous [0] = ch->previous[1] = 0;
    ch->gauss_buf[0] = ch->gauss_buf[1] = ch->gauss_buf[2] = ch->gauss_buf[3] = 0;
    dir = S9xGetSampleAddress(ch->sample_number);
+   {
+      /* Same voice, same sample, still sounding, keyed a moment ago:
+       * treat as a duplicate and let the current sound run on. */
+      uint16_t want = (uint16_t)READ_WORD(dir);
+      if (channel >= 0 && channel < 8 &&
+          ch->state != SOUND_SILENT &&
+          (kon_seen & (1u << channel)) &&
+          kon_last_start[channel] == want &&
+          (uint32_t)(soundux_frame - kon_last_frame[channel]) < kon_dedup_frames)
+      {
+         kon_suppressed++;
+         return;
+      }
+      kon_last_start[channel] = want;
+      kon_last_frame[channel] = soundux_frame;
+      kon_seen |= (uint8_t)(1u << channel);
+      if (channel >= 0 && channel < 8) {
+         kon_brr_hash[channel] = brr_hash_at(want);
+         kon_start_addr[channel] = want;
+         if ((uint16_t)READ_WORD(dir + 2) == want) kon_loop_full++;
+      }
+      if (channel >= 0 && channel < 8) {
+         uint8_t n = loop_count[channel];
+         loops_per_kon[n > 7 ? 7 : n]++;   /* bin the finished voice */
+         loop_count[channel] = 0;
+      }
+   }
    ch->block_pointer = READ_WORD(dir);
    if (channel >= 0 && channel < 8) {
       kon_loop_addr[channel] = (uint16_t)READ_WORD(dir + 2);
