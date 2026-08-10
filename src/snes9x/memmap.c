@@ -1655,8 +1655,25 @@ void ApplyROMFixes(void)
          /* Clock Tower */
          strncmp(Memory.ROMId, "AJE", 3) == 0)
       Settings.H_Max = (SNES_CYCLES_PER_SCANLINE * 103) / 100;
-   else if (strncmp(Memory.ROMId, "A3M", 3) == 0 && Settings.CyclesPercentage == 100)
-      /* Mortal Kombat 3. Fixes cut off speech sample */
+   /*
+    * Mortal Kombat 3's timing hack is DISABLED here.
+    *
+    * Upstream stretches this game's scanline to 110% with the comment
+    * "Fixes cut off speech sample". Swept offline against the user's ear on
+    * identical renders of the same fight:
+    *
+    *     130% much worse | 110% repeats | 100% best | 90% worse | 80% worse
+    *
+    * A clean minimum at true SNES timing, worse in both directions. The
+    * hack pushes the 65816 further ahead of the APU — and this lineage
+    * already executes 15.6% more instructions per frame than an accurate
+    * core — so it makes the sound driver re-key voices more, not less.
+    * Whoever tuned 110 was chasing a different symptom.
+    *
+    * Leaving the line here, disabled, so nobody reintroduces it from
+    * upstream without repeating the listening test.
+    */
+   else if (0 && strncmp(Memory.ROMId, "A3M", 3) == 0 && Settings.CyclesPercentage == 100)
       Settings.H_Max = (SNES_CYCLES_PER_SCANLINE * 110) / 100;
    else if (match_na("\x0bd\x0da\x0b2\x0d4\x0b0\x0bd\x0de") &&
          Settings.CyclesPercentage == 100)
