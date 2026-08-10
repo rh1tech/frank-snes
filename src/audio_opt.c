@@ -104,15 +104,15 @@ void audio_mix_noecho_opt(int16_t* buffer, int32_t sample_count,
 
     int32_t i = 0;
     for (; i < sample_count - 1; i += 2) {
-        int32_t l = (MixBuffer[i]     * left_vol)  >> 9;
-        int32_t r = (MixBuffer[i + 1] * right_vol) >> 9;
+        int32_t l = (MixBuffer[i]     * left_vol)  >> 10;
+        int32_t r = (MixBuffer[i + 1] * right_vol) >> 10;
         if (l < -32768) l = -32768; else if (l > 32767) l = 32767;
         if (r < -32768) r = -32768; else if (r > 32767) r = 32767;
         buffer[i]     = l;
         buffer[i + 1] = r;
     }
     if (i < sample_count) {
-        int32_t l = (MixBuffer[i] * left_vol) >> 9;
+        int32_t l = (MixBuffer[i] * left_vol) >> 10;
         if (l < -32768) l = -32768; else if (l > 32767) l = 32767;
         buffer[i] = l;
     }

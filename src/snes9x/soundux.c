@@ -66,6 +66,22 @@ static struct LocalStateStruct {
 static struct LocalStateStruct *LocalState = &LocalStateStorage;
 
 // Optional kill switch for SNES noise generator (vinyl-like hiss/scratch)
+volatile uint32_t kon_total, kon_same_sample;
+/* A music driver legitimately re-keys the same instrument on the same voice
+ * for every note, so "same sample again" says nothing on its own. What is
+ * not legitimate is the same voice re-keying the same sample within a frame
+ * or two — far faster than any note. Those are the spurious re-triggers a
+ * listener hears as a repeat. */
+/* Ring log of every voice start: which sample, on which voice, when.
+ * 512 entries at 8 bytes is 4 KB, enough for ~40 s of dense play. */
+typedef struct { uint32_t frame; uint16_t start; uint8_t ch; uint8_t srcn; } konlog_t;
+#define KONLOG_N 512
+volatile konlog_t konlog[KONLOG_N];
+volatile uint32_t konlog_w;          /* total appends; index = w % KONLOG_N */
+volatile uint32_t kon_retrig_same_frame;
+volatile uint32_t kon_retrig_le2_frames;
+volatile uint32_t soundux_frame;
+
 static bool g_disable_noise = false;
 // Per-channel mute mask for debugging; bit i mutes channel i (0..7)
 static uint8_t g_channel_mute_mask = 0x00; // 0 = all channels enabled
@@ -923,7 +939,7 @@ void S9xMixSamples(int16_t* buffer, int32_t sample_count)
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 8);
             CLIP16(I);
             buffer[J] = I;
          }
@@ -951,7 +967,7 @@ void S9xMixSamples(int16_t* buffer, int32_t sample_count)
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 8);
             CLIP16(I);
             buffer[J] = I;
          }
@@ -966,7 +982,7 @@ void S9xMixSamples(int16_t* buffer, int32_t sample_count)
 #else
       for (J = 0; J < sample_count; J++)
       {
-         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 4);
+         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 8);
          CLIP16(I);
          buffer[J] = I;
       }
@@ -995,6 +1011,7 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
 
    /* sample_count is the number of mono samples we want */
    int32_t stereo_count = sample_count * 2;
+   soundux_frame++;
 
    if (SoundData.echo_enable)
       memset(EchoBuffer, 0, stereo_count * sizeof(EchoBuffer [0]));
@@ -1025,7 +1042,7 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
             SoundData.echo_ptr = 0;
 
          int32_t echo_vol = (SoundData.echo_volume[0] + SoundData.echo_volume[1]) / 2;
-         I = (mono * master_vol + E * echo_vol) / (VOL_DIV16 * 4);
+         I = (mono * master_vol + E * echo_vol) / (VOL_DIV16 * 8);
          CLIP16(I);
          buffer[J] = I;
       }
@@ -1038,7 +1055,7 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
          int32_t left = MixBuffer[J * 2];
          int32_t right = MixBuffer[J * 2 + 1];
          int32_t mono = (left + right) / 2;
-         I = (mono * master_vol) / (VOL_DIV16 * 4);
+         I = (mono * master_vol) / (VOL_DIV16 * 8);
          CLIP16(I);
          buffer[J] = I;
       }
@@ -1135,7 +1152,7 @@ void S9xMixSamplesLowPass(int16_t* buffer, int32_t sample_count, int32_t low_pas
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 8);
             CLIP16(I);
 
             /* Apply low-pass filter */
@@ -1170,7 +1187,7 @@ void S9xMixSamplesLowPass(int16_t* buffer, int32_t sample_count, int32_t low_pas
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 8);
             CLIP16(I);
 
             /* Apply low-pass filter */
@@ -1188,7 +1205,7 @@ void S9xMixSamplesLowPass(int16_t* buffer, int32_t sample_count, int32_t low_pas
       for (J = 0; J < sample_count; J++)
       {
          int32_t *low_pass_sample = &MixOutputPrev[J & 0x1];
-         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 4);
+         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 8);
          CLIP16(I);
 
          /* Apply low-pass filter */
@@ -1385,6 +1402,37 @@ void S9xPlaySample(int32_t channel)
    ch->gauss_buf[0] = ch->gauss_buf[1] = ch->gauss_buf[2] = ch->gauss_buf[3] = 0;
    dir = S9xGetSampleAddress(ch->sample_number);
    ch->block_pointer = READ_WORD(dir);
+   /* Re-trigger telemetry. A "repeated sample" that no buffer ever replayed
+    * has to be the driver keying the same sound again. Counting a key-on
+    * that lands on the same voice with the same start address as that
+    * voice's previous key-on separates a genuine re-trigger from a
+    * different sound. */
+   {
+      static uint16_t last_start[8];
+      static uint8_t  seen[8];
+      kon_total++;
+      if (channel >= 0 && channel < 8) {
+         static uint32_t last_frame[8];
+         if (seen[channel] && last_start[channel] == (uint16_t)ch->block_pointer) {
+            uint32_t dt = soundux_frame - last_frame[channel];
+            kon_same_sample++;
+            if (dt == 0) kon_retrig_same_frame++;
+            if (dt <= 2) kon_retrig_le2_frames++;
+         }
+         last_start[channel] = (uint16_t)ch->block_pointer;
+         last_frame[channel] = soundux_frame;
+         seen[channel] = 1;
+         {
+            uint32_t w = konlog_w;
+            volatile konlog_t *e = &konlog[w % KONLOG_N];
+            e->frame = soundux_frame;
+            e->start = (uint16_t)ch->block_pointer;
+            e->ch    = (uint8_t)channel;
+            e->srcn  = (uint8_t)ch->sample_number;
+            konlog_w = w + 1;
+         }
+      }
+   }
 #ifdef FRANK_SNES_AUDIO_CAPTURE
    /* Diagnosis only: record what this key-on actually resolved to, so a
     * voice that produces no sound can be traced to its sample data. */
