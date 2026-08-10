@@ -123,9 +123,37 @@ extern void hdmi_alt_run_core1(void);
  */
 #define AUDIO_FRAME_SAMPLES_NTSC (AUDIO_SAMPLE_RATE / 60)
 #define AUDIO_FRAME_SAMPLES_PAL  (AUDIO_SAMPLE_RATE / 50)
-#define AUDIO_FRAME_SAMPLES_MAX  AUDIO_FRAME_SAMPLES_PAL
-#define AUDIO_FRAME_SAMPLES      (Settings.PAL ? AUDIO_FRAME_SAMPLES_PAL \
+
+/*
+ * ...and the frame is not always a nominal frame long.
+ *
+ * memmap.c carries snes9x's per-game CPU timing hacks, which stretch
+ * Settings.H_Max: 103% for Power Rangers, 130% for Alien vs Predator, 200%
+ * for Home Improvement — and 110% for Mortal Kombat 3, whose comment reads
+ * "Fixes cut off speech sample". A stretched scanline means more emulated
+ * cycles per frame, so the APU generates proportionally more audio: MK3's
+ * frame holds ~705 samples, not 641.
+ *
+ * Asking the mixer for the nominal count on such a game throws the
+ * difference away every frame — 9% of MK3's audio — which is exactly the
+ * cut-off speech the hack was written to prevent.
+ *
+ * Clamped because soundux mixes into SOUND_BUFFER_SIZE (2133 stereo
+ * entries), so no more than 1066 sample frames can be asked for at once.
+ */
+#define AUDIO_FRAME_SAMPLES_MAX  1066u
+#define AUDIO_FRAME_SAMPLES_BASE (Settings.PAL ? AUDIO_FRAME_SAMPLES_PAL \
                                                : AUDIO_FRAME_SAMPLES_NTSC)
+static inline uint32_t audio_frame_samples(void)
+{
+    uint32_t n = (uint32_t)(((uint64_t)AUDIO_FRAME_SAMPLES_BASE *
+                             (uint32_t)Settings.H_Max +
+                             (SNES_CYCLES_PER_SCANLINE / 2u)) /
+                            SNES_CYCLES_PER_SCANLINE);
+    if (n > AUDIO_FRAME_SAMPLES_MAX) n = AUDIO_FRAME_SAMPLES_MAX;
+    return n;
+}
+#define AUDIO_FRAME_SAMPLES      audio_frame_samples()
 
 //=============================================================================
 // Screen Buffers
@@ -274,7 +302,10 @@ volatile uint32_t audio_underruns;
 #else
 #define SFIFO_CHUNKS 4
 #endif
-#define SFIFO_FRAMES (AUDIO_FRAME_SAMPLES_MAX * SFIFO_CHUNKS)
+/* Ring capacity is sized on a nominal frame, not the stretched worst case:
+ * a longer producer frame simply occupies more of the ring. Only mix16 has
+ * to be able to hold one whole stretched frame. */
+#define SFIFO_FRAMES (AUDIO_FRAME_SAMPLES_PAL * SFIFO_CHUNKS)
 
 /*
  * The FIFO itself lives in a header so tests/audio_path_test.c compiles
@@ -1805,8 +1836,24 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             int32_t target   = (int32_t)(SFIFO_FRAMES +
                                AUDIO_QUEUE_DEPTH * AUDIO_BUFFER_LENGTH) / 2;
             int32_t err      = buffered - target;
-            int32_t ratio    = (1 << 16) +
-                (int32_t)(((int64_t)err << 16) * 6 / (100 * (int64_t)target));
+
+            /*
+             * Nominal rate first, servo second.
+             *
+             * The producer's rate is known: frame_samples per emulated
+             * frame, and the frame period is known too. On a game whose
+             * H_Max is stretched by a timing hack (MK3 runs at 110%) that
+             * is 705 samples every 20 ms = 35250/s against a 32040 Hz DAC —
+             * a 10% mismatch, well outside the servo's 6% authority, so
+             * leaving it to the servo just overflows the FIFO. Feed it
+             * forward and let the servo trim what is left.
+             */
+            uint32_t produced = (uint32_t)(((uint64_t)frame_samples * 1000000u)
+                                           / (uint32_t)TARGET_FRAME_US);
+            int32_t ratio_nom = (int32_t)(((uint64_t)produced << 16)
+                                          / AUDIO_SAMPLE_RATE);
+            int32_t ratio    = ratio_nom +
+                (int32_t)(((int64_t)err * ratio_nom) * 6 / (100 * (int64_t)target));
             /* Authority has to cover the whole rate range the pipeline can
              * see: DAC crystal error (well under 1%) plus emulation running
              * below 60 fps under load. At 53 fps the producer is 12% short,
@@ -1815,8 +1862,9 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             /* Authority still has to cover a producer that is genuinely
              * slow, but the servo now reaches these limits only when the
              * emulator really cannot keep up, not on jitter. */
-            if (ratio < 57700) ratio = 57700;   /* 0.880x */
-            if (ratio > 74000) ratio = 74000;   /* 1.129x */
+            /* Authority is relative to the nominal rate, not to 1.0. */
+            if (ratio < (ratio_nom * 88) / 100) ratio = (ratio_nom * 88) / 100;
+            if (ratio > (ratio_nom * 113) / 100) ratio = (ratio_nom * 113) / 100;
             if (ratio < ratio_min) ratio_min = ratio;
             if (ratio > ratio_max) ratio_max = ratio;
 
