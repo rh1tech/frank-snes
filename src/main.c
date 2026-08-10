@@ -1738,7 +1738,18 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 
         // Mixer attenuates by >>11 (÷2048) to prevent hard clipping.
         // Boost with soft limiter to restore volume, scaled by volume setting.
+        /*
+         * The two sound cores hand over audio at very different levels.
+         * soundux attenuates by VOL_DIV16*8 and needs boosting; blargg's
+         * S-DSP outputs near full scale and must not be. Applying the same
+         * gain to both drove the DSP path 61000 past full scale and into
+         * the limiter on hundreds of frames.
+         */
+#ifdef SOUND_CORE_DSP
+        const int gain_num = g_settings.volume;
+#else
         const int gain_num = g_settings.volume * 4;
+#endif
         const int gain_den = 100;
         const bool use_soft_limiter = true;
 
