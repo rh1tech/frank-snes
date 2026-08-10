@@ -66,6 +66,9 @@ option(FRANK_SNES_PADSCRIPT_MK3 "Six timed START presses, then hands off" OFF)
 # Hash mixer and DAC output once a second, to compare two runs.
 option(FRANK_SNES_AUDIO_FINGERPRINT "Fingerprint audio for A/B determinism runs" OFF)
 
+# 512-entry ring log of every voice start (4 KB of SRAM; overflows M1).
+option(FRANK_SNES_KONLOG "Log voice starts for offline analysis" OFF)
+
 # Fast mode: aggressively reduce quality for higher framerate
 option(FRANK_SNES_FAST_MODE "Enable fast mode (reduced quality for higher FPS)" ON)
 
@@ -368,6 +371,10 @@ endif()
 
 if(FRANK_SNES_AUDIO_FINGERPRINT)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_AUDIO_FINGERPRINT=1)
+endif()
+
+if(FRANK_SNES_KONLOG)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_KONLOG=1)
 endif()
 
 if(FRANK_SNES_AUTOPAD)

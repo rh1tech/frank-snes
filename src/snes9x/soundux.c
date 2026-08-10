@@ -74,10 +74,12 @@ volatile uint32_t kon_total, kon_same_sample;
  * listener hears as a repeat. */
 /* Ring log of every voice start: which sample, on which voice, when.
  * 512 entries at 8 bytes is 4 KB, enough for ~40 s of dense play. */
+#ifdef FRANK_SNES_KONLOG
 typedef struct { uint32_t frame; uint16_t start; uint8_t ch; uint8_t srcn; } konlog_t;
 #define KONLOG_N 512
 volatile konlog_t konlog[KONLOG_N];
 volatile uint32_t konlog_w;          /* total appends; index = w % KONLOG_N */
+#endif
 volatile uint32_t kon_retrig_same_frame;
 volatile uint32_t kon_retrig_le2_frames;
 volatile uint32_t soundux_frame;
@@ -1422,6 +1424,7 @@ void S9xPlaySample(int32_t channel)
          last_start[channel] = (uint16_t)ch->block_pointer;
          last_frame[channel] = soundux_frame;
          seen[channel] = 1;
+#ifdef FRANK_SNES_KONLOG
          {
             uint32_t w = konlog_w;
             volatile konlog_t *e = &konlog[w % KONLOG_N];
@@ -1431,6 +1434,7 @@ void S9xPlaySample(int32_t channel)
             e->srcn  = (uint8_t)ch->sample_number;
             konlog_w = w + 1;
          }
+#endif
       }
    }
 #ifdef FRANK_SNES_AUDIO_CAPTURE
