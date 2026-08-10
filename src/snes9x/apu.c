@@ -152,30 +152,6 @@ volatile uint32_t dsp_write_count = 0; /* total DSP writes — for hang detectio
 #ifdef PICO_ON_DEVICE
 __attribute__((hot, section(".time_critical.apu_dsp")))
 #endif
-/*
- * The two 1.43 paths that can start a voice from something other than a
- * plain KON write, and so play a sample the driver only asked for once.
- *
- *  kon_deferred   - a KON arrived while that voice's KOFF bit was still
- *                   set, so it was parked in KeyOn instead of played.
- *  kon_koff_start - a *KOFF* write started a voice, via the KeyOnPrev
- *                   path below. If the driver then issues its own KON as
- *                   well, the sample is played twice: an audible repeat.
- */
-volatile uint32_t kon_deferred;
-volatile uint32_t kon_koff_start;
-/* What the driver actually reads back to decide a voice is finished.
- * ENDX is only refreshed inside MixStereo, once per frame and after the
- * SPC700 has already run that whole frame, so every one of these reads
- * sees a value up to 20 ms stale. ENVX and OUTX come from live channel
- * state and are current. If the driver leans on ENDX, that staleness is
- * a real defect in this port's frame-based mixing, not inherited 1.43
- * behaviour. */
-volatile uint32_t dsp_read_endx;
-volatile uint32_t dsp_read_envx;
-volatile uint32_t dsp_read_outx;
-volatile uint32_t dsp_read_other;
-
 void S9xSetAPUDSP(uint8_t byte)
 {
    uint8_t reg = IAPU.RAM [0xf2];
@@ -320,7 +296,6 @@ void S9xSetAPUDSP(uint8_t byte)
          }
          else if ((KeyOnPrev & mask) != 0)
          {
-            kon_koff_start++;
             KeyOnPrev &= ~mask;
             APU.KeyedChannels |= mask;
             APU.DSP [APU_KOFF] &= ~mask;
@@ -353,10 +328,7 @@ void S9xSetAPUDSP(uint8_t byte)
                   S9xSFXCheckKON(c);
                }
                else
-               {
-                  kon_deferred++;
                   KeyOn |= mask;
-               }
             }
          }
       }
@@ -574,11 +546,6 @@ uint8_t S9xGetAPUDSP()
 {
    uint8_t reg = IAPU.RAM [0xf2] & 0x7f;
    uint8_t byte = APU.DSP [reg];
-
-   if      (reg == APU_ENDX)          dsp_read_endx++;
-   else if ((reg & 0x0f) == APU_ENVX) dsp_read_envx++;
-   else if ((reg & 0x0f) == APU_OUTX) dsp_read_outx++;
-   else                               dsp_read_other++;
 
    switch (reg)
    {

@@ -7,7 +7,6 @@
 #include "cpuexec.h"
 #include "gfx.h"
 #include "apu.h"
-#include "soundux.h"
 #include "dma.h"
 #include <stdio.h>
 #include "../settings.h"
@@ -127,19 +126,6 @@ CPU_HOT void S9xDoHBlankProcessing()
          APU.Cycles -= Settings.H_Max;
       else
          APU.Cycles -= Settings.H_Max;
-#endif
-#if !defined(SOUND_CORE_DSP)
-      /* Advance the mixer alongside the SPC700 rather than in one lump at
-       * the end of the frame. The sound driver polls ENVX to decide a voice
-       * has finished; leaving it a whole frame stale is what makes it
-       * re-key voices, heard as a repeated sample. Every 16 scanlines is
-       * ~0.6 ms of freshness against the driver's ~1.5 ms poll interval. */
-      if ((CPU.V_Counter & 15) == 0)
-      {
-         int32_t lines = Settings.PAL ? SNES_MAX_PAL_VCOUNTER
-                                      : SNES_MAX_NTSC_VCOUNTER;
-         S9xMixSlice((int32_t)(((int32_t)CPU.V_Counter << 8) / lines));
-      }
 #endif
 #else
       S9xAPUExecute();

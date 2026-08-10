@@ -915,58 +915,6 @@ static INLINE void MixStereo(int32_t sample_count)
    MixStereoSegment(0, sample_count);
 }
 
-/* ------------------------------------------------------------------ */
-/* Sliced mixing                                                       */
-/* ------------------------------------------------------------------ */
-/*
- * Why this exists.
- *
- * MK3's sound driver decides a voice has finished by polling ENVX — the
- * live envelope level — about 650 times a second. ENVX (and ENDX) are only
- * written while the mixer runs, and the mixer ran once per emulated frame,
- * *after* S9xMainLoop() had already executed that whole frame's SPC700. So
- * the driver sampled a 20 ms staircase whose every step described the
- * previous frame, and re-keyed voices on the strength of it. That is the
- * repeated sample, and it gets worse with more voices because each one adds
- * envelope transitions that land on stale reads.
- *
- * Mixing the frame in slices as the SPC700 advances keeps the envelopes the
- * driver reads current. The output stage is unchanged: slices accumulate
- * into the same MixBuffer and the frame is converted once at the end.
- */
-static int32_t slice_done;        /* stereo samples of this frame mixed  */
-static int32_t slice_total;       /* stereo samples this frame will hold */
-
-void S9xSetFrameSampleCount(int32_t stereo_samples)
-{
-   if (stereo_samples > SOUND_BUFFER_SIZE) stereo_samples = SOUND_BUFFER_SIZE;
-   slice_total = stereo_samples & ~1;
-}
-
-static void slice_begin(void)
-{
-   if (SoundData.echo_enable)
-      memset(EchoBuffer, 0, slice_total * sizeof(EchoBuffer [0]));
-   memset(MixBuffer, 0, slice_total * sizeof(MixBuffer [0]));
-   slice_done = 0;
-}
-
-/* Mix up to `fraction`/256 of the frame. Called as the SPC700 advances. */
-void S9xMixSlice(int32_t fraction)
-{
-   int32_t upto;
-
-   if (slice_total <= 0) return;
-   if (slice_done == 0) slice_begin();
-
-   upto = (int32_t)(((int64_t)slice_total * fraction) >> 8) & ~1;
-   if (upto > slice_total) upto = slice_total;
-   if (upto <= slice_done)  return;
-
-   MixStereoSegment(slice_done, upto - slice_done);
-   slice_done = upto;
-}
-
 void S9xMixSamples(int16_t* buffer, int32_t sample_count)
 {
 
@@ -1067,17 +1015,10 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
    int32_t stereo_count = sample_count * 2;
    soundux_frame++;
 
-   /* Finish whatever the slices did not cover. If nothing sliced this
-    * frame (slice_total unset, or the caller never advanced us) this is
-    * exactly the old behaviour: one memset and one full mix. */
-   if (slice_total != stereo_count) {
-      S9xSetFrameSampleCount(stereo_count);
-      slice_done = 0;
-   }
-   if (slice_done == 0) slice_begin();
-   if (slice_done < stereo_count)
-      MixStereoSegment(slice_done, stereo_count - slice_done);
-   slice_done = 0;
+   if (SoundData.echo_enable)
+      memset(EchoBuffer, 0, stereo_count * sizeof(EchoBuffer [0]));
+   memset(MixBuffer, 0, stereo_count * sizeof(MixBuffer [0]));
+   MixStereo(stereo_count);
 
    /* Mix stereo to mono: average L+R channels */
    /* Use combined master volume (average of L and R) */

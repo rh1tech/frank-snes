@@ -157,11 +157,6 @@ extern int32_t  dsp_frame_start_cycle;
 
 void S9xDSPQueueEvent(uint8_t type, uint8_t data, int32_t cycle);
 void S9xDSPSetFrameStart(int32_t cycle);
-/* Sliced mixing: keeps ENVX/ENDX current for a driver that polls them
- * far more often than once a frame. See soundux.c. */
-void S9xSetFrameSampleCount(int32_t stereo_samples);
-void S9xMixSlice(int32_t fraction_256);
-
 void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count);
 
 /* SFX auto-release: channels KON'd near a button press auto-release
