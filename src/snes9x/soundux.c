@@ -67,6 +67,18 @@ static struct LocalStateStruct *LocalState = &LocalStateStorage;
 
 // Optional kill switch for SNES noise generator (vinyl-like hiss/scratch)
 volatile uint32_t kon_total, kon_same_sample;
+/*
+ * The loop-point directory read is taken at MIX time, i.e. at the end of
+ * the frame, long after the voice was keyed. MK3 rewrites one directory
+ * entry per voice, so the entry can have moved on to the next sound by
+ * then and the voice loops to the wrong sample.
+ *
+ * loop_dir_checked counts loop points reached; loop_dir_stale counts those
+ * where the directory no longer holds what it held at key-on.
+ */
+volatile uint32_t loop_dir_checked, loop_dir_stale;
+static uint16_t kon_loop_addr[8];
+static uint8_t  kon_loop_valid;
 /* A music driver legitimately re-keys the same instrument on the same voice
  * for every note, so "same sample again" says nothing on its own. What is
  * not legitimate is the same voice re-keying the same sample within a frame
@@ -844,6 +856,11 @@ static INLINE void MixStereoSegment(int32_t buf_offset, int32_t sample_count)
                         ch->last_block = false;
                         dir = S9xGetSampleAddress(ch->sample_number);
                         ch->block_pointer = READ_WORD(dir + 2);
+                        if (J < 8 && (kon_loop_valid & (1u << J))) {
+                           loop_dir_checked++;
+                           if (kon_loop_addr[J] != (uint16_t)ch->block_pointer)
+                              loop_dir_stale++;
+                        }
 
                         /* SFX auto-release removed — was killing music loops */
                      }
@@ -913,6 +930,58 @@ stereo_exit:;
 static INLINE void MixStereo(int32_t sample_count)
 {
    MixStereoSegment(0, sample_count);
+}
+
+/* ------------------------------------------------------------------ */
+/* Sliced mixing                                                       */
+/* ------------------------------------------------------------------ */
+/*
+ * Why this exists.
+ *
+ * MK3's sound driver decides a voice has finished by polling ENVX — the
+ * live envelope level — about 650 times a second. ENVX (and ENDX) are only
+ * written while the mixer runs, and the mixer ran once per emulated frame,
+ * *after* S9xMainLoop() had already executed that whole frame's SPC700. So
+ * the driver sampled a 20 ms staircase whose every step described the
+ * previous frame, and re-keyed voices on the strength of it. That is the
+ * repeated sample, and it gets worse with more voices because each one adds
+ * envelope transitions that land on stale reads.
+ *
+ * Mixing the frame in slices as the SPC700 advances keeps the envelopes the
+ * driver reads current. The output stage is unchanged: slices accumulate
+ * into the same MixBuffer and the frame is converted once at the end.
+ */
+static int32_t slice_done;        /* stereo samples of this frame mixed  */
+static int32_t slice_total;       /* stereo samples this frame will hold */
+
+void S9xSetFrameSampleCount(int32_t stereo_samples)
+{
+   if (stereo_samples > SOUND_BUFFER_SIZE) stereo_samples = SOUND_BUFFER_SIZE;
+   slice_total = stereo_samples & ~1;
+}
+
+static void slice_begin(void)
+{
+   if (SoundData.echo_enable)
+      memset(EchoBuffer, 0, slice_total * sizeof(EchoBuffer [0]));
+   memset(MixBuffer, 0, slice_total * sizeof(MixBuffer [0]));
+   slice_done = 0;
+}
+
+/* Mix up to `fraction`/256 of the frame. Called as the SPC700 advances. */
+void S9xMixSlice(int32_t fraction)
+{
+   int32_t upto;
+
+   if (slice_total <= 0) return;
+   if (slice_done == 0) slice_begin();
+
+   upto = (int32_t)(((int64_t)slice_total * fraction) >> 8) & ~1;
+   if (upto > slice_total) upto = slice_total;
+   if (upto <= slice_done)  return;
+
+   MixStereoSegment(slice_done, upto - slice_done);
+   slice_done = upto;
 }
 
 void S9xMixSamples(int16_t* buffer, int32_t sample_count)
@@ -1015,10 +1084,17 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
    int32_t stereo_count = sample_count * 2;
    soundux_frame++;
 
-   if (SoundData.echo_enable)
-      memset(EchoBuffer, 0, stereo_count * sizeof(EchoBuffer [0]));
-   memset(MixBuffer, 0, stereo_count * sizeof(MixBuffer [0]));
-   MixStereo(stereo_count);
+   /* Finish whatever the slices did not cover. If nothing sliced this
+    * frame (slice_total unset, or the caller never advanced us) this is
+    * exactly the old behaviour: one memset and one full mix. */
+   if (slice_total != stereo_count) {
+      S9xSetFrameSampleCount(stereo_count);
+      slice_done = 0;
+   }
+   if (slice_done == 0) slice_begin();
+   if (slice_done < stereo_count)
+      MixStereoSegment(slice_done, stereo_count - slice_done);
+   slice_done = 0;
 
    /* Mix stereo to mono: average L+R channels */
    /* Use combined master volume (average of L and R) */
@@ -1404,6 +1480,10 @@ void S9xPlaySample(int32_t channel)
    ch->gauss_buf[0] = ch->gauss_buf[1] = ch->gauss_buf[2] = ch->gauss_buf[3] = 0;
    dir = S9xGetSampleAddress(ch->sample_number);
    ch->block_pointer = READ_WORD(dir);
+   if (channel >= 0 && channel < 8) {
+      kon_loop_addr[channel] = (uint16_t)READ_WORD(dir + 2);
+      kon_loop_valid |= (uint8_t)(1u << channel);
+   }
    /* Re-trigger telemetry. A "repeated sample" that no buffer ever replayed
     * has to be the driver keying the same sound again. Counting a key-on
     * that lands on the same voice with the same start address as that
