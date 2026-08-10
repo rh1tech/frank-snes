@@ -103,14 +103,38 @@ static INLINE uint32_t link_frame_span(void)
          * (uint32_t)Settings.H_Max;
 }
 
+/* Diagnostics for the clamp above, because the comment's claim that only
+ * "a handful" of events land past the V_Counter wrap has never been
+ * measured. ev_dragged counts events whose real position was earlier than
+ * the last one issued — every one of those is collapsed onto a single
+ * instant — and ev_drag_cycles totals how far each was moved. Read over
+ * SWD alongside ev_batches. */
+volatile uint32_t ev_dragged;
+/* Which register the dragged write was for. KON ($4c) is the one that
+ * starts a voice; if that is what gets moved a frame, the collapse is not
+ * cosmetic. */
+volatile uint32_t ev_drag_kon;
+volatile uint32_t ev_drag_koff;
+volatile uint32_t ev_drag_other;
+static bool ev_was_dragged;
+volatile uint32_t ev_drag_cycles;
+volatile uint32_t ev_span_hits;
+volatile uint32_t ev_batches;
+
 static INLINE uint32_t link_dsp_now(void)
 {
     uint32_t raw = (uint32_t)CPU.V_Counter * (uint32_t)Settings.H_Max
                  + (uint32_t)CPU.Cycles;
     uint32_t span = link_frame_span();
 
-    if (raw > span)       raw = span;
-    if (raw < ev_last_when) raw = ev_last_when;
+    if (raw > span)       { raw = span; ev_span_hits++; }
+    ev_was_dragged = false;
+    if (raw < ev_last_when) {
+        ev_dragged++;
+        ev_drag_cycles += ev_last_when - raw;
+        ev_was_dragged = true;
+        raw = ev_last_when;
+    }
     ev_last_when = raw;
     return raw;
 }
@@ -134,6 +158,11 @@ static inline void ev_push(uint8_t type, uint16_t addr, uint8_t val)
     }
     link_event_t *e = &ev_buf[ev_count++];
     uint32_t when = link_dsp_now();
+    if (ev_was_dragged) {
+        if      (addr == 0x4c) ev_drag_kon++;
+        else if (addr == 0x5c) ev_drag_koff++;
+        else                   ev_drag_other++;
+    }
     if (ev_count > 1 && when < e[-1].cycles) {
         uint32_t back = e[-1].cycles - when;
         ev_inversions++;
@@ -437,6 +466,7 @@ void s9x_link_frame(void)
 
     /* New batch starts here: let the clamp track from zero again. */
     ev_last_when = 0;
+    ev_batches++;
 
     link_frame_reply_t reply;
     bool ok = link_master_frame_exchange(ev_buf, ev_count,

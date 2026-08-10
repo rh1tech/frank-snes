@@ -74,7 +74,10 @@ static bool     ready;
 static uint32_t dsp_span;
 static uint32_t dsp_clocks_per_frame;
 static uint32_t dsp_clocks_done;
-static uint32_t dsp_pos_last;
+/* Cycles since the last drain, and the raw V_Counter position it was last
+ * derived from. See apu_dsp_now(). */
+static uint32_t dsp_rel;
+static uint32_t dsp_prev_raw;
 static uint32_t dsp_rate = 32040u;
 static bool     dsp_geom_pal;
 static bool     dsp_geom_valid;
@@ -97,15 +100,35 @@ static void apu_dsp_geometry(void)
 
 static void apu_dsp_finish_frame(void);
 
+/*
+ * Position within the current batch, in master cycles.
+ *
+ * V_Counter * H_Max + CPU.Cycles is only monotonic *within* a video frame,
+ * and the batch boundary is the drain in main.c, which does not coincide
+ * with V_Counter wrapping — measured at exactly one wrap per batch. The old
+ * code clamped: writes after the wrap came out with near-zero positions,
+ * were dragged forward to the previous value, and every one of them
+ * collapsed onto a single instant. The wrap lands in V-blank, which is
+ * where a sound driver does its work, so that is most of a frame's key-ons
+ * landing together — heard as samples repeating and playing only partially.
+ *
+ * Carrying the wrap instead of clamping keeps the timebase monotonic across
+ * it, and keeps the accumulator bounded by resetting it every drain.
+ */
 static INLINE uint32_t apu_dsp_now(void)
 {
-   uint32_t pos = (uint32_t)CPU.V_Counter * (uint32_t)Settings.H_Max
-                + (uint32_t)CPU.Cycles;
    apu_dsp_geometry();
-   if (pos > dsp_span)     pos = dsp_span;
-   if (pos < dsp_pos_last) pos = dsp_pos_last;
-   dsp_pos_last = pos;
-   return pos;
+
+   int32_t cyc = (int32_t)CPU.Cycles;
+   uint32_t raw = (uint32_t)CPU.V_Counter * (uint32_t)Settings.H_Max
+                + (uint32_t)(cyc > 0 ? cyc : 0);
+
+   uint32_t delta = (raw >= dsp_prev_raw) ? raw - dsp_prev_raw
+                                          : raw + dsp_span - dsp_prev_raw;
+   if (delta > dsp_span) delta = dsp_span;   /* never trust a wild jump */
+   dsp_prev_raw = raw;
+   dsp_rel += delta;
+   return dsp_rel;
 }
 
 static void apu_dsp_sync(uint32_t when)
@@ -171,7 +194,8 @@ bool S9xInitSound(int32_t buffer_ms, int32_t lag_ms)
    spc_dsp_reset();
    spc_dsp_set_output(out_buf, APU_OUT_PAIRS * 2);
    dsp_clocks_done = 0;
-   dsp_pos_last    = 0;
+   dsp_rel         = 0;
+   dsp_prev_raw    = 0;
    dsp_geom_valid  = false;
 #endif
    ready = true;
@@ -189,7 +213,8 @@ void S9xResetSound(bool full)
 #else
    spc_dsp_set_output(out_buf, APU_OUT_PAIRS * 2);
    dsp_clocks_done = 0;
-   dsp_pos_last    = 0;
+   dsp_rel         = 0;
+   dsp_prev_raw    = 0;
 #endif
 }
 
@@ -211,7 +236,8 @@ void S9xSetPlaybackRate(uint32_t rate)
    dsp_rate        = rate;
    dsp_geom_valid  = false;      /* region may not be known yet */
    dsp_clocks_done = 0;
-   dsp_pos_last    = 0;
+   dsp_rel         = 0;
+   dsp_prev_raw    = 0;
 #endif
 }
 
@@ -290,9 +316,11 @@ uint8_t S9xGetAPUDSP(void)
 
 static void apu_dsp_finish_frame(void)
 {
-   apu_dsp_sync(dsp_span);
+   /* Run to where the CPU actually is, not to a nominal frame end: a batch
+    * can be a little longer or shorter than one frame. */
+   apu_dsp_sync(apu_dsp_now());
    dsp_clocks_done = 0;
-   dsp_pos_last    = 0;
+   dsp_rel         = 0;
 }
 #endif /* !SPC700_ACCURATE */
 

@@ -60,6 +60,12 @@ option(FRANK_SNES_AUTOBOOT "Auto-load Doom on boot (skip UI)" OFF)
 # Autopad: scripted gamepad inputs to drive title/menus (debugging)
 option(FRANK_SNES_AUTOPAD "Inject scripted button presses" OFF)
 
+# Deterministic MK3 menu walk for device-vs-host key-on comparison.
+option(FRANK_SNES_PADSCRIPT_MK3 "Six timed START presses, then hands off" OFF)
+
+# Hash mixer and DAC output once a second, to compare two runs.
+option(FRANK_SNES_AUDIO_FINGERPRINT "Fingerprint audio for A/B determinism runs" OFF)
+
 # Fast mode: aggressively reduce quality for higher framerate
 option(FRANK_SNES_FAST_MODE "Enable fast mode (reduced quality for higher FPS)" ON)
 
@@ -354,6 +360,14 @@ if(FRANK_SNES_AUTOBOOT)
         target_compile_definitions(frank-snes PRIVATE AUTOBOOT_PATH="${AUTOBOOT_PATH}")
         message(STATUS "AUTOBOOT: ${AUTOBOOT_PATH}")
     endif()
+endif()
+
+if(FRANK_SNES_PADSCRIPT_MK3)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_PADSCRIPT_MK3=1)
+endif()
+
+if(FRANK_SNES_AUDIO_FINGERPRINT)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_AUDIO_FINGERPRINT=1)
 endif()
 
 if(FRANK_SNES_AUTOPAD)

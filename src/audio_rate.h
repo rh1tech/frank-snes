@@ -51,12 +51,19 @@ static void sfifo_push(const int16_t *src, uint32_t frames)
 /* Pull one chunk, resampling at `ratio` (q16 input frames per output frame).
  * The caller derives the ratio from ring depth, which is the only signal
  * that reflects the DAC's true rate. */
+/* How often the ring could not supply real audio. A slow producer should
+ * come out as *slow* sound, never as holes: every one of these is a
+ * fraction of a millisecond of held sample where emulated audio should
+ * have been. Non-zero means the resampler could not stretch far enough. */
+uint32_t sfifo_dry;
+
 static void sfifo_pull(int16_t *dst, uint32_t frames, int32_t ratio)
 {
 
     for (uint32_t i = 0; i < frames; i++) {
         uint32_t whole = sfifo_rd >> 16;
         if (sfifo_fill < 2) {
+            sfifo_dry++;
             /*
              * Dry mid-chunk. Emitting zeros here punches a hole into
              * whatever was sounding — measured at 13 holes even with the

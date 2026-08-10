@@ -197,6 +197,40 @@ static uint32_t __attribute__((aligned(32))) audio_packed_discard[AUDIO_BUFFER_L
 static uint32_t g_render_cost_us = 4000;   /* estimated cost of rendering  */
 static uint32_t g_emu_only_us   = 8000;   /* cost of a skipped-render frame */
 volatile uint32_t audio_discards;
+/* Delivery-path health that no existing counter covered. */
+/*
+ * Fingerprint of what actually reached the DAC.
+ *
+ * The emulator is deterministic: identical ROM and identical input must
+ * give identical audio, every run. The reported fault is NOT deterministic
+ * — same fight, different samples cut each time — so something between the
+ * emulator and the DAC varies. Hashing the delivered frames and snapshotting
+ * that hash once a second lets two runs be diffed, and the first differing
+ * second says when the divergence starts.
+ */
+#ifdef FRANK_SNES_AUDIO_FINGERPRINT
+volatile uint32_t audio_hash = 2166136261u;
+#define AUDIO_HASH_LOG 160
+volatile uint32_t audio_hash_log[AUDIO_HASH_LOG];
+volatile uint32_t audio_hash_n;
+static uint32_t   audio_hash_chunks;
+
+/* Same fingerprint taken at the DAC, so one run reports determinism at both
+ * ends: the producer must be bit-identical run to run, the DAC never can be
+ * (it adapts to the real clock) — what matters is how far it drifts. */
+volatile uint32_t dac_hash = 2166136261u;
+volatile uint32_t dac_hash_log[AUDIO_HASH_LOG];
+volatile uint32_t dac_hash_n;
+static uint32_t   dac_hash_chunks;
+#endif /* FRANK_SNES_AUDIO_FINGERPRINT */
+
+volatile uint32_t ratio_floor_hits;   /* servo pinned at maximum stretch */
+volatile uint32_t ratio_ceil_hits;    /* servo pinned at maximum squeeze */
+volatile uint32_t sfifo_short;        /* chunk skipped: ring below need   */
+volatile int32_t  ratio_min = 0x7fffffff;   /* servo excursion, q16 */
+volatile int32_t  ratio_max;
+volatile int32_t  pace_adj_min = 0x7fffffff;  /* frame-period trim, us */
+volatile int32_t  pace_adj_max = -0x7fffffff;
 volatile uint32_t audio_underruns;
 
 /* --- Audio pacing -------------------------------------------------------
@@ -711,6 +745,30 @@ uint32_t S9xReadJoypad(const int32_t port) {
             S9xNotifyButtonPress();
         prev_joypad = joypad;
     }
+
+#ifdef FRANK_SNES_PADSCRIPT_MK3
+    /*
+     * Deterministic MK3 menu walk, for comparing this emulator against the
+     * same core running on a host.
+     *
+     * Six single-frame START presses at fixed frames, then NOTHING is
+     * pressed for the rest of the run. The frames are the ones the host
+     * harness (scratchpad lr.c, screen-driven) chose for the 1.43 core, so
+     * both sides see identical input and their key-on streams can be
+     * diffed directly.
+     *
+     * It must stay single-frame and must stop: START pauses MK3, so a
+     * script that keeps pressing it re-triggers the announcer and restarts
+     * rounds by itself, which invalidated every earlier comparison.
+     */
+    if (port == 0) {
+        static uint32_t padscript_frame = 0;
+        static const uint32_t press_at[] = { 46, 196, 346, 496, 652, 1440 };
+        uint32_t f = padscript_frame++;
+        for (unsigned i = 0; i < sizeof(press_at) / sizeof(press_at[0]); i++)
+            if (f == press_at[i]) joypad |= SNES_START_MASK;
+    }
+#endif
 
 #ifdef FRANK_SNES_AUTOPAD
     /* Scripted pad driver for SNES DOOM: drives through logos, title,
@@ -1629,6 +1687,24 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
          * the fixed-size chunks the DAC wants are resampled out of it
          * below. Pushing a fixed 534 here is what threw away a sixth of
          * every PAL frame. */
+#ifdef FRANK_SNES_AUDIO_FINGERPRINT
+        {
+            /* Fingerprint the MIXER's output, not the DAC's. Everything
+             * downstream of here is paced by the wall clock, so hashing
+             * delivered frames cannot tell a non-deterministic emulator
+             * from a merely adaptive resampler. This can. */
+            uint32_t h = audio_hash;
+            const uint8_t *hb = (const uint8_t *)mix16;
+            for (uint32_t k = 0; k < frame_samples * sizeof(int16_t) * AUDIO_CH; k++)
+                { h ^= hb[k]; h *= 16777619u; }
+            audio_hash = h;
+            if (++audio_hash_chunks >= 50u) {
+                audio_hash_chunks = 0;
+                if (audio_hash_n < AUDIO_HASH_LOG)
+                    audio_hash_log[audio_hash_n++] = h;
+            }
+        }
+#endif
         sfifo_push(mix16, frame_samples);
         }
     #ifdef FRANK_SNES_PROFILE
@@ -1665,24 +1741,60 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             if (depth >= AUDIO_QUEUE_DEPTH)
                 break;                       /* ring full: leave it in the FIFO */
 
-            int32_t err = (int32_t)depth - (int32_t)(AUDIO_QUEUE_DEPTH / 2);
-            /* Proportional gain. Too low and the loop can only reach full
-             * stretch once the ring is already empty, so it starves on frame
-             * jitter; this holds the ring near 3 chunks even when emulation
-             * runs 8% slow. */
-            int32_t ratio = (1 << 16) + (err * (1 << 16)) /
-                            (int32_t)AUDIO_QUEUE_DEPTH;
+            /*
+             * Rate servo.
+             *
+             * The error signal is the TOTAL buffered audio in frames — the
+             * elastic FIFO plus what is already packed in the ring — not the
+             * ring depth in chunks. Chunk depth has eight levels, so a servo
+             * driven by it moves the playback rate in 12.5% steps: ordinary
+             * frame jitter of one or two chunks swung the rate by 12-25% and
+             * pinned it against both clamps several times a second. The
+             * actual correction required is 32050 Hz produced against 32040
+             * consumed — 0.03%. That swing was heard as samples cutting and
+             * warbling, and because it is driven by the wall clock it never
+             * reproduced the same way twice.
+             *
+             * Frames give ~4700 levels instead of 8, so a gentle gain can
+             * hold the buffer near half full and still cover a genuinely
+             * slow producer. Full deflection is 6%, an order of magnitude
+             * more than the steady-state error and inaudible.
+             */
+            int32_t buffered = (int32_t)sfifo_fill +
+                               (int32_t)(depth * AUDIO_BUFFER_LENGTH);
+            int32_t target   = (int32_t)(SFIFO_FRAMES +
+                               AUDIO_QUEUE_DEPTH * AUDIO_BUFFER_LENGTH) / 2;
+            int32_t err      = buffered - target;
+            int32_t ratio    = (1 << 16) +
+                (int32_t)(((int64_t)err << 16) * 6 / (100 * (int64_t)target));
             /* Authority has to cover the whole rate range the pipeline can
              * see: DAC crystal error (well under 1%) plus emulation running
              * below 60 fps under load. At 53 fps the producer is 12% short,
              * so the stretch limit is set there — beyond that the audio
              * would starve and click instead. */
+            /* Authority still has to cover a producer that is genuinely
+             * slow, but the servo now reaches these limits only when the
+             * emulator really cannot keep up, not on jitter. */
             if (ratio < 57700) ratio = 57700;   /* 0.880x */
             if (ratio > 74000) ratio = 74000;   /* 1.129x */
+            if (ratio < ratio_min) ratio_min = ratio;
+            if (ratio > ratio_max) ratio_max = ratio;
+
+            /* Diagnostics for the stretch authority. ratio_floor_hits
+             * counts chunks where the servo wanted to stretch further than
+             * it is allowed to: past that point the ring drains and the
+             * pull holds samples instead of stretching, which is a hole
+             * rather than slow sound. The limit was tuned for 53 fps
+             * against a 60 fps target, i.e. 88% of nominal — on PAL that
+             * same fraction is 44 fps. */
+            if (ratio <= 57700) ratio_floor_hits++;
+            if (ratio >= 74000) ratio_ceil_hits++;
 
             uint32_t need = ((AUDIO_BUFFER_LENGTH * (uint32_t)ratio) >> 16) + 2;
-            if (sfifo_fill < need)
+            if (sfifo_fill < need) {
+                sfifo_short++;
                 break;                       /* not a chunk's worth yet */
+            }
 
             sfifo_pull(mix16, AUDIO_BUFFER_LENGTH, ratio);
             uint32_t *dst32 = audio_packed_buffer[prod % AUDIO_QUEUE_DEPTH];
@@ -1701,6 +1813,20 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                 memcpy((void *)&audio_cap_buf[audio_cap_len * AUDIO_BUFFER_LENGTH],
                        dst32, AUDIO_BUFFER_LENGTH * sizeof(uint32_t));
                 if (++audio_cap_len >= audio_cap_max) audio_cap_arm = 0;
+            }
+#endif
+#ifdef FRANK_SNES_AUDIO_FINGERPRINT
+            {
+                uint32_t h = dac_hash;
+                const uint8_t *hb = (const uint8_t *)dst32;
+                for (uint32_t k = 0; k < AUDIO_BUFFER_LENGTH * sizeof(uint32_t); k++)
+                    { h ^= hb[k]; h *= 16777619u; }
+                dac_hash = h;
+                if (++dac_hash_chunks >= 60u) {
+                    dac_hash_chunks = 0;
+                    if (dac_hash_n < AUDIO_HASH_LOG)
+                        dac_hash_log[dac_hash_n++] = h;
+                }
             }
 #endif
             __dmb();
@@ -1738,8 +1864,60 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             g_palette_needs_update = false;
         }
 
-        // Advance deadline and frame counter for the next emulated frame.
-        next_frame_deadline += TARGET_FRAME_US;
+        /*
+         * Advance the deadline for the next emulated frame — and slave that
+         * period to the audio buffer.
+         *
+         * The DAC is a fixed-rate sink, so a producer/consumer mismatch has
+         * to be absorbed somewhere: by buffer (finite) or by changing the
+         * playback rate (audible). Correcting the *producer* removes the
+         * mismatch instead of hiding it — the emulator's average frame rate
+         * becomes exactly the DAC's rate, the buffer sits at its target, and
+         * the resampler downstream is left with nothing to do.
+         *
+         * Deficit shortens the frame period, surplus lengthens it. The
+         * adjustment is bounded at 1/8 of a frame so a stopped DAC (menu,
+         * paused audio) can only slow emulation slightly rather than stall
+         * it, and so this can never fight the frameskip logic.
+         *
+         * If the emulator is genuinely CPU-bound this does nothing — it is
+         * already running flat out — and the resampler takes over and
+         * stretches, which is the honest outcome: slow sound, not holes.
+         */
+        {
+            uint32_t d = audio_prod_seq - audio_cons_seq;
+            int32_t buffered = (int32_t)sfifo_fill +
+                               (int32_t)(d * AUDIO_BUFFER_LENGTH);
+            int32_t target   = (int32_t)(SFIFO_FRAMES +
+                               AUDIO_QUEUE_DEPTH * AUDIO_BUFFER_LENGTH) / 2;
+            int32_t err      = buffered - target;      /* frames of audio */
+
+            /* One frame period per `target` frames of error: a full swing
+             * of the buffer moves the period by one frame, so the loop is
+             * critically slow rather than twitchy. */
+            int32_t adj = (int32_t)(((int64_t)err * (int32_t)TARGET_FRAME_US)
+                                    / target);
+
+            /* Authority is deliberately small — this only has to trim
+             * drift between two clocks that are already within 0.03% of
+             * each other. A wide limit lets the loop demand a frame period
+             * the emulator cannot meet, which pins it permanently "late"
+             * and drives constant frameskip. 1/32 of a frame is ~3%. */
+            int32_t lim = (int32_t)TARGET_FRAME_US / 32;
+            if (adj >  lim) adj =  lim;
+            if (adj < -lim) adj = -lim;
+
+            /* And never shorten the period when the emulator has just
+             * missed the one it had: it is CPU-bound, not mistimed, and
+             * asking for more only starves the video. The resampler
+             * absorbs that case as stretch, which is the honest outcome. */
+            if (adj < 0 && late_us > 0) adj = 0;
+
+            if (adj < pace_adj_min) pace_adj_min = adj;
+            if (adj > pace_adj_max) pace_adj_max = adj;
+
+            next_frame_deadline += (uint32_t)((int32_t)TARGET_FRAME_US + adj);
+        }
         frame_num++;
 
 #ifdef FRANK_SNES_SUPERFX_DIAG
