@@ -773,9 +773,13 @@ uint32_t S9xReadJoypad(const int32_t port) {
      * rounds by itself, which invalidated every earlier comparison.
      */
     if (port == 0) {
-        static uint32_t padscript_frame = 0;
+        /* Key off the EMULATED FRAME, not the number of times the game has
+         * polled the pad. MK3 reads the joypad more than once per frame, so
+         * a call counter runs ahead of the host harness and the two stop
+         * being the same experiment — which invalidated the first
+         * device-vs-host comparison. */
         static const uint32_t press_at[] = { 46, 196, 346, 496, 652, 1440 };
-        uint32_t f = padscript_frame++;
+        uint32_t f = (uint32_t)ICPU.Frame;
         for (unsigned i = 0; i < sizeof(press_at) / sizeof(press_at[0]); i++)
             if (f == press_at[i]) joypad |= SNES_START_MASK;
     }
