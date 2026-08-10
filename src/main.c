@@ -229,6 +229,17 @@ volatile uint32_t ratio_ceil_hits;    /* servo pinned at maximum squeeze */
 volatile uint32_t sfifo_short;        /* chunk skipped: ring below need   */
 volatile int32_t  ratio_min = 0x7fffffff;   /* servo excursion, q16 */
 volatile int32_t  ratio_max;
+/* Headroom telemetry. The mixer sums eight voices, so a dense scene is a
+ * loud one; if the post-gain peak is riding into the soft limiter then
+ * dense passages are being compressed and quiet voices buried under the
+ * loud ones — which would present as "samples missing when many play at
+ * once" without any key-on ever being lost. */
+volatile int32_t  mix_peak_max;        /* largest |mix16| seen, pre-gain */
+volatile uint32_t mix_limit_frames;    /* frames whose peak enters the limiter */
+volatile uint32_t mix_clip_frames;     /* frames whose peak would hard-clip */
+volatile uint32_t mix_frames;
+volatile int32_t  mix_gain_num, mix_gain_den;
+
 volatile int32_t  pace_adj_min = 0x7fffffff;  /* frame-period trim, us */
 volatile int32_t  pace_adj_max = -0x7fffffff;
 volatile uint32_t audio_underruns;
@@ -1705,6 +1716,20 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             }
         }
 #endif
+        {
+            int32_t peak = 0;
+            for (uint32_t k = 0; k < frame_samples * AUDIO_CH; k++) {
+                int32_t v = mix16[k]; if (v < 0) v = -v;
+                if (v > peak) peak = v;
+            }
+            if (peak > mix_peak_max) mix_peak_max = peak;
+            int32_t post = (peak * (g_settings.volume * 4)) / 100;
+            if (post > 24000) mix_limit_frames++;
+            if (post > 32767) mix_clip_frames++;
+            mix_frames++;
+            mix_gain_num = g_settings.volume * 4;
+            mix_gain_den = 100;
+        }
         sfifo_push(mix16, frame_samples);
         }
     #ifdef FRANK_SNES_PROFILE

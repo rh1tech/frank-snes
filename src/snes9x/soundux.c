@@ -923,7 +923,7 @@ void S9xMixSamples(int16_t* buffer, int32_t sample_count)
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 16);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
             CLIP16(I);
             buffer[J] = I;
          }
@@ -951,7 +951,7 @@ void S9xMixSamples(int16_t* buffer, int32_t sample_count)
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 16);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
             CLIP16(I);
             buffer[J] = I;
          }
@@ -966,7 +966,7 @@ void S9xMixSamples(int16_t* buffer, int32_t sample_count)
 #else
       for (J = 0; J < sample_count; J++)
       {
-         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 16);
+         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 4);
          CLIP16(I);
          buffer[J] = I;
       }
@@ -1025,7 +1025,7 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
             SoundData.echo_ptr = 0;
 
          int32_t echo_vol = (SoundData.echo_volume[0] + SoundData.echo_volume[1]) / 2;
-         I = (mono * master_vol + E * echo_vol) / (VOL_DIV16 * 16);
+         I = (mono * master_vol + E * echo_vol) / (VOL_DIV16 * 4);
          CLIP16(I);
          buffer[J] = I;
       }
@@ -1038,7 +1038,7 @@ void S9xMixSamplesMono(int16_t* buffer, int32_t sample_count)
          int32_t left = MixBuffer[J * 2];
          int32_t right = MixBuffer[J * 2 + 1];
          int32_t mono = (left + right) / 2;
-         I = (mono * master_vol) / (VOL_DIV16 * 16);
+         I = (mono * master_vol) / (VOL_DIV16 * 4);
          CLIP16(I);
          buffer[J] = I;
       }
@@ -1135,7 +1135,7 @@ void S9xMixSamplesLowPass(int16_t* buffer, int32_t sample_count, int32_t low_pas
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 16);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
             CLIP16(I);
 
             /* Apply low-pass filter */
@@ -1170,7 +1170,7 @@ void S9xMixSamplesLowPass(int16_t* buffer, int32_t sample_count, int32_t low_pas
             if (SoundData.echo_ptr >= SoundData.echo_buffer_size)
                SoundData.echo_ptr = 0;
 
-            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 16);
+            I = (MixBuffer[J] * SoundData.master_volume [J & 1] + E * SoundData.echo_volume [J & 1]) / (VOL_DIV16 * 4);
             CLIP16(I);
 
             /* Apply low-pass filter */
@@ -1188,7 +1188,7 @@ void S9xMixSamplesLowPass(int16_t* buffer, int32_t sample_count, int32_t low_pas
       for (J = 0; J < sample_count; J++)
       {
          int32_t *low_pass_sample = &MixOutputPrev[J & 0x1];
-         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 16);
+         I = (MixBuffer[J] * SoundData.master_volume [J & 1]) / (VOL_DIV16 * 4);
          CLIP16(I);
 
          /* Apply low-pass filter */
