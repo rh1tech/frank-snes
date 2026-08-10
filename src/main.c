@@ -240,6 +240,22 @@ volatile uint32_t mix_clip_frames;     /* frames whose peak would hard-clip */
 volatile uint32_t mix_frames;
 volatile int32_t  mix_gain_num, mix_gain_den;
 
+/*
+ * Repetition detectors, one on each side of the mixer.
+ *
+ * mix_repeat_frames counts emulated frames whose mixed audio is bit-identical
+ * to the previous frame — that is the emulator producing the same sound twice.
+ * dac_repeat_chunks counts DAC chunks identical to the one before — that is
+ * the delivery path replaying. Exactly one of these can be non-zero for a
+ * given fault, so together they say which side to fix.
+ *
+ * Silence repeats legitimately, so both ignore all-zero blocks.
+ */
+volatile uint32_t mix_repeat_frames;
+volatile uint32_t dac_repeat_chunks;
+volatile uint32_t mix_nonsilent_frames;
+volatile uint32_t dac_nonsilent_chunks;
+
 volatile int32_t  pace_adj_min = 0x7fffffff;  /* frame-period trim, us */
 volatile int32_t  pace_adj_max = -0x7fffffff;
 volatile uint32_t audio_underruns;
@@ -1589,6 +1605,12 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
     #ifdef FRANK_SNES_PROFILE
         uint32_t t0 = _diag_t0;
     #endif
+#if !defined(SOUND_CORE_DSP)
+        /* Tell the mixer how long this frame is before emulating it, so it
+         * can mix in slices as the SPC700 advances and keep the envelope
+         * levels the sound driver polls from going a frame stale. */
+        S9xSetFrameSampleCount((int32_t)(AUDIO_FRAME_SAMPLES * 2));
+#endif
         S9xMainLoop();
         uint32_t _diag_t1 = time_us_32();
     #ifdef FRANK_SNES_PROFILE
@@ -1716,6 +1738,20 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             }
         }
 #endif
+        {
+            /* Frame-to-frame repetition on the producer side. */
+            static uint32_t prev_mix_h;
+            uint32_t mh = 2166136261u;
+            uint32_t nz = 0;
+            const uint8_t *mb = (const uint8_t *)mix16;
+            for (uint32_t k = 0; k < frame_samples * sizeof(int16_t) * AUDIO_CH; k++)
+                { mh ^= mb[k]; mh *= 16777619u; nz |= mb[k]; }
+            if (nz) {
+                mix_nonsilent_frames++;
+                if (mh == prev_mix_h) mix_repeat_frames++;
+            }
+            prev_mix_h = mh;
+        }
         {
             int32_t peak = 0;
             for (uint32_t k = 0; k < frame_samples * AUDIO_CH; k++) {
@@ -1854,6 +1890,20 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                 }
             }
 #endif
+            {
+                /* And on the delivery side. */
+                static uint32_t prev_dac_h;
+                uint32_t dh = 2166136261u;
+                uint32_t nz = 0;
+                const uint8_t *db = (const uint8_t *)dst32;
+                for (uint32_t k = 0; k < AUDIO_BUFFER_LENGTH * sizeof(uint32_t); k++)
+                    { dh ^= db[k]; dh *= 16777619u; nz |= db[k]; }
+                if (nz) {
+                    dac_nonsilent_chunks++;
+                    if (dh == prev_dac_h) dac_repeat_chunks++;
+                }
+                prev_dac_h = dh;
+            }
             __dmb();
             audio_prod_seq = prod + 1;
             __dmb();
