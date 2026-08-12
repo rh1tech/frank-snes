@@ -103,7 +103,46 @@ enum {
 
     LINK_OP_PING         = 0x0040,  /* M->S: liveness / latency probe     */
     LINK_OP_PONG         = 0x0041,
+
+    /* ---- PPU offload ------------------------------------------------
+     *
+     * The slave renders. The master streams every PPU-visible write, one
+     * scanline marker per line and an explicit end-of-frame record; the
+     * slave replays them through the same S9xSetPPU / RenderLine /
+     * S9xUpdateScreen the master used to run and returns the finished
+     * paletted framebuffer. Proven offline on 7 games and 6,900 frames:
+     * every frame pixel-identical, with the 65816 never executing.
+     *
+     * Measured prize on the master: 17,305 -> 9,663 us/frame, 46 -> 50 fps.
+     *
+     * These deliberately ride the EXISTING per-frame exchange rather than
+     * adding an exchange of their own. The note on LINK_OP_FRAME records
+     * what the first assembled board measured: the doorbell phases, not
+     * the bytes, are what an exchange costs. The PPU stream is ~4 KB and
+     * the frame back is 57 KB, against a 50.4 MB/s link that is already
+     * 99.94% idle - so bytes are free and a second round trip would not
+     * be. LINK_OP_FRAME's arg1 high half is already spoken for, hence a
+     * dedicated pair of ops that carry their own lengths.
+     *
+     * PPU_STREAM: arg0 = stream byte length, bulk follows.
+     * PPU_FRAME:  arg0 = framebuffer byte length, arg1 = palette entries
+     *             changed this frame; framebuffer bulk follows, then the
+     *             palette bulk if arg1 is non-zero.
+     */
+    LINK_OP_PPU_STREAM     = 0x0050,  /* M->S: the PPU command stream     */
+    LINK_OP_PPU_STREAM_ACK = 0x0051,
+    LINK_OP_PPU_FRAME      = 0x0052,  /* S->M: the rendered framebuffer   */
+    LINK_OP_PPU_FRAME_ACK  = 0x0053,
 };
+
+/* The paletted framebuffer the slave returns: 8 bits per pixel, the same
+ * format GFX.Screen already holds on the master, so the master's existing
+ * HDMI path consumes it unchanged. 256x224 = 57,344 bytes; a PAL overscan
+ * frame is 256x239. The palette rides separately because it changes far
+ * less often than the pixels. */
+#define LINK_PPU_MAX_WIDTH   256
+#define LINK_PPU_MAX_HEIGHT  239
+#define LINK_PPU_MAX_BYTES   (LINK_PPU_MAX_WIDTH * LINK_PPU_MAX_HEIGHT)
 
 /* ---- Frame header (24 bytes), followed by payload, zero-padded to
  *      LINK_CTRL_BYTES. ---- */
