@@ -505,6 +505,11 @@ if(FRANK_SNES_AUTOPAD)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_AUTOPAD=1)
 endif()
 
+option(FRANK_SNES_NO_RENDER "Measurement only: skip all rendering" OFF)
+if(FRANK_SNES_NO_RENDER)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_NO_RENDER=1)
+endif()
+
 if(FRANK_SNES_FAST_MODE)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_FAST_MODE=1)
     message(STATUS "FAST MODE enabled")

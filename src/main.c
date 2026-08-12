@@ -675,6 +675,7 @@ typedef struct {
     uint32_t ship_rs_sub_calls;    /* subscreen calls/frame x100 */
     uint32_t ship_tile_calls;      /* DrawTile16 calls/frame */
     uint32_t ship_tile_lines;      /* tile LINES drawn/frame */
+    uint32_t ship_norender;        /* 1 = this sample had rendering skipped */
 } frank_telemetry_t;
 /* 0 upd 1 rs 2 obj 3 bg0 4 bg1 5 bg2 6 bg3 7 mode7 8 zclear 9 sub 10 main
    11 colormath 12 backdrop 13 scale 14 tileconv */
@@ -2411,6 +2412,8 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                     frank_telemetry.ship_tile_calls = frank_tile_calls / d;
                     frank_telemetry.ship_tile_lines = frank_tile_lines / d;
                     frank_tile_calls = frank_tile_lines = 0; }
+                  { extern volatile uint32_t frank_norender;
+                    frank_telemetry.ship_norender = frank_norender; }
                   frank_upd_us = frank_rs_us = frank_rs_calls = 0; }
                 g_ship_emul_sum = 0; g_ship_emul_n = 0;
                 frank_telemetry.events_per_frame = frank_event_count / (tel_frames ? tel_frames : 1);

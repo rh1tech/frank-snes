@@ -2781,6 +2781,7 @@ volatile uint32_t frank_upd_us;       /* whole S9xUpdateScreen */
 volatile uint32_t frank_rs_calls;
 volatile uint32_t frank_rs_sub_us;   /* subscreen half of RenderScreen */
 volatile uint32_t frank_rs_sub_calls;
+volatile uint32_t frank_norender;
 
 GFX_HOT static void RenderScreen(uint8_t* Screen, bool sub, bool force_no_add, uint8_t D)
 {
@@ -3066,6 +3067,21 @@ GFX_HOT static void RenderScreen(uint8_t* Screen, bool sub, bool force_no_add, u
 GFX_HOT void S9xUpdateScreen(void)
 {
    uint32_t __upd_a = time_us_32();
+#ifdef FRANK_SNES_NO_RENDER
+   /* Measurement build for the PPU-offload decision. Rendering is skipped on
+      alternating 10-second phases rather than permanently: a permanently
+      blank screen makes the game unnavigable, and alternating gives both
+      states in the SAME scene, which is the only fair comparison - fps and
+      render load swing widely between scenes. `frank_norender` tells the
+      reader which phase a sample came from. */
+   frank_norender = (time_us_32() / 10000000u) & 1u;
+   if (frank_norender)
+   {
+      IPPU.PreviousLine = IPPU.CurrentLine;
+      frank_upd_us += time_us_32() - __upd_a;
+      return;
+   }
+#endif
    g_upd_screen_calls++;
 #ifdef FRANK_SNES_PROFILE
    uint32_t _render_t0 = time_us_32();
