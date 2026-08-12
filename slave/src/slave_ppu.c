@@ -42,10 +42,14 @@
  *
  * They must match the master's, or the two halves render differently. */
 settings_t g_settings = {
-   .bg_enabled           = { true, true, true, true },
+   /* bg_enabled is a BITMASK (bit 0 = BG1 ... bit 3 = BG4), not an array of
+      bools. Writing { true, true, true, true } into a scalar takes the first
+      element, so this was 1 - BG1 only, every other layer suppressed. */
+   .bg_enabled           = 0x0f,
    .sprites_enabled      = true,
    .transparency_enabled = true,
    .crt_overscan         = false,
+   .hdma_enabled         = true,
 };
 
 /* The renderer calls into the master's HDMI palette API. The slave drives no
