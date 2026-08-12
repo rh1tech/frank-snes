@@ -3,6 +3,7 @@
 #include "snes9x.h"
 #include "memmap.h"
 #include "ppu.h"
+#include "ppu_capture.h"
 #include "cpuexec.h"
 #include "apu.h"
 #include "dma.h"
@@ -249,6 +250,7 @@ void S9xFixColourBrightness() {
 /******************************************************************************/
 PPU_HOT void S9xSetPPU(uint8_t Byte, uint16_t Address)
 {
+   PPUCAP_WRITE_HOOK(Address, Byte);
    if (Address <= 0x2183)
    {
       switch (Address)

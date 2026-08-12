@@ -17,6 +17,7 @@
 #include "cpuexec.h"
 #include "display.h"
 #include "gfx.h"
+#include "ppu_capture.h"
 #include "apu.h"
 #include "settings.h"
 #include "colormath.h"
@@ -408,6 +409,7 @@ void S9xStartScreenRefresh(void)
 
 GFX_HOT void RenderLine(uint8_t C)
 {
+   PPUCAP_LINE_HOOK(C);
    if (IPPU.RenderThisFrame)
    {
       LineData[C].BG[0].VOffset = PPU.BG[0].VOffset + 1;
@@ -454,6 +456,7 @@ GFX_HOT void RenderLine(uint8_t C)
 
 void S9xEndScreenRefresh(void)
 {
+   PPUCAP_ENDF_HOOK();
    if (IPPU.RenderThisFrame)
    {
       FLUSH_REDRAW();

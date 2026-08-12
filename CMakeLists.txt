@@ -319,6 +319,12 @@ endif()
 # The APU. Two whole cores, selected together — the SPC700 and the DSP
 # are a matched pair and cannot be mixed.
 set(C2_SOURCES "")
+
+# PPU command-stream capture for the C2 PPU offload. Ours, not upstream, so it
+# stays out of SNES9X_SOURCES and its -O3 flag block.
+if(FRANK_SNES_PPU_CAPTURE)
+    list(APPEND C2_SOURCES src/snes9x/ppu_capture.c)
+endif()
 # The 1.6x core ships its own APU (bapu) and does not use any of these.
 if(CPU_CORE STREQUAL "S9X16")
 elseif(SOUND_CORE STREQUAL "ACCURATE")
@@ -503,6 +509,11 @@ endif()
 
 if(FRANK_SNES_AUTOPAD)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_AUTOPAD=1)
+endif()
+
+option(FRANK_SNES_PPU_CAPTURE "Capture the PPU command stream for the C2 slave" OFF)
+if(FRANK_SNES_PPU_CAPTURE)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_PPU_CAPTURE=1)
 endif()
 
 option(FRANK_SNES_NO_RENDER "Measurement only: skip all rendering" OFF)
