@@ -53,11 +53,32 @@ set(SLAVE_SOUND_SOURCES
     ${REPO_ROOT}/src/snes9x/spc_dsp.c
 )
 
+# The renderer, for the PPU offload. Scoping build: these are the files the
+# slave needs to replay a PPU command stream and draw the frame.
+set(SLAVE_PPU_SOURCES
+    ${REPO_ROOT}/src/snes9x/gfx.c
+    ${REPO_ROOT}/src/snes9x/tile.c
+    ${REPO_ROOT}/src/snes9x/clip.c
+    ${REPO_ROOT}/src/snes9x/colormath.c
+    ${REPO_ROOT}/src/snes9x/ppu.c
+    ${REPO_ROOT}/src/snes9x/globals.c
+    ${REPO_ROOT}/src/snes9x/tile_asm.S
+
+    # The 448 KB of tile caches cannot fit in the slave's SRAM (356 KB free
+    # with the renderer linked), so the slave's PSRAM on U5 - unused until
+    # now - is brought up for them. Everything the renderer touches per pixel
+    # stays in SRAM.
+    ${REPO_ROOT}/drivers/psram_init.c
+    ${REPO_ROOT}/drivers/psram_allocator.c
+)
+
 add_executable(frank-snes-slave
     src/main.c
     src/slave_glue.c
     src/slave_sound.c
+    src/slave_ppu.c
     ${SLAVE_SOUND_SOURCES}
+    ${SLAVE_PPU_SOURCES}
 )
 
 # slave/src comes first so its snes_alloc.h shadows the master's, which
@@ -68,6 +89,8 @@ target_include_directories(frank-snes-slave PRIVATE
     ${REPO_ROOT}/src
     ${REPO_ROOT}/src/snes9x
     ${REPO_ROOT}/link
+    ${REPO_ROOT}/drivers
+    ${REPO_ROOT}/drivers/libdvi
 )
 
 # Diagnostic: force the DSP's echo unit off. The echo delay line lives
