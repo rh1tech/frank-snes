@@ -37,6 +37,14 @@ set(PSRAM_SPEED "133" CACHE STRING "PSRAM max frequency in MHz: 84, 100, 133")
 
 # Lightweight on-device profiling (prints once per second over UART)
 option(FRANK_SNES_PROFILE "Enable periodic performance profiling output" OFF)
+# The [perf] line is ~1000 characters to a 115200 UART - roughly 87 ms of
+# blocking transmit every second, which perturbs what it is measuring. With
+# QUIET the counters and the frank_telemetry block are still updated, so the
+# numbers can be read over SWD instead.
+option(FRANK_SNES_PROFILE_QUIET "Profile without printing the [perf] line" OFF)
+# MEASUREMENT ONLY: compile out the sub-instruction event drain to see what it
+# costs on this hardware. Emulation is incorrect with this on - never ship it.
+option(FRANK_SNES_NODRAIN "Measurement build: no sub-instruction event drain" OFF)
 
 # DSP command logging (KON/KOFF/FLG/GAIN to serial)
 option(FRANK_SNES_DSP_LOG "Enable DSP command logging output" OFF)
@@ -103,6 +111,34 @@ endif()
 set(SOUND_CORE "${SOUND_CORE_DEFAULT}" CACHE STRING "Sound core: DSP or LEGACY")
 set_property(CACHE SOUND_CORE PROPERTY STRINGS DSP ACCURATE LEGACY)
 message(STATUS "Sound core: ${SOUND_CORE}")
+
+# CPU/system core selection.
+#   LEGACY — the snes9x 1.43-derived core in src/snes9x. What every board
+#            has shipped.
+#   S9X16  — the snes9x 1.6x core in src/snes9x16.
+#
+# This is not an accuracy nicety. The 1.43 core charges a flat
+# CPU.Cycles += CPU.MemSpeed per instruction, where 1.6x charges cycles
+# inside the memory accessors; 1.43 therefore executes 18212.6
+# instructions per frame against 1.6x's 15751.4 and runs Mortal Kombat 3
+# about 2% fast relative to its APU. Rendered offline with the same ROM
+# and the same input script, 1.43 repeats announcer samples and 1.6x does
+# not — confirmed by ear over three independent fights. Swapping the APU
+# alone does not fix it; the CPU is what has to change.
+#
+# S9X16 brings its own APU (bapu: SPC700 + S-DSP), so SOUND_CORE does not
+# apply to it.
+set(CPU_CORE "LEGACY" CACHE STRING "CPU/system core: LEGACY (1.43) or S9X16 (1.6x)")
+set_property(CACHE CPU_CORE PROPERTY STRINGS LEGACY S9X16)
+message(STATUS "CPU core: ${CPU_CORE}")
+
+# The C2 DSP offload replaces the 1.43 mixer. The 1.6x core generates its
+# own samples, so bring-up runs sound on the master; moving its S-DSP to
+# the slave is a separate step.
+if(CPU_CORE STREQUAL "S9X16" AND C2_SOUND_LINK)
+    set(C2_SOUND_LINK OFF)
+    message(STATUS "C2: sound stays on the master (S9X16 brings its own APU)")
+endif()
 
 # HDMI driver selection.  PIO (default) is the bespoke palette-indexed
 # scanline driver in drivers/HDMI.c; ALT switches to the libdvi-backed
@@ -191,6 +227,61 @@ pico_generate_pio_header(drivers ${CMAKE_CURRENT_LIST_DIR}/drivers/audio_i2s.pio
 target_link_libraries(drivers pico_stdlib hardware_dma hardware_pio hardware_spi hardware_gpio)
 
 # Snes9x emulator sources
+if(CPU_CORE STREQUAL "S9X16")
+    # The 1.6x core. Feature set matches what the shipping firmware
+    # actually supports: SuperFX and nothing else. The DSP1-4 globals in
+    # the 1.43 build are 4-byte placeholders, so leaving those
+    # coprocessors out is not a regression.
+    #
+    # Deferred, not dropped: snapshot.cpp (savestates — its Snap* freeze
+    # tables are 46 KB of non-const data, i.e. SRAM, and want const-ing
+    # first) and msu1.c (needs a VFS; msu1_stub.c stands in).
+    set(SNES9X_SOURCES
+        src/snes9x16/cpu.cpp
+        src/snes9x16/cpuexec.cpp
+        src/snes9x16/cpuops.cpp
+        src/snes9x16/dma.cpp
+        src/snes9x16/ppu.cpp
+        src/snes9x16/memmap.cpp
+        src/snes9x16/gfx.cpp
+        src/snes9x16/globals.cpp
+        src/snes9x16/clip.cpp
+        src/snes9x16/controls.cpp
+        src/snes9x16/fscompat.cpp
+        src/snes9x16/sha256.cpp
+        src/snes9x16/crosshairs.cpp
+        src/snes9x16/port_glue.cpp
+        src/snes9x16/s9x16_api.cpp
+        src/snes9x16/port_state.cpp
+        src/snes9x16/msu1_stub.c
+        src/snes9x16/tile.c
+        src/snes9x16/fxemu.c
+        src/snes9x16/sa1.cpp
+        src/snes9x16/sa1cpu.cpp
+        src/snes9x16/sa1hw.c
+        src/snes9x16/dsp.c
+        src/snes9x16/sdd1.c
+        src/snes9x16/srtc.c
+        src/snes9x16/spc7110.c
+        src/snes9x16/seta.c
+        src/snes9x16/obc1.c
+        src/snes9x16/bsx.c
+        src/snes9x16/bsflash.c
+        src/snes9x16/c4emu.c
+        src/snes9x16/apu/apu.cpp
+        src/snes9x16/apu/bapu/dsp/sdsp.cpp
+        src/snes9x16/apu/bapu/smp/smp.cpp
+        src/snes9x16/apu/bapu/smp/smp_state.cpp
+    )
+    set(SNES9X_INCLUDE_DIRS
+        ${CMAKE_CURRENT_LIST_DIR}/src/snes9x16
+        ${CMAKE_CURRENT_LIST_DIR}/src/snes9x16/apu
+        ${CMAKE_CURRENT_LIST_DIR}/src/snes9x16/apu/bapu)
+    # Cheats, SA-1 and DSP3 declare 977 KB of globals between them against
+    # 520 KB of SRAM. None are built; see src/snes9x16/globals.cpp.
+    set(SNES9X_EXTRA_DEFS SNES9X_NO_CHEATS=1 SNES9X_NO_SDD1=1 SNES9X_NO_DSP3=1
+                          FRANK_SNES_CPU_CORE_S9X16=1 FRANK_SNES_INDEXED_SCREEN=1)
+else()
 set(SNES9X_SOURCES
     src/snes9x/c4.c
     src/snes9x/c4emu.c
@@ -214,6 +305,9 @@ set(SNES9X_SOURCES
     src/snes9x/cpu_asm.S
     src/snes9x/tile_asm.S
 )
+set(SNES9X_INCLUDE_DIRS "")
+set(SNES9X_EXTRA_DEFS "")
+endif()
 
 # The sample-generating half of the APU. On C2 it runs on the slave
 # instead, and src/sound_backend_link.c stands in its place — see
@@ -225,7 +319,9 @@ set(SNES9X_SOURCES
 # The APU. Two whole cores, selected together — the SPC700 and the DSP
 # are a matched pair and cannot be mixed.
 set(C2_SOURCES "")
-if(SOUND_CORE STREQUAL "ACCURATE")
+# The 1.6x core ships its own APU (bapu) and does not use any of these.
+if(CPU_CORE STREQUAL "S9X16")
+elseif(SOUND_CORE STREQUAL "ACCURATE")
     # blargg's SPC700 clocking blargg's S-DSP.
     list(APPEND SNES9X_SOURCES
         src/snes9x/spc700_blargg.c
@@ -276,6 +372,14 @@ set(UI_SOURCES
     src/settings.c
 )
 
+# The 1.6x core brings its own tile converter and its own APU, so the
+# hand-written replacements for the 1.43 ones do not apply — and would only
+# pull the 1.43 headers back into the build.
+if(CPU_CORE STREQUAL "S9X16")
+    list(REMOVE_ITEM ASM_OPT_SOURCES src/tile_convert_opt.c)
+    list(REMOVE_ITEM C2_SOURCES src/sound_backend_link.c)
+endif()
+
 add_executable(frank-snes
     src/main.c
     src/frank_snes_profile.c
@@ -288,7 +392,19 @@ add_executable(frank-snes
 set_source_files_properties(${SNES9X_SOURCES} PROPERTIES COMPILE_FLAGS
     "-O3 -fno-strict-aliasing -funroll-loops -fomit-frame-pointer")
 
+if(CPU_CORE STREQUAL "S9X16")
+    # main.c reaches into Settings/IPPU/GFX directly and the 1.6x headers
+    # that declare those are C++ (memmap.h alone pulls in <string>). It
+    # already compiles clean as C++, so it is built that way rather than
+    # hidden behind an accessor for every field.
+    #
+    # settings.c is NOT: it has out-of-order designated initializers, which
+    # C++ rejects outright. It stays C and goes through s9x16_api.h.
+    set_source_files_properties(src/main.c PROPERTIES LANGUAGE CXX)
+endif()
+
 target_include_directories(frank-snes PRIVATE
+    ${SNES9X_INCLUDE_DIRS}
     src
     src/snes9x
     src/fatfs
@@ -301,6 +417,7 @@ target_include_directories(frank-snes PRIVATE
 )
 
 target_compile_definitions(frank-snes PRIVATE
+    ${SNES9X_EXTRA_DEFS}
     BOARD_${BOARD_VARIANT}
     CPU_CLOCK_MHZ=${CPU_SPEED}
     CPU_VOLTAGE=${CPU_VOLTAGE}
@@ -328,6 +445,13 @@ endif()
 
 if(FRANK_SNES_PROFILE)
     target_compile_definitions(frank-snes PRIVATE FRANK_SNES_PROFILE=1)
+    if(FRANK_SNES_PROFILE_QUIET)
+        target_compile_definitions(frank-snes PRIVATE PROF_QUIET=1)
+    endif()
+endif()
+if(FRANK_SNES_NODRAIN)
+    target_compile_definitions(frank-snes PRIVATE FRANK_SNES_NODRAIN=1)
+    message(WARNING "FRANK_SNES_NODRAIN: emulation timing is WRONG - measurement only")
 endif()
 
 if(FRANK_SNES_DSP_LOG)

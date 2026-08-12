@@ -24,6 +24,8 @@ SoundStatus so;
 #endif
 
 SSettings Settings;
+struct STimings Timings;
+int16_t S9xVTimerPosition;
 
 int32_t OpAddress = 0;
 

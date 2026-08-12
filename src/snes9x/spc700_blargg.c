@@ -1845,12 +1845,21 @@ static uint32_t spc_remainder;
 static uint32_t ratio_numerator   = APU_NUMERATOR_NTSC;
 static uint32_t ratio_denominator = APU_DENOMINATOR_NTSC;
 
+/* 64-bit intermediate, deliberately.
+ *
+ * CPU.Cycles is normally under one scanline, but a long DMA runs with the
+ * event drain suppressed and can leave it a couple of hundred thousand cycles
+ * ahead before the drain unwinds it. ratio_numerator times that span exceeds
+ * 32 bits - measured offline at 34176 * 263216 = 8,995,670,016, which wraps to
+ * 405,735,424 and yields 572 APU clocks where 12,678 were owed. The SPC700
+ * silently lost ~12,000 clocks every time it happened and ended up
+ * permanently out of phase with the CPU. */
 #define S9X_APU_GET_CLOCK(cpucycles) \
-   ((int32_t)((ratio_numerator * (uint32_t)((cpucycles) - reference_time) \
+   ((int32_t)(((uint64_t)ratio_numerator * (uint32_t)((cpucycles) - reference_time) \
                + spc_remainder) / ratio_denominator))
 #define S9X_APU_GET_CLOCK_REMAINDER(cpucycles) \
-   ((ratio_numerator * (uint32_t)((cpucycles) - reference_time) \
-     + spc_remainder) % ratio_denominator)
+   ((uint32_t)(((uint64_t)ratio_numerator * (uint32_t)((cpucycles) - reference_time) \
+     + spc_remainder) % ratio_denominator))
 
 bool S9xInitAPU(void)
 {

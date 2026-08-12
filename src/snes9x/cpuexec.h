@@ -32,7 +32,34 @@ typedef struct
 void S9xMainLoop(void);
 void S9xReset(void);
 void S9xSoftReset(void);
-void S9xDoHBlankProcessing(void);
+void S9xDoHEventProcessing(void);
+
+/* Drain every scanline event whose position CPU.Cycles has now passed.
+ *
+ * A while, not an if: one instruction or DMA burst can cross several event
+ * positions. Not during DMA - the transfer charges and drains itself, and
+ * re-entering the handler mid-transfer would let HDMA recurse. */
+/* The common case is "no event due": one load and one compare. Testing
+   CPU.InDMA first cost a second load and branch on every single bus access
+   and every addressing-mode charge - millions per frame - to guard a case
+   that almost never applies. Moving it inside the loop is behaviourally
+   identical because the loop body is only reached when an event is due. */
+#ifdef FRANK_SNES_NODRAIN
+/* MEASUREMENT ONLY - compiles out the sub-instruction event drain so its cost
+   on this hardware can be read off. Emulation is WRONG in this build: events
+   then only fire at instruction boundaries. Never ship it. */
+#define S9xDrainEvents() do { } while (0)
+#else
+#define S9xDrainEvents() \
+   do { \
+      while (CPU.Cycles >= CPU.NextEvent) \
+      { \
+         if (CPU.InDMA) \
+            break; \
+         S9xDoHEventProcessing(); \
+      } \
+   } while (0)
+#endif
 void S9xClearIRQ(uint32_t source);
 void S9xSetIRQ(uint32_t source);
 
@@ -85,30 +112,56 @@ static INLINE void S9xFixCycles(void)
    }
 }
 
+/* Advance to the next event in the ring.
+ *
+ * A pure state machine: each event knows its successor and that successor's
+ * position, so there are no comparisons against the current cycle count here.
+ * The old version chose between two events by testing which half of the line
+ * it was in, and consulted HTimerEnabled/VTimerEnabled on every call. */
 static INLINE void S9xReschedule(void)
 {
-   uint8_t which;
-   int32_t max;
+   uint8_t which = HC_HBLANK_START_EVENT;
+   int32_t hpos  = Timings.HBlankStart;
 
-   if (CPU.WhichEvent == HBLANK_START_EVENT || CPU.WhichEvent == HTIMER_AFTER_EVENT)
+   switch (CPU.WhichEvent)
    {
-      which = HBLANK_END_EVENT;
-      max = Settings.H_Max;
-   }
-   else
-   {
-      which = HBLANK_START_EVENT;
-      max = Settings.HBlankStart;
+   case HC_HBLANK_START_EVENT:
+   case HC_IRQ_1_3_EVENT:
+      which = HC_HDMA_START_EVENT;   hpos = Timings.HDMAStart;      break;
+   case HC_HDMA_START_EVENT:
+   case HC_IRQ_3_5_EVENT:
+      which = HC_HCOUNTER_MAX_EVENT; hpos = Timings.H_Max;          break;
+   case HC_HCOUNTER_MAX_EVENT:
+   case HC_IRQ_5_7_EVENT:
+      which = HC_HDMA_INIT_EVENT;    hpos = Timings.HDMAInit;       break;
+   case HC_HDMA_INIT_EVENT:
+   case HC_IRQ_7_9_EVENT:
+      which = HC_RENDER_EVENT;       hpos = Timings.RenderPos;      break;
+   case HC_RENDER_EVENT:
+   case HC_IRQ_9_A_EVENT:
+      which = HC_WRAM_REFRESH_EVENT; hpos = Timings.WRAMRefreshPos; break;
+   case HC_WRAM_REFRESH_EVENT:
+   case HC_IRQ_A_1_EVENT:
+      which = HC_HBLANK_START_EVENT; hpos = Timings.HBlankStart;    break;
    }
 
-   if (PPU.HTimerEnabled &&
-         (int32_t) PPU.HTimerPosition < max && (int32_t) PPU.HTimerPosition > CPU.NextEvent &&
-         (!PPU.VTimerEnabled || (PPU.VTimerEnabled && CPU.V_Counter == PPU.IRQVBeamPos)))
+   /* Timer due before the event just chosen? Take its slot. */
+   if (((int32_t) PPU.HTimerPosition > CPU.NextEvent) && ((int32_t) PPU.HTimerPosition < hpos))
    {
-      which = (int32_t) PPU.HTimerPosition < Settings.HBlankStart ? HTIMER_BEFORE_EVENT : HTIMER_AFTER_EVENT;
-      max = PPU.HTimerPosition;
+      hpos = (int32_t) PPU.HTimerPosition;
+
+      switch (which)
+      {
+      case HC_HDMA_START_EVENT:   which = HC_IRQ_1_3_EVENT; break;
+      case HC_HCOUNTER_MAX_EVENT: which = HC_IRQ_3_5_EVENT; break;
+      case HC_HDMA_INIT_EVENT:    which = HC_IRQ_5_7_EVENT; break;
+      case HC_RENDER_EVENT:       which = HC_IRQ_7_9_EVENT; break;
+      case HC_WRAM_REFRESH_EVENT: which = HC_IRQ_9_A_EVENT; break;
+      case HC_HBLANK_START_EVENT: which = HC_IRQ_A_1_EVENT; break;
+      }
    }
-   CPU.NextEvent = max;
+
+   CPU.NextEvent  = hpos;
    CPU.WhichEvent = which;
 }
 #endif

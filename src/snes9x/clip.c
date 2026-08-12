@@ -6,6 +6,14 @@
 #include "memmap.h"
 #include "ppu.h"
 
+/* Recomputed whenever the window registers change and on every line that uses
+   them; on the Pico it belongs in RAM rather than XIP flash. */
+#ifdef PICO_ON_DEVICE
+#define CLIP_HOT __attribute__((hot, section(".time_critical.clip")))
+#else
+#define CLIP_HOT
+#endif
+
 typedef struct
 {
    uint32_t Left;
@@ -36,7 +44,7 @@ static int BandCompare(const void* d1, const void* d2)
    return ((Band*) d1)->Left  - ((Band*) d2)->Left;
 }
 
-void ComputeClipWindows()
+CLIP_HOT void ComputeClipWindows()
 {
    ClipData* pClip = &IPPU.Clip [0];
    int32_t c, w, i;

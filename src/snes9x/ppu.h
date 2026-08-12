@@ -172,6 +172,7 @@ typedef struct
    uint8_t  BGnxOFSbyte;
    uint8_t  OpenBus1;
    uint8_t  OpenBus2;
+   uint16_t VRAMReadBuffer; /* $2139/$213a prefetch latch */
 } SPPU;
 
 #define CLIP_OR 0
@@ -190,19 +191,28 @@ typedef struct
    uint16_t Address;
    uint8_t  BAddress;
 
-   /* General DMA only: */
-   uint16_t TransferBytes;
+   /* $43x5/$43x6 is ONE register pair. The general-DMA byte count and the
+      H-DMA indirect address are the same storage on hardware, so an H-DMA on
+      a channel clobbers that channel's pending DMA length and vice versa.
+      1.43 kept them in separate fields, which let a DMA transfer more bytes
+      than the hardware would - Syndicate's VRAM fill ran past its end. */
+   union
+   {
+      uint16_t TransferBytes;   /* general DMA */
+      uint16_t IndirectAddress; /* H-DMA */
+   };
 
    /* H-DMA only: */
    bool     HDMAIndirectAddressing;
-   uint16_t IndirectAddress;
    uint8_t  IndirectBank;
    bool     Repeat;
    uint8_t  LineCount;
    bool     FirstLine;
+   bool     DoTransfer; /* does this channel transfer on the coming line? */
 } SDMA;
 
 void S9xUpdateScreen(void);
+void S9xUpdateIRQPositions(bool initial);
 void S9xResetPPU(void);
 void S9xSoftResetPPU(void);
 void S9xFixColourBrightness();
@@ -494,13 +504,36 @@ static INLINE void REGISTER_2180(uint8_t Byte)
    Memory.FillRAM [0x2180] = Byte;
 }
 
+/* The VRAM read port is prefetched: $2139/$213a hand back a latch that was
+ * filled by the PREVIOUS access, and refilling it is what advances the
+ * address. 1.43 recomputed "the address minus one" with a FirstVRAMRead flag,
+ * which gets the off-by-one right only some of the time. */
+static INLINE void S9xUpdateVRAMReadBuffer(void)
+{
+   if (PPU.VMA.FullGraphicCount)
+   {
+      uint32_t addr = PPU.VMA.Address;
+      uint32_t rem  = addr & PPU.VMA.Mask1;
+      uint32_t address = (addr & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) +
+                         ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3);
+      PPU.VRAMReadBuffer = Memory.VRAM[(address << 1) & 0xffff] |
+                           (Memory.VRAM[((address << 1) + 1) & 0xffff] << 8);
+   }
+   else
+      PPU.VRAMReadBuffer = Memory.VRAM[(PPU.VMA.Address << 1) & 0xffff] |
+                           (Memory.VRAM[((PPU.VMA.Address << 1) + 1) & 0xffff] << 8);
+}
+
 static INLINE uint8_t REGISTER_4212(void)
 {
    uint8_t GetBank = 0;
    if (CPU.V_Counter >= PPU.ScreenHeight + FIRST_VISIBLE_LINE && CPU.V_Counter < PPU.ScreenHeight + FIRST_VISIBLE_LINE + 3)
       GetBank = 1;
 
-   GetBank |= CPU.Cycles >= Settings.HBlankStart ? 0x40 : 0;
+   /* HBlank spans the end of one line and the start of the next: the flag is
+      still set until HBlankEnd (H=1) before it falls for the visible span. */
+   if (CPU.Cycles < Timings.HBlankEnd || CPU.Cycles >= Timings.HBlankStart)
+      GetBank |= 0x40;
    if (CPU.V_Counter >= PPU.ScreenHeight + FIRST_VISIBLE_LINE)
       GetBank |= 0x80; /* XXX: 0x80 or 0xc0 ? */
 

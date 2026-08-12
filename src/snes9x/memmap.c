@@ -1637,9 +1637,12 @@ void ApplyROMFixes(void)
    /* Specific game fixes */
    Settings.StarfoxHack = match_na("STAR FOX") || match_na("STAR WING");
    Settings.WinterGold = match_na("FX SKIING NINTENDO 96") || match_na("DIRT RACER") || Settings.StarfoxHack;
-   Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
-
-   /* CPU timing hacks */
+   /* CPU timing hacks.
+    *
+    * HBlankStart used to be computed HERE, from the PREVIOUS ROM's H_Max, and
+    * only then was H_Max assigned - so it never tracked any of the per-game
+    * stretches below and sat at a constant 1026. It is now derived after
+    * H_Max, once, at the end of this block. */
    Settings.H_Max = (SNES_CYCLES_PER_SCANLINE * Settings.CyclesPercentage) / 100;
 
    /* A Couple of HDMA related hacks - Lantus */
@@ -1684,6 +1687,23 @@ void ApplyROMFixes(void)
    else if (strncmp(Memory.ROMId, "A9D", 3) == 0 && Settings.CyclesPercentage == 100)
       Settings.H_Max = (SNES_CYCLES_PER_SCANLINE * 110) / 100;
 
+   Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
+
+   S9xInitTimings();
+
+   /* Select the APU clock ratio for this ROM's region.
+    *
+    * ratio_numerator is statically initialised to the NTSC value with a
+    * comment promising S9xAPUTimingSetSpeedup would fix it up - and nothing
+    * ever called it. Every PAL game therefore clocked its SPC700 at the NTSC
+    * rate, 0.91% slow, so the timer-paced sound driver got fewer ticks per
+    * frame than the game expected and silently skipped work. snes9x 1.6x
+    * makes this same call from its own InitROM, which is why its audio is
+    * clean. Only the blargg SPC700 (SOUND_CORE=ACCURATE) uses this ratio. */
+#ifdef USE_BLARGG_APU
+   S9xAPUTimingSetSpeedup(0);
+#endif
+
    /* Other */
 
    /* Additional game fixes by sanmaiwashi ... */
@@ -1693,5 +1713,19 @@ void ApplyROMFixes(void)
       bytes0x2000 [0xb18] = 0x4c;
       bytes0x2000 [0xb19] = 0x4b;
       bytes0x2000 [0xb1a] = 0xea;
+   }
+
+   {
+      /* Battery-backed SRAM powers up in an indeterminate state; snes9x's
+         convention is 0x60, and titles that probe for a blank save depend on
+         it. 1.43 left the calloc'd zeros, so the very first SRAM read differed
+         from the accurate core. A few games want 0x00 instead. */
+      uint8_t sram_init = 0x60;
+
+      if (Settings.SETA || match_na("S.F.S.95 della SerieA") ||
+          match_id("AACJ") || match_na("goemon 4"))
+         sram_init = 0x00;
+
+      memset(Memory.SRAM, sram_init, 0x20000);
    }
 }

@@ -153,6 +153,9 @@ static INLINE void A_ASL16(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    ICPU._Carry = (ICPU.Registers.AH & 0x80) != 0;
    ICPU.Registers.A.W <<= 1;
@@ -163,6 +166,9 @@ static INLINE void A_ASL8(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    ICPU._Carry = (ICPU.Registers.AL & 0x80) != 0;
    ICPU.Registers.AL <<= 1;
@@ -174,6 +180,9 @@ static INLINE void ASL16(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = S9xGetWord(OpAddress);
    ICPU._Carry = (Work16 & 0x8000) != 0;
@@ -188,6 +197,9 @@ static INLINE void ASL8(void)
    uint8_t Work8;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work8 = S9xGetByte(OpAddress);
    ICPU._Carry = (Work8 & 0x80) != 0;
@@ -258,6 +270,9 @@ static INLINE void A_DEC16(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    ICPU.Registers.A.W--;
@@ -268,6 +283,9 @@ static INLINE void A_DEC8(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    ICPU.Registers.AL--;
@@ -279,6 +297,9 @@ static INLINE void DEC16(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    Work16 = S9xGetWord(OpAddress) - 1;
@@ -292,6 +313,9 @@ static INLINE void DEC8(void)
    uint8_t Work8;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    Work8 = S9xGetByte(OpAddress) - 1;
@@ -315,6 +339,9 @@ static INLINE void A_INC16(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    ICPU.Registers.A.W++;
@@ -325,6 +352,9 @@ static INLINE void A_INC8(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    ICPU.Registers.AL++;
@@ -336,6 +366,9 @@ static INLINE void INC16(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    Work16 = S9xGetWord(OpAddress) + 1;
@@ -349,6 +382,9 @@ static INLINE void INC8(void)
    uint8_t Work8;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.WaitAddress = NULL;
    Work8 = S9xGetByte(OpAddress) + 1;
@@ -396,6 +432,9 @@ static INLINE void A_LSR16(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    ICPU._Carry = ICPU.Registers.AL & 1;
    ICPU.Registers.A.W >>= 1;
@@ -406,6 +445,9 @@ static INLINE void A_LSR8(void)
 {
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    ICPU._Carry = ICPU.Registers.AL & 1;
    ICPU.Registers.AL >>= 1;
@@ -417,6 +459,9 @@ static INLINE void LSR16(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = S9xGetWord(OpAddress);
    ICPU._Carry = Work16 & 1;
@@ -431,6 +476,9 @@ static INLINE void LSR8(void)
    uint8_t Work8;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work8 = S9xGetByte(OpAddress);
    ICPU._Carry = Work8 & 1;
@@ -456,6 +504,9 @@ static INLINE void A_ROL16(void)
    uint32_t Work32;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work32 = (ICPU.Registers.A.W << 1) | CheckCarry();
    ICPU._Carry = Work32 > 0xffff;
@@ -468,6 +519,9 @@ static INLINE void A_ROL8(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = ICPU.Registers.AL;
    Work16 <<= 1;
@@ -482,6 +536,9 @@ static INLINE void ROL16(void)
    uint32_t Work32;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work32 = S9xGetWord(OpAddress);
    Work32 <<= 1;
@@ -497,6 +554,9 @@ static INLINE void ROL8(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = S9xGetByte(OpAddress);
    Work16 <<= 1;
@@ -511,6 +571,9 @@ static INLINE void A_ROR16(void)
    uint32_t Work32;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work32 = ICPU.Registers.A.W;
    Work32 |= (int32_t) CheckCarry() << 16;
@@ -525,6 +588,9 @@ static INLINE void A_ROR8(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = ICPU.Registers.AL | ((uint16_t) CheckCarry() << 8);
    ICPU._Carry = (uint8_t) Work16 & 1;
@@ -538,6 +604,9 @@ static INLINE void ROR16(void)
    uint32_t Work32;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work32 = S9xGetWord(OpAddress);
    Work32 |= (int32_t) CheckCarry() << 16;
@@ -553,6 +622,9 @@ static INLINE void ROR8(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = S9xGetByte(OpAddress);
    Work16 |= (int32_t) CheckCarry() << 8;
@@ -715,6 +787,9 @@ static INLINE void TSB16(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = S9xGetWord(OpAddress);
    ICPU._Zero = (Work16 & ICPU.Registers.A.W) != 0;
@@ -728,6 +803,9 @@ static INLINE void TSB8(void)
    uint8_t Work8;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work8 = S9xGetByte(OpAddress);
    ICPU._Zero = Work8 & ICPU.Registers.AL;
@@ -740,6 +818,9 @@ static INLINE void TRB16(void)
    uint16_t Work16;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work16 = S9xGetWord(OpAddress);
    ICPU._Zero = (Work16 & ICPU.Registers.A.W) != 0;
@@ -753,6 +834,9 @@ static INLINE void TRB8(void)
    uint8_t Work8;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    Work8 = S9xGetByte(OpAddress);
    ICPU._Zero = Work8 & ICPU.Registers.AL;

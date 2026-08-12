@@ -1075,15 +1075,29 @@ bool settings_save(void) {
 extern void set_frameskip_level(uint8_t level);
 
 /* snes9x globals for audio settings */
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* The 1.6x headers are C++ and this file has out-of-order designated
+   initializers that C++ rejects, so it stays C and goes through the
+   façade. */
+#include "s9x16_api.h"
+#else
 #include "snes9x/snes9x.h"
+#endif
 
 void settings_apply_runtime(void) {
     set_frameskip_level(g_settings.frameskip);
 
     /* Audio settings */
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* Echo and interpolation are not switches on this core: the accurate
+       S-DSP always does both, the way the hardware does. Only mute is a
+       real front-end choice. */
+    s9x16_set_mute(g_settings.volume == 0);
+#else
     Settings.DisableSoundEcho = !g_settings.echo_enabled;
     Settings.InterpolatedSound = g_settings.interpolation;
     Settings.Mute = (g_settings.volume == 0);
+#endif
 
     /* Emulation: SNES Mouse — enabled only while a real mouse is connected
      * AND the user hasn't explicitly forced the port to OFF. Some games
@@ -1094,10 +1108,15 @@ void settings_apply_runtime(void) {
      * Port routing (1 or 2) is handled inside the PPU via Settings.MousePort. */
     bool mouse_on = settings_mouse_connected() &&
                     (g_settings.mouse_port != MOUSE_PORT_OFF);
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    s9x16_set_mouse(mouse_on,
+                    (g_settings.mouse_port == MOUSE_PORT_1) ? 0 : 1);
+#else
     Settings.Mouse = mouse_on;
     Settings.MouseMaster = mouse_on;
     Settings.MousePort = (g_settings.mouse_port == MOUSE_PORT_1) ? 0 : 1;
     Settings.ControllerOption = mouse_on ? SNES_MOUSE : SNES_JOYPAD;
+#endif
 
     /* CRT effect */
     graphics_set_crt_active(g_settings.crt_effect);

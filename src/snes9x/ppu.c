@@ -45,61 +45,183 @@ void S9xLatchCounters(bool force)
       return;
 
    PPU.VBeamPosLatched = (uint16_t) CPU.V_Counter;
-   PPU.HBeamPosLatched = (uint16_t)((CPU.Cycles * SNES_HCOUNTER_MAX) / Settings.H_Max);
+   PPU.HBeamPosLatched = (uint16_t)((CPU.Cycles * SNES_HCOUNTER_MAX) / Timings.H_Max);
 
    Memory.FillRAM [0x213F] |= 0x40;
 }
 
 void S9xUpdateJustifiers();
 
-void S9xUpdateHTimer()
+/* Give up the IRQ slot: restore the base event this timer had displaced. */
+static void S9xTimerSlotRelease(void)
 {
-   if (PPU.HTimerEnabled)
+   switch (CPU.WhichEvent)
    {
-      PPU.HTimerPosition = PPU.IRQHBeamPos * Settings.H_Max / SNES_HCOUNTER_MAX;
-      if (PPU.HTimerPosition == Settings.H_Max || PPU.HTimerPosition == Settings.HBlankStart)
-         PPU.HTimerPosition--;
+   case HC_IRQ_1_3_EVENT:
+      CPU.WhichEvent = HC_HDMA_START_EVENT;   CPU.NextEvent = Timings.HDMAStart;      break;
+   case HC_IRQ_3_5_EVENT:
+      CPU.WhichEvent = HC_HCOUNTER_MAX_EVENT; CPU.NextEvent = Timings.H_Max;          break;
+   case HC_IRQ_5_7_EVENT:
+      CPU.WhichEvent = HC_HDMA_INIT_EVENT;    CPU.NextEvent = Timings.HDMAInit;       break;
+   case HC_IRQ_7_9_EVENT:
+      CPU.WhichEvent = HC_RENDER_EVENT;       CPU.NextEvent = Timings.RenderPos;      break;
+   case HC_IRQ_9_A_EVENT:
+      CPU.WhichEvent = HC_WRAM_REFRESH_EVENT; CPU.NextEvent = Timings.WRAMRefreshPos; break;
+   case HC_IRQ_A_1_EVENT:
+      CPU.WhichEvent = HC_HBLANK_START_EVENT; CPU.NextEvent = Timings.HBlankStart;    break;
+   }
+}
 
-      if (!PPU.VTimerEnabled || CPU.V_Counter == PPU.IRQVBeamPos)
+/* Take the slot of the base event that is now due after the timer. */
+static void S9xTimerSlotClaim(void)
+{
+   switch (CPU.WhichEvent)
+   {
+   case HC_HDMA_START_EVENT:   CPU.WhichEvent = HC_IRQ_1_3_EVENT; break;
+   case HC_HCOUNTER_MAX_EVENT: CPU.WhichEvent = HC_IRQ_3_5_EVENT; break;
+   case HC_HDMA_INIT_EVENT:    CPU.WhichEvent = HC_IRQ_5_7_EVENT; break;
+   case HC_RENDER_EVENT:       CPU.WhichEvent = HC_IRQ_7_9_EVENT; break;
+   case HC_WRAM_REFRESH_EVENT: CPU.WhichEvent = HC_IRQ_9_A_EVENT; break;
+   case HC_HBLANK_START_EVENT: CPU.WhichEvent = HC_IRQ_A_1_EVENT; break;
+   }
+}
+
+static int32_t CyclesUntilNext(int32_t hc, int32_t vc)
+{
+   int32_t total = 0;
+   int32_t vpos  = (int32_t) CPU.V_Counter;
+
+   if (vc - vpos > 0)
+   {
+      total += (vc - vpos) * Timings.H_Max_Master;
+      if (vpos <= 240 && vc > 240 && Timings.InterlaceField && !IPPU.Interlace)
+         total -= ONE_DOT_CYCLE;
+   }
+   else
+   {
+      if (vc == vpos && hc > CPU.Cycles)
+         return hc;
+
+      total += (Timings.V_Max - vpos) * Timings.H_Max_Master;
+      if (vpos <= 240 && Timings.InterlaceField && !IPPU.Interlace)
+         total -= ONE_DOT_CYCLE;
+
+      total += vc * Timings.H_Max_Master;
+      if (vc > 240 && !Timings.InterlaceField && !IPPU.Interlace)
+         total -= ONE_DOT_CYCLE;
+   }
+
+   return total + hc;
+}
+
+/* Recompute where the next timer IRQ falls, as an absolute cycle position.
+ * Replaces raising the IRQ from the ring's IRQ_x_y events: the position and
+ * the dispatch that consumes it now come from the same model. */
+void S9xUpdateIRQPositions(bool initial)
+{
+   PPU.HTimerPosition  = PPU.IRQHBeamPos * ONE_DOT_CYCLE + Timings.IRQTriggerCycles;
+   PPU.HTimerPosition -= PPU.IRQHBeamPos ? 0 : ONE_DOT_CYCLE;
+   PPU.HTimerPosition += PPU.IRQHBeamPos > 322 ? (ONE_DOT_CYCLE / 2) : 0;
+   PPU.HTimerPosition += PPU.IRQHBeamPos > 326 ? (ONE_DOT_CYCLE / 2) : 0;
+   S9xVTimerPosition   = PPU.IRQVBeamPos;
+
+   if (PPU.VTimerEnabled && S9xVTimerPosition >= Timings.V_Max + (IPPU.Interlace ? 1 : 0))
+      Timings.NextIRQTimer = 0x0fffffff;
+   else if (!PPU.HTimerEnabled && !PPU.VTimerEnabled)
+      Timings.NextIRQTimer = 0x0fffffff;
+   else if (PPU.HTimerEnabled && !PPU.VTimerEnabled)
+   {
+      int32_t v_pos = (int32_t) CPU.V_Counter;
+
+      Timings.NextIRQTimer = PPU.HTimerPosition;
+      if (CPU.Cycles > Timings.NextIRQTimer - Timings.IRQTriggerCycles)
       {
-         if (PPU.HTimerPosition < CPU.Cycles)
-         {
-            /* Missed the IRQ on this line already */
-            if (CPU.WhichEvent == HBLANK_END_EVENT || CPU.WhichEvent == HTIMER_AFTER_EVENT)
-            {
-               CPU.WhichEvent = HBLANK_END_EVENT;
-               CPU.NextEvent = Settings.H_Max;
-            }
-            else
-            {
-               CPU.WhichEvent = HBLANK_START_EVENT;
-               CPU.NextEvent = Settings.HBlankStart;
-            }
-         }
-         else
-         {
-            if (CPU.WhichEvent == HTIMER_BEFORE_EVENT || CPU.WhichEvent == HBLANK_START_EVENT)
-            {
-               if (PPU.HTimerPosition > Settings.HBlankStart)
-               {
-                  /* HTimer was to trigger before h-blank start, now triggers after start of h-blank */
-                  CPU.NextEvent = Settings.HBlankStart;
-                  CPU.WhichEvent = HBLANK_START_EVENT;
-               }
-               else
-               {
-                  CPU.NextEvent = PPU.HTimerPosition;
-                  CPU.WhichEvent = HTIMER_BEFORE_EVENT;
-               }
-            }
-            else
-            {
-               CPU.WhichEvent = HTIMER_AFTER_EVENT;
-               CPU.NextEvent = PPU.HTimerPosition;
-            }
-         }
+         Timings.NextIRQTimer += Timings.H_Max;
+         v_pos++;
+      }
+
+      if (v_pos == 240 && Timings.InterlaceField && !IPPU.Interlace)
+      {
+         Timings.NextIRQTimer -= PPU.IRQHBeamPos <= 322 ? ONE_DOT_CYCLE / 2 : 0;
+         Timings.NextIRQTimer -= PPU.IRQHBeamPos <= 326 ? ONE_DOT_CYCLE / 2 : 0;
       }
    }
+   else if (!PPU.HTimerEnabled && PPU.VTimerEnabled)
+   {
+      if ((int32_t) CPU.V_Counter == S9xVTimerPosition && initial)
+         Timings.NextIRQTimer = CPU.Cycles + Timings.IRQTriggerCycles - ONE_DOT_CYCLE;
+      else
+         Timings.NextIRQTimer = CyclesUntilNext(Timings.IRQTriggerCycles - ONE_DOT_CYCLE,
+                                                S9xVTimerPosition);
+   }
+   else
+   {
+      int32_t field;
+
+      Timings.NextIRQTimer = CyclesUntilNext(PPU.HTimerPosition, S9xVTimerPosition);
+
+      field = Timings.InterlaceField ? 1 : 0;
+      if (S9xVTimerPosition < (int32_t) CPU.V_Counter ||
+          (S9xVTimerPosition == (int32_t) CPU.V_Counter && Timings.NextIRQTimer > Timings.H_Max))
+         field = !field;
+
+      if (S9xVTimerPosition == 240 && field && !IPPU.Interlace)
+      {
+         Timings.NextIRQTimer -= PPU.IRQHBeamPos <= 322 ? ONE_DOT_CYCLE / 2 : 0;
+         Timings.NextIRQTimer -= PPU.IRQHBeamPos <= 326 ? ONE_DOT_CYCLE / 2 : 0;
+      }
+   }
+}
+
+/* Recompute where the programmable H/V timer falls and re-place it in the
+ * event ring.
+ *
+ * The old version scaled IRQHBeamPos by H_Max/341, which drifted with every
+ * per-game H_Max stretch, and rewrote CPU.NextEvent and CPU.WhichEvent from
+ * five places using the two-event vocabulary. The position is now the hardware
+ * one - four master cycles per dot, plus the 24 cycles the IRQ takes to be
+ * recognised - and a V-only timer gets a real position (HC=20) instead of
+ * being raised from the register write. */
+void S9xUpdateHTimer(void)
+{
+   if (PPU.HTimerEnabled && PPU.IRQHBeamPos != 0)
+   {
+      PPU.HTimerPosition = PPU.IRQHBeamPos * ONE_DOT_CYCLE;
+
+      /* The last few dots of a full-length line are stretched. */
+      if (Timings.H_Max == Timings.H_Max_Master)
+      {
+         if (PPU.IRQHBeamPos > 322)
+            PPU.HTimerPosition += ONE_DOT_CYCLE_DIV_2;
+         if (PPU.IRQHBeamPos > 326)
+            PPU.HTimerPosition += ONE_DOT_CYCLE_DIV_2;
+      }
+
+      /* 14 to reach the comparator, 4 to assert /IRQ, 6 to be taken. */
+      PPU.HTimerPosition += 24;
+   }
+   else
+      PPU.HTimerPosition = 20;
+
+   S9xVTimerPosition = PPU.IRQVBeamPos;
+
+   if (PPU.HTimerPosition >= Timings.H_Max && PPU.IRQHBeamPos < 340)
+   {
+      PPU.HTimerPosition -= Timings.H_Max;
+      if (++S9xVTimerPosition >= Timings.V_Max)
+         S9xVTimerPosition = 0;
+   }
+
+   if (PPU.HTimerPosition < CPU.Cycles)
+      S9xTimerSlotRelease();
+   else if ((PPU.HTimerPosition < CPU.NextEvent) ||
+            (!(CPU.WhichEvent & 1) && PPU.HTimerPosition == CPU.NextEvent))
+   {
+      CPU.NextEvent = PPU.HTimerPosition;
+      S9xTimerSlotClaim();
+   }
+   else
+      S9xTimerSlotRelease();
 }
 
 void S9xFixColourBrightness() {
@@ -324,12 +446,12 @@ PPU_HOT void S9xSetPPU(uint8_t Byte, uint16_t Address)
       case 0x2116: /* VRAM read/write address (low) */
          PPU.VMA.Address &= 0xFF00;
          PPU.VMA.Address |= Byte;
-         IPPU.FirstVRAMRead = true;
+         S9xUpdateVRAMReadBuffer();
          break;
       case 0x2117: /* VRAM read/write address (high) */
          PPU.VMA.Address &= 0x00FF;
          PPU.VMA.Address |= Byte << 8;
-         IPPU.FirstVRAMRead = true;
+         S9xUpdateVRAMReadBuffer();
          break;
       case 0x2118: /* VRAM write data (low) */
          IPPU.FirstVRAMRead = true;
@@ -738,40 +860,21 @@ PPU_HOT uint8_t S9xGetPPU(uint16_t Address)
          PPU.OAMFlip ^= 1;
          return (PPU.OpenBus1 = byte);
       case 0x2139: /* Read vram low byte */
-         if (IPPU.FirstVRAMRead)
-            byte = Memory.VRAM[(PPU.VMA.Address << 1) & 0xffff];
-         else if (PPU.VMA.FullGraphicCount)
-         {
-            uint32_t addr = PPU.VMA.Address - 1;
-            uint32_t rem = addr & PPU.VMA.Mask1;
-            uint32_t address = (addr & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3);
-            byte = Memory.VRAM [((address << 1) - 2) & 0xffff];
-         }
-         else
-            byte = Memory.VRAM[((PPU.VMA.Address << 1) - 2) & 0xffff];
-
+         /* Hand back the latch the PREVIOUS access filled; refilling it is
+            what advances the address. */
+         byte = PPU.VRAMReadBuffer & 0xff;
          if (!PPU.VMA.High)
          {
+            S9xUpdateVRAMReadBuffer();
             PPU.VMA.Address += PPU.VMA.Increment;
-            IPPU.FirstVRAMRead = false;
          }
          return (PPU.OpenBus1 = byte);
       case 0x213A: /* Read vram high byte */
-         if (IPPU.FirstVRAMRead)
-            byte = Memory.VRAM[((PPU.VMA.Address << 1) + 1) & 0xffff];
-         else if (PPU.VMA.FullGraphicCount)
-         {
-            uint32_t addr = PPU.VMA.Address - 1;
-            uint32_t rem = addr & PPU.VMA.Mask1;
-            uint32_t address = (addr & ~PPU.VMA.Mask1) + (rem >> PPU.VMA.Shift) + ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3);
-            byte = Memory.VRAM [((address << 1) - 1) & 0xffff];
-         }
-         else
-            byte = Memory.VRAM[((PPU.VMA.Address << 1) - 1) & 0xffff];
+         byte = (PPU.VRAMReadBuffer >> 8) & 0xff;
          if (PPU.VMA.High)
          {
+            S9xUpdateVRAMReadBuffer();
             PPU.VMA.Address += PPU.VMA.Increment;
-            IPPU.FirstVRAMRead = false;
          }
          return (PPU.OpenBus1 = byte);
       case 0x213B: /* Read palette data */
@@ -948,35 +1051,20 @@ PPU_HOT void S9xSetCPU(uint8_t byte, uint16_t Address)
       switch (Address)
       {
       case 0x4200: /* NMI, V & H IRQ and joypad reading enable flags */
-         if (byte & 0x20)
-         {
-            if (!PPU.VTimerEnabled)
-            {
-               PPU.VTimerEnabled = true;
-               if (PPU.HTimerEnabled)
-                  S9xUpdateHTimer();
-               else if (PPU.IRQVBeamPos == CPU.V_Counter)
-                  S9xSetIRQ(PPU_V_BEAM_IRQ_SOURCE);
-            }
-         }
-         else
-            PPU.VTimerEnabled = false;
+         /* The timer's position is an absolute cycle deadline
+            (Timings.NextIRQTimer) tested by the main loop at every opcode
+            boundary, not an entry in the scanline event ring. A ring slot can
+            only fire where an event is scheduled, so a V-only timer had to be
+            rounded to HC=20 when hardware raises it at HC=10, and the IRQ was
+            taken one instruction late on every line the game used it. */
+         PPU.VTimerEnabled = (byte & 0x20) != 0;
+         PPU.HTimerEnabled = (byte & 0x10) != 0;
 
-         if (byte & 0x10)
-         {
-            if (!PPU.HTimerEnabled)
-            {
-               PPU.HTimerEnabled = true;
-               S9xUpdateHTimer();
-            }
-         }
-         else
-         {
-            /* No need to check for HTimer being disabled as the scanline
-               event trigger code won't trigger an H-IRQ unless its enabled. */
-            PPU.HTimerEnabled = false;
-            PPU.HTimerPosition = Settings.H_Max + 1;
-         }
+         if ((byte & 0x30) != (Memory.FillRAM [0x4200] & 0x30))
+            /* Only allow an instantaneous IRQ when turning the timers
+               completely on or completely off. */
+            S9xUpdateIRQPositions((byte & 0x30) == 0 ||
+                                  (Memory.FillRAM [0x4200] & 0x30) == 0);
          if (!(byte & 0x30))
             CLEAR_IRQ_SOURCE(PPU_V_BEAM_IRQ_SOURCE | PPU_H_BEAM_IRQ_SOURCE);
 
@@ -992,7 +1080,7 @@ PPU_HOT void S9xSetCPU(uint8_t byte, uint16_t Address)
          {
             CPU.Flags |= NMI_FLAG;
             CPU.NMIActive = true;
-            CPU.NMICycleCount = CPU.Cycles + TWO_CYCLES;
+            CPU.NMICycleCount = CPU.Cycles + ONE_CYCLE;
          }
          break;
       case 0x4201:
@@ -1045,40 +1133,37 @@ PPU_HOT void S9xSetCPU(uint8_t byte, uint16_t Address)
          d = PPU.IRQHBeamPos;
          PPU.IRQHBeamPos = (PPU.IRQHBeamPos & 0xFF00) | byte;
 
-         if (PPU.HTimerEnabled && PPU.IRQHBeamPos != d)
-            S9xUpdateHTimer();
+         if (PPU.IRQHBeamPos != d)
+            S9xUpdateIRQPositions(false);
          break;
       case 0x4208:
          d = PPU.IRQHBeamPos;
          PPU.IRQHBeamPos = (PPU.IRQHBeamPos & 0xFF) | ((byte & 1) << 8);
 
-         if (PPU.HTimerEnabled && PPU.IRQHBeamPos != d)
-            S9xUpdateHTimer();
-
+         if (PPU.IRQHBeamPos != d)
+            S9xUpdateIRQPositions(false);
          break;
       case 0x4209:
          d = PPU.IRQVBeamPos;
          PPU.IRQVBeamPos = (PPU.IRQVBeamPos & 0xFF00) | byte;
-         if (PPU.VTimerEnabled && PPU.IRQVBeamPos != d)
-         {
-            if (PPU.HTimerEnabled)
-               S9xUpdateHTimer();
-            else if (PPU.IRQVBeamPos == CPU.V_Counter)
-               S9xSetIRQ(PPU_V_BEAM_IRQ_SOURCE);
-         }
+         /* A V position change may make the timer due on THIS line, so the
+            recompute is the "initial" one that can trigger immediately. */
+         if (PPU.IRQVBeamPos != d)
+            S9xUpdateIRQPositions(true);
          break;
       case 0x420A:
          d = PPU.IRQVBeamPos;
          PPU.IRQVBeamPos = (PPU.IRQVBeamPos & 0xFF) | ((byte & 1) << 8);
-         if (PPU.VTimerEnabled && PPU.IRQVBeamPos != d)
-         {
-            if (PPU.HTimerEnabled)
-               S9xUpdateHTimer();
-            else if (PPU.IRQVBeamPos == CPU.V_Counter)
-               S9xSetIRQ(PPU_V_BEAM_IRQ_SOURCE);
-         }
+         if (PPU.IRQVBeamPos != d)
+            S9xUpdateIRQPositions(true);
          break;
       case 0x420B:
+         if (CPU.InDMA)
+            break;
+         /* The CPU is stopped and resynchronised to the DMA clock before the
+            first channel runs; this was never charged. */
+         if (byte != 0)
+            CPU.Cycles += Timings.DMACPUSync;
          if ((byte & 0x01) != 0)
             S9xDoDMA(0);
          if ((byte & 0x02) != 0)
@@ -1109,6 +1194,12 @@ PPU_HOT void S9xSetCPU(uint8_t byte, uint16_t Address)
                CPU.FastROMSpeed = SLOW_ONE_CYCLE;
 
             FixROMSpeed();
+            /* FixROMSpeed only rewrites Memory.MemorySpeed[]. CPU.MemSpeed -
+               what every opcode and operand fetch is charged - is refreshed
+               solely by S9xSetPCBase, so without this the core keeps paying
+               SlowROM for instruction fetches after the game switched to
+               FastROM. */
+            S9xSetPCBase(ICPU.ShiftedPB + (uint32_t)(CPU.PC - CPU.PCBase));
          }
          break;
       case 0x420e:
@@ -1712,7 +1803,7 @@ static void CommonPPUReset()
 
    PPU.VTimerEnabled = false;
    PPU.HTimerEnabled = false;
-   PPU.HTimerPosition = Settings.H_Max + 1;
+   PPU.HTimerPosition = 20;  /* disabled timers park at HDMAInit */
    PPU.Mosaic = 0;
    PPU.BGMosaic [0] = PPU.BGMosaic [1] = false;
    PPU.BGMosaic [2] = PPU.BGMosaic [3] = false;

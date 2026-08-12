@@ -23,6 +23,9 @@ static INLINE void Relative(void)
    int8_t Int8 = *CPU.PC++;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpAddress = ((int32_t)(CPU.PC - CPU.PCBase) + Int8) & 0xffff;
 }
@@ -36,6 +39,9 @@ static INLINE void RelativeLong(void)
 #endif
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2 + ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    CPU.PC += 2;
    OpAddress += (CPU.PC - CPU.PCBase);
@@ -51,6 +57,9 @@ static INLINE void AbsoluteIndexedIndirect(bool read)
 #endif
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpenBus = CPU.PC[1];
    CPU.PC += 2;
@@ -68,6 +77,9 @@ static INLINE void AbsoluteIndirectLong(bool read)
 #endif
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpenBus = CPU.PC[1];
    CPU.PC += 2;
@@ -86,6 +98,9 @@ static INLINE void AbsoluteIndirect(bool read)
 #endif
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpenBus = CPU.PC[1];
    CPU.PC += 2;
@@ -107,6 +122,9 @@ static INLINE void Absolute(bool read)
    CPU.PC += 2;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -127,6 +145,9 @@ static INLINE void AbsoluteLong(bool read)
    CPU.PC += 3;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2 + CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -137,6 +158,9 @@ static INLINE void Direct(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.D.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -146,6 +170,9 @@ static INLINE void DirectIndirectIndexed(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.D.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpAddress = S9xGetWord(OpAddress);
    if (read)
@@ -159,6 +186,9 @@ static INLINE void DirectIndirectIndexedLong(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.D.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    if (read)
       OpAddress = S9xGetWord(OpAddress) + ((OpenBus = S9xGetByte(OpAddress + 2)) << 16) + ICPU.Registers.Y.W;
@@ -172,6 +202,9 @@ static INLINE void DirectIndexedIndirect(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.D.W + ICPU.Registers.X.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpAddress = S9xGetWord(OpAddress);
    if (read)
@@ -179,6 +212,9 @@ static INLINE void DirectIndexedIndirect(bool read)
    OpAddress += ICPU.ShiftedDB;
 #ifndef SA1_OPCODES
    CPU.Cycles += ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -190,6 +226,9 @@ static INLINE void DirectIndexedX(bool read)
    OpAddress &= CheckEmulation() ? 0xff : 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed + ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -201,6 +240,9 @@ static INLINE void DirectIndexedY(bool read)
    OpAddress &= CheckEmulation() ? 0xff : 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed + ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -216,6 +258,9 @@ static INLINE void AbsoluteIndexedX(bool read)
    CPU.PC += 2;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -231,6 +276,9 @@ static INLINE void AbsoluteIndexedY(bool read)
    CPU.PC += 2;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeedx2;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -251,6 +299,9 @@ static INLINE void AbsoluteLongIndexedX(bool read)
    CPU.PC += 3;
 #ifndef SA1_OPCODES
     CPU.Cycles += CPU.MemSpeedx2 + CPU.MemSpeed;
+#ifndef SA1_OPCODES
+    S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -260,6 +311,9 @@ static INLINE void DirectIndirect(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.D.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpAddress = S9xGetWord(OpAddress);
    if (read)
@@ -273,6 +327,9 @@ static INLINE void DirectIndirectLong(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.D.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    if (read)
       OpAddress = S9xGetWord(OpAddress) + ((OpenBus = S9xGetByte(OpAddress + 2)) << 16);
@@ -287,6 +344,9 @@ static INLINE void StackRelative(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.S.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed + ONE_CYCLE;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
 }
 
@@ -296,6 +356,9 @@ static INLINE void StackRelativeIndirectIndexed(bool read)
    OpAddress = (*CPU.PC++ + ICPU.Registers.S.W) & 0xffff;
 #ifndef SA1_OPCODES
    CPU.Cycles += CPU.MemSpeed + TWO_CYCLES;
+#ifndef SA1_OPCODES
+   S9xDrainEvents();
+#endif
 #endif
    OpAddress = S9xGetWord(OpAddress);
    if (read)

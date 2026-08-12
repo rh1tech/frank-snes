@@ -18,14 +18,43 @@
 #include <string.h>
 #include <stdbool.h>
 
+
+/* main.c is compiled as C++ when CPU_CORE=S9X16, because the 1.6x core's
+ * headers are C++. Everything else this file talks to - the drivers, the
+ * UI, fatfs - is C, and those headers have no extern "C" guards of their
+ * own. Rather than churn a dozen shared headers, the C includes are
+ * wrapped here. */
+#ifdef __cplusplus
+#define FRANK_C_BEGIN extern "C" {
+#define FRANK_C_END   }
+#else
+#define FRANK_C_BEGIN
+#define FRANK_C_END
+#endif
+
+FRANK_C_BEGIN
 #include "board_config.h"
 #include "HDMI.h"
 // USB CDC serial used for debug output (dev builds only)
 #include "psram_init.h"
 #include "psram_allocator.h"
 #include "ff.h"
+FRANK_C_END
 
 // Snes9x includes
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* The 1.6x core. These headers are C++ — this file is compiled as C++ when
+ * CPU_CORE=S9X16 for exactly that reason. soundux.h and srtc.h have no
+ * counterpart: the block mixer and the S-RTC are 1.43-only. */
+#include "snes9x.h"
+#include "memmap.h"
+#include "apu/apu.h"
+#include "display.h"
+#include "gfx.h"
+#include "cpuexec.h"
+#include "ppu.h"
+#include "s9x16_api.h"
+#else
 #include "snes9x/snes9x.h"
 #include "snes9x/soundux.h"
 #include "snes9x/memmap.h"
@@ -34,6 +63,7 @@
 #include "snes9x/gfx.h"
 #include "snes9x/cpuexec.h"
 #include "snes9x/srtc.h"
+#endif
 
 /*
  * APU RAM and the DSP register file, wherever the built sound core keeps
@@ -48,13 +78,25 @@
 #include "snes9x/spc_dsp.h"
 #define DIAG_APU_RAM   spc_apuram()
 #define DIAG_DSP_REGS  spc_dsp_regs()
+#elif defined(FRANK_SNES_CPU_CORE_S9X16)
+/* bapu keeps APU RAM and the DSP register file inside SNES::smp / SNES::dsp
+ * rather than in the flat IAPU/APU globals the 1.43 core exposed. The two
+ * diagnostics that used these are 1.43-only; NULL makes any attempt to use
+ * them fail loudly instead of fingerprinting whatever happens to be at
+ * address zero. */
+#define DIAG_APU_RAM   ((const uint8_t *)NULL)
+#define DIAG_DSP_REGS  ((const uint8_t *)NULL)
 #else
 #define DIAG_APU_RAM   IAPU.RAM
 #define DIAG_DSP_REGS  APU.DSP
 #endif
 
+FRANK_C_BEGIN
+
 // APU on Core 1
+#ifndef FRANK_SNES_CPU_CORE_S9X16
 #include "snes9x/apu_core1.h"
+#endif
 #ifdef C2_SOUND_LINK
 /* C2 only: hand the frame's sound work to the slave. Defined in
  * src/sound_backend_link.c. */
@@ -90,6 +132,16 @@ extern void hdmi_alt_run_core1(void);
 #ifdef FRANK_SNES_PROFILE
 #include "frank_snes_profile.h"
 #endif
+
+/* Defined in the C drivers. Declared here rather than in a function body
+   because an extern "C" block cannot be opened at block scope. */
+extern volatile bool g_palette_needs_update;
+extern volatile uint32_t dsp_log_frame;
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+void S9xPushPaletteToDisplay(void);
+#endif
+
+FRANK_C_END
 
 //=============================================================================
 // Configuration
@@ -141,17 +193,31 @@ extern void hdmi_alt_run_core1(void);
  * Clamped because soundux mixes into SOUND_BUFFER_SIZE (2133 stereo
  * entries), so no more than 1066 sample frames can be asked for at once.
  */
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* No H_Max stretching on this core, so a frame is never longer than the
+   nominal PAL count. The 1066 below exists only for the 1.43 core's
+   per-game scanline stretch. */
+#define AUDIO_FRAME_SAMPLES_MAX  704u
+#else
 #define AUDIO_FRAME_SAMPLES_MAX  1066u
+#endif
 #define AUDIO_FRAME_SAMPLES_BASE (Settings.PAL ? AUDIO_FRAME_SAMPLES_PAL \
                                                : AUDIO_FRAME_SAMPLES_NTSC)
 static inline uint32_t audio_frame_samples(void)
 {
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* No H_Max to scale by: the 1.6x core charges cycles inside the memory
+     * accessors, so a scanline is a scanline and there is no per-game
+     * stretch factor to compensate for. The nominal count is the count. */
+    return AUDIO_FRAME_SAMPLES_BASE;
+#else
     uint32_t n = (uint32_t)(((uint64_t)AUDIO_FRAME_SAMPLES_BASE *
                              (uint32_t)Settings.H_Max +
                              (SNES_CYCLES_PER_SCANLINE / 2u)) /
                             SNES_CYCLES_PER_SCANLINE);
     if (n > AUDIO_FRAME_SAMPLES_MAX) n = AUDIO_FRAME_SAMPLES_MAX;
     return n;
+#endif
 }
 #define AUDIO_FRAME_SAMPLES      audio_frame_samples()
 
@@ -161,8 +227,12 @@ static inline uint32_t audio_frame_samples(void)
 
 // Screen buffers - 256x224 8-bit palette-indexed (HDMI driver maps index to color)
 uint8_t __attribute__((aligned(4))) SCREEN[2][SNES_WIDTH * SNES_HEIGHT];
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* The 1.6x core allocates its own depth buffers in S9xGraphicsInit. */
+#else
 static uint8_t __attribute__((aligned(4))) ZBuffer[SNES_WIDTH * SNES_HEIGHT];
 static uint8_t __attribute__((aligned(4))) SubZBuffer[SNES_WIDTH * SNES_HEIGHT];
+#endif
 
 // Separate sub-screen buffer for transparency.  Lives in the PSRAM
 // scratch region (first 512 KB, reserved by psram_allocator and not
@@ -180,6 +250,38 @@ static uint8_t __attribute__((aligned(4))) SubZBuffer[SNES_WIDTH * SNES_HEIGHT];
 // second launch.
 #define SUB_SCREEN_OFFSET (256 * 1024)  /* into 512 KB scratch region */
 static uint8_t *SubScreenBuffer = (uint8_t *)(0x11000000 + SUB_SCREEN_OFFSET);
+
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* The 1.6x tile renderer writes 16-bit pixels and cannot be talked out of
+ * it without rewriting tile.c, so it renders into its own buffer and the
+ * frame is narrowed to the 8-bit indices the HDMI driver scans out. With
+ * FRANK_SNES_INDEXED_SCREEN those 16-bit values are already CGRAM indices,
+ * so "narrowing" is a truncation and not a colour lookup.
+ *
+ * These live in PSRAM: 224 KB of framebuffer does not fit in SRAM beside
+ * the core. That puts the renderer's pixel writes on the PSRAM bus, which
+ * is the one cost of this arrangement worth measuring.
+ */
+#define SCREEN16_PIXELS   (SNES_WIDTH * SNES_HEIGHT)
+
+/* The core allocates its own framebuffers in S9xGraphicsInit (in PSRAM,
+ * at native size), so there is nothing for the front end to place. This
+ * used to allocate them here at fixed offsets in the 512 KB scratch
+ * region - which is already carved into a decompression buffer, a
+ * conversion buffer and a 256 KB file-load buffer, and writing over all
+ * three is what locked the first build up. */
+
+/* 256x224 truncations per frame. Kept in one place so the cost is visible
+ * and so the loop can be replaced wholesale if it shows up in a profile. */
+static void screen16_to_indexed(uint8_t *dst)
+{
+    const uint16_t *src = (const uint16_t *)GFX.Screen;
+    if (!src)
+        return;
+    for (uint32_t i = 0; i < SCREEN16_PIXELS; i++)
+        dst[i] = (uint8_t)src[i];
+}
+#endif
 
 // Current display buffer (double buffering) - accessed by HDMI driver
 volatile uint32_t current_buffer = 0;
@@ -222,6 +324,8 @@ static uint32_t __attribute__((aligned(32))) audio_packed_discard[AUDIO_BUFFER_L
  * the song, an underrun fades it to silence and back. Both are common
  * to every sound core and every board, which is why they survived
  * replacing the mixer. */
+static uint64_t g_ship_emul_sum = 0;
+static uint32_t g_ship_emul_n = 0;
 static uint32_t g_render_cost_us = 4000;   /* estimated cost of rendering  */
 static uint32_t g_emu_only_us   = 8000;   /* cost of a skipped-render frame */
 volatile uint32_t audio_discards;
@@ -289,7 +393,11 @@ volatile uint32_t audio_underruns;
  * is covered by resampling audio that was really produced. Emulator state
  * is never advanced by the audio clock.
  */
-#ifdef FRANK_SNES_FAST_MODE
+#if defined(FRANK_SNES_CPU_CORE_S9X16)
+/* The 1.6x S-DSP writes stereo and offers no mono path, so FAST_MODE's
+   half-rate trick does not apply to it. */
+#define AUDIO_CH 2
+#elif defined(FRANK_SNES_FAST_MODE)
 #define AUDIO_CH 1                  /* S9xMixSamplesMono output */
 #else
 #define AUDIO_CH 2
@@ -297,7 +405,9 @@ volatile uint32_t audio_underruns;
 /* Buffer depth decides how long an fps dip can last before the resampler
  * has to stretch hard enough to be audible. M1 has almost no SRAM spare,
  * so only the larger boards get the deeper FIFO. */
-#ifdef BOARD_C2
+#if defined(BOARD_C2) && !defined(FRANK_SNES_CPU_CORE_S9X16)
+#define SFIFO_CHUNKS 8
+#elif defined(BOARD_C2)
 #define SFIFO_CHUNKS 8
 #else
 #define SFIFO_CHUNKS 4
@@ -375,14 +485,29 @@ volatile uint32_t  diag_kon_total;
 volatile uint32_t  diag_silent_run;   /* consecutive all-zero chunks    */
 volatile uint32_t  diag_tripped;      /* 1 once the snapshot is taken   */
 volatile uint8_t  *diag_apuram_snap;  /* 64 KB copy of APU RAM          */
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* Diagnostics from the 1.43 sound investigation. The 1.6x core needs the
+   SRAM for APU RAM; these are kept as one-element stubs so the code that
+   references them still builds. */
+volatile uint8_t   diag_ram_head[1];
+volatile uint8_t   diag_dsp_snap[1];
+#else
 volatile uint8_t   diag_ram_head[0x800]; /* zero page + directory, SRAM */
 volatile uint8_t   diag_dsp_snap[128];
+#endif
 
 /* Every SPC700 write into the sample directory, so a directory entry
  * found half-written can be traced to either a lost write (the store
  * happened, the memory did not keep it) or a write that never issued. */
 typedef struct { uint32_t seq, addr; uint8_t val; } dirw_rec_t;
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+/* A DSP-write trace ring, 6 KB of SRAM. The 1.6x core needs that space for
+   APU RAM, which is on every SPC700 instruction's path; this only matters
+   when the DSP-write diagnostic is being read. */
+#define DIRW_RING 16
+#else
 #define DIRW_RING 512
+#endif
 volatile dirw_rec_t diag_dirw[DIRW_RING];
 volatile uint32_t   diag_dirw_wr, diag_dirw_total;
 
@@ -499,6 +624,63 @@ static void __no_inline_not_in_flash_func(set_flash_timings)(int cpu_mhz, int fl
 //=============================================================================
 #define LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
 
+/* Telemetry the debug probe can read while the board runs.
+ *
+ * C2 has no usable console (USB is the HID host, and the UART header reads as
+ * garbage through the probe) and OpenOCD cannot halt this firmware, so the
+ * only way to get numbers off the board is to read them out of RAM with a
+ * mem_ap target. Deliberately NOT static: it has to appear in the symbol
+ * table for the probe to find it. Update it last in the report block and bump
+ * seq around the write so a reader can tell it caught a torn sample. */
+typedef struct {
+    uint32_t magic;        /* 0x4B4E5246 = "FRNK" */
+    uint32_t seq;          /* odd while being written */
+    uint32_t emu_fps;
+    uint32_t rend_fps;
+    uint32_t skip_fps;
+    uint32_t avg_emul_us;
+    uint32_t max_emul_us;
+    uint32_t avg_mix_us;
+    uint32_t avg_pack_us;
+    uint32_t avg_upd_us;   /* S9xUpdateScreen  */
+    uint32_t avg_rs_us;    /* RenderScreen     */
+    uint32_t avg_zclear_us;
+    uint32_t avg_colormath_us;
+    uint32_t avg_scale_us;
+    uint32_t avg_obj_us;
+    uint32_t avg_bg0_us;
+    uint32_t instr_per_frame;
+    uint32_t events_per_frame;
+    uint32_t event_us_per_frame;
+    uint32_t ev_us_type[7];
+    uint32_t ev_n_type[7];
+    uint32_t hdma_bytes_per_frame;
+    uint32_t hdma_chan_per_frame;
+    uint32_t hdma_calls_per_frame;
+    uint32_t getmemptr_per_frame;
+    /* Renderer breakdown, us PER FRAME (not per call, so it is directly
+       comparable with avg_emul_us). Index order in rend_us_name[] below. */
+    uint32_t rend_us[15];
+    /* Always-on frame budget, ship builds included. The profiling build's
+       per-event timers inflate everything measured inside an event (~3x on
+       event_us), so any frame-budget claim must come from these instead. */
+    uint32_t ship_emul_us;         /* avg us inside S9xMainLoop, all frames */
+    uint32_t ship_emu_only_us;     /* last skipped frame: emulation without render */
+    uint32_t ship_render_cost_us;  /* rolling estimate of what rendering adds */
+    uint32_t ship_mainloop_calls;  /* S9xMainLoop entries per frame x100 */
+    uint32_t ship_upd_us;          /* S9xUpdateScreen total, us/frame */
+    uint32_t ship_rs_us;           /* RenderScreen total, us/frame */
+    uint32_t ship_rs_calls;        /* RenderScreen calls/frame x100 */
+    uint32_t ship_rs_sub_us;       /* subscreen half, us/frame */
+    uint32_t ship_rs_sub_calls;    /* subscreen calls/frame x100 */
+    uint32_t ship_tile_calls;      /* DrawTile16 calls/frame */
+    uint32_t ship_tile_lines;      /* tile LINES drawn/frame */
+} frank_telemetry_t;
+/* 0 upd 1 rs 2 obj 3 bg0 4 bg1 5 bg2 6 bg3 7 mode7 8 zclear 9 sub 10 main
+   11 colormath 12 backdrop 13 scale 14 tileconv */
+volatile frank_telemetry_t frank_telemetry =
+    { 0x4B4E5246u };
+
 #ifdef FRANK_SNES_PROFILE
 typedef struct {
     uint32_t last_report_us;
@@ -527,6 +709,7 @@ typedef struct {
 } perf_stats_t;
 
 static perf_stats_t g_perf;
+
 
 static inline void perf_reset_window(uint32_t now_us) {
     g_perf.last_report_us = now_us;
@@ -566,6 +749,10 @@ static inline void perf_min_u32(uint32_t *dst, uint32_t v) {
 //=============================================================================
 
 bool S9xInitDisplay(void) {
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* Nothing to do: S9xGraphicsInit owns Pitch, Screen, SubScreen and both
+     * Z buffers, and has already sized them for the native frame. */
+#else
     GFX.Pitch = SNES_WIDTH;  // 8-bit pixels: 1 byte per pixel
     GFX.ZPitch = SNES_WIDTH;
     GFX.Screen = SCREEN[current_buffer];
@@ -575,9 +762,12 @@ bool S9xInitDisplay(void) {
     // sub-screen from the previous ROM doesn't leak into color math.
     memset(SubScreenBuffer, 0, SNES_WIDTH * SNES_HEIGHT);
     GFX.SubScreen = g_settings.transparency_enabled ? SubScreenBuffer : GFX.Screen;
+#endif
 
+#ifndef FRANK_SNES_CPU_CORE_S9X16
     GFX.ZBuffer = (uint8_t *)ZBuffer;
     GFX.SubZBuffer = (uint8_t *)SubZBuffer;
+#endif
     return true;
 }
 
@@ -784,7 +974,9 @@ uint32_t S9xReadJoypad(const int32_t port) {
         static uint32_t prev_joypad = 0;
         uint32_t new_buttons = joypad & ~prev_joypad;
         if (new_buttons)
-            S9xNotifyButtonPress();
+#ifndef FRANK_SNES_CPU_CORE_S9X16
+            S9xNotifyButtonPress();   /* SFX auto-release: 1.43 only */
+#endif
         prev_joypad = joypad;
     }
 
@@ -997,6 +1189,23 @@ void JustifierButtons(uint32_t *justifiers) {
 //=============================================================================
 
 static inline void snes9x_init(void) {
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* s9x16_init() owns Settings for this core - including the cycle costs
+     * that make it time the machine correctly. Only the front end's own
+     * preferences are applied here, and only the ones 1.6x still has.
+     *
+     * Gone on purpose: CyclesPercentage, H_Max and HBlankStart. 1.6x
+     * charges cycles inside the memory accessors, so there is no scanline
+     * length to stretch - which is the whole reason for this port. Also
+     * gone: SoundPlaybackRate (the DSP emits at a fixed 32040 Hz),
+     * InterpolatedSound and DisableSoundEcho (the S-DSP does both properly
+     * now), and the Mouse fields (1.6x routes controllers through
+     * S9xSetController). */
+    bool have_mouse = mouse_is_connected() &&
+                      (g_settings.mouse_port != MOUSE_PORT_OFF);
+    Settings.Mute = (g_settings.volume == 0);
+    Settings.MouseMaster = have_mouse;
+#else
     Settings.CyclesPercentage = 100;
     Settings.H_Max = SNES_CYCLES_PER_SCANLINE;
     Settings.FrameTimePAL = 20000;
@@ -1025,7 +1234,19 @@ static inline void snes9x_init(void) {
     Settings.SoundEnvelopeHeightReading = false;
     Settings.Mute = false;
 #endif
+#endif  /* !FRANK_SNES_CPU_CORE_S9X16 */
 
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* The 1.6x core owns its own init order and its own APU, and it does
+     * not resample - it emits at 32040 Hz, which is already this port's
+     * I2S rate. So there is no playback rate to set here, and asking for
+     * one would be a lie the core could not honour. */
+    S9xInitDisplay();
+    if (!s9x16_init()) {
+        LOG("FATAL: s9x16_init failed (out of memory)\n");
+    }
+    s9x16_set_render(true);
+#else
     S9xInitDisplay();
     S9xInitMemory();
     S9xInitAPU();
@@ -1035,11 +1256,16 @@ static inline void snes9x_init(void) {
     }
     S9xSetPlaybackRate(Settings.SoundPlaybackRate);
     IPPU.RenderThisFrame = 1;
+#endif
 }
 
 //=============================================================================
 // ROM Loading from SD Card
 //=============================================================================
+
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+static size_t g_rom_content_size = 0;
+#endif
 
 static bool load_rom_from_sd(const char *filename) {
     static FIL file;
@@ -1085,6 +1311,31 @@ static bool load_rom_from_sd(const char *filename) {
     else
         alloc_size += 0x10000;  // Extra 64KB for mapping safety (non-SuperFX)
     alloc_size += 0x200;  // Header alignment
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* The 1.6x core allocated its ROM buffer in Memory.Init, so the file is
+     * read straight into it. Allocating a second one here would be two
+     * ROM-sized blocks in 8 MB of PSRAM. There is no ForceSuperFX hint
+     * either - this core sizes SRAM from the ROM header it parses. */
+    {
+        if (!s9x16_alloc_rom((uint32_t)file_size)) {
+            LOG("Failed to allocate ROM buffer for %lu bytes\n",
+                (unsigned long)file_size);
+            f_close(&file);
+            return false;
+        }
+        uint32_t rom_capacity = 0;
+        uint8_t *rom_dst = s9x16_rom_storage(&rom_capacity);
+        if (rom_dst == NULL || file_size > rom_capacity) {
+            LOG("ROM too large for core buffer (%lu > %lu)\n",
+                (unsigned long)file_size, (unsigned long)rom_capacity);
+            f_close(&file);
+            return false;
+        }
+        Memory.ROM = rom_dst;
+    }
+    (void)alloc_size;
+    (void)might_be_superfx;
+#else
     Memory.ROM = (uint8_t *)psram_malloc(alloc_size);
     if (Memory.ROM == NULL) {
         LOG("Failed to allocate ROM buffer (%lu bytes)!\n", (unsigned long)alloc_size);
@@ -1096,7 +1347,8 @@ static bool load_rom_from_sd(const char *filename) {
 
     Memory.ROM_AllocSize = file_size; /* Content size for ROM parser; buffer may be larger */
     Settings.ForceSuperFX = might_be_superfx; /* Hint for S9xInitMemory to allocate 128KB SRAM */
-    
+#endif
+
     // Read ROM into buffer
     res = f_read(&file, Memory.ROM, file_size, &bytes_read);
     f_close(&file);
@@ -1107,6 +1359,11 @@ static bool load_rom_from_sd(const char *filename) {
     }
     
     LOG("ROM loaded: %lu bytes\n", (unsigned long)bytes_read);
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+    /* The 1.6x parser is handed the byte count separately - the buffer it
+     * sits in is larger than the image. */
+    g_rom_content_size = (size_t)bytes_read;
+#endif
     return true;
 }
 
@@ -1284,7 +1541,7 @@ void __time_critical_func(render_core)(void) {
 //=============================================================================
 
 // Deferred palette update flag from PPU
-extern volatile bool g_palette_needs_update;
+/* declared with C linkage at file scope, see the include block */
 extern void S9xFixColourBrightness(void);
 
 /*
@@ -1341,6 +1598,9 @@ static uint32_t frameskip_pattern_len = 6;
 static uint32_t frameskip_pattern_mask = 0x09;  // Default: level 3 (20fps)
 
 // Set frameskip level at runtime
+#ifdef __cplusplus
+extern "C"
+#endif
 void set_frameskip_level(uint8_t level) {
     if (level > 4) level = 3;  // Clamp to valid range
     frameskip_pattern_len = frameskip_patterns[level][0];
@@ -1582,9 +1842,11 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 
             // Restore emulation: renderer writes to SCREEN[0], HDMI shows SCREEN[!0]=SCREEN[1]
             current_buffer = 0;
+#ifndef FRANK_SNES_CPU_CORE_S9X16
             GFX.Screen = SCREEN[0];
             GFX.SubScreen = (g_settings.transparency_enabled && SubScreenBuffer)
                             ? SubScreenBuffer : GFX.Screen;
+#endif  /* S9X16 renders into Screen16 always; only the 8-bit side flips. */
 
             // Restore emulation palette
             S9xFixColourBrightness();
@@ -1593,8 +1855,14 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             // Clear stale joypad state so the game doesn't see buttons
             // from before the menu on the first frame of resumed emulation
             // (game can read $4218/$4016 before VBlank updates them)
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+            /* 1.6x keeps pad state in controls.cpp, not in IPPU. */
+            for (int j = 0; j < 5; j++)
+                s9x16_set_joypad(j, 0);
+#else
             for (int j = 0; j < 5; j++)
                 IPPU.Joypads[j] = 0;
+#endif
             Memory.FillRAM[0x4218] = 0;
             Memory.FillRAM[0x4219] = 0;
             Memory.FillRAM[0x421a] = 0;
@@ -1617,7 +1885,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             continue;
         }
 
-        { extern volatile uint32_t dsp_log_frame; dsp_log_frame++; }
+        { dsp_log_frame++; }
 
         // Run one SNES frame of emulation.
         uint32_t _diag_t0 = time_us_32();
@@ -1632,6 +1900,8 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         /* Feed dynamic frameskip: if this frame exceeded the budget, accumulate overrun */
         {
             uint32_t this_emu_us = _diag_t1 - _diag_t0;
+            g_ship_emul_sum += this_emu_us;
+            g_ship_emul_n++;
             /* Rolling estimate of what rendering adds to a frame, used above
              * to credit skips honestly. */
             if (!skip_render) {
@@ -1682,7 +1952,23 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         uint32_t t2 = time_us_32();
     #endif
         {
-    #ifdef FRANK_SNES_FAST_MODE
+    #if defined(FRANK_SNES_CPU_CORE_S9X16)
+        /* The 1.6x core does not mix on demand - the S-DSP has already
+         * written this frame's samples and hands them over. Take what it
+         * produced, up to what the packer can hold; short is a real answer
+         * and the elastic FIFO downstream absorbs it. Padding the tail with
+         * silence would be inventing audio the emulator never generated. */
+        {
+            int drained = 0;
+            const int16_t *src = s9x16_drain_audio(&drained);
+            uint32_t want = frame_samples * 2;      /* stereo int16 count */
+            if (want > AUDIO_FRAME_SAMPLES_MAX * 2) want = AUDIO_FRAME_SAMPLES_MAX * 2;
+            uint32_t have = (drained > 0) ? (uint32_t)drained : 0;
+            if (have > want) have = want;
+            if (have && src) memcpy(mix16, src, have * sizeof(int16_t));
+            if (have < want) memset(mix16 + have, 0, (want - have) * sizeof(int16_t));
+        }
+    #elif defined(FRANK_SNES_FAST_MODE)
         // FAST MODE: Mix mono only (half the samples), then duplicate to stereo in packing
         S9xMixSamplesMono((void *)mix16, frame_samples);
     #else
@@ -1935,10 +2221,19 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             consecutive_skipped_frames = 0;
 
             // Swap display buffers only when we rendered
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+            /* The core drew into Screen16; narrow it into the buffer the
+             * driver is about to start showing, then flip. Same ordering as
+             * the 1.43 path - the freshly filled buffer is the one that
+             * goes on screen. */
+            screen16_to_indexed(SCREEN[current_buffer]);
+            current_buffer = !current_buffer;
+#else
             current_buffer = !current_buffer;
             GFX.Screen = SCREEN[current_buffer];
             GFX.SubScreen = (g_settings.transparency_enabled && SubScreenBuffer)
                             ? SubScreenBuffer : GFX.Screen;
+#endif
         }
 
         // Update palette if brightness changed during frame. Skip when
@@ -1948,7 +2243,14 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         // just displayed (Cybernator regression). The $2100 write
         // handler pushes eagerly on non-zero brightness.
         if (g_palette_needs_update && PPU.Brightness != 0) {
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+            /* IPPU.Red/Green/Blue are already current - the core rebuilt
+             * them when brightness or CGRAM changed. Only the push to the
+             * driver is deferred to here, which is a frame boundary. */
+            S9xPushPaletteToDisplay();
+#else
             S9xFixColourBrightness();
+#endif
             g_palette_needs_update = false;
         }
 
@@ -2071,6 +2373,75 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         }
 #endif
 
+        {
+            /* Always-on frame counter for the debug probe. One compare and an
+               increment per frame; the once-a-second store is negligible.
+               This board has no console and cannot be halted, so reading this
+               out of RAM over SWD is the only way to see a frame rate. */
+            static uint32_t tel_last_us = 0;
+            static uint32_t tel_frames  = 0;
+            uint32_t tel_now = time_us_32();
+
+            tel_frames++;
+            if ((uint32_t)(tel_now - tel_last_us) >= 1000000u) {
+                extern volatile uint32_t frank_instr_count, frank_event_count;
+                frank_telemetry.seq++;
+                frank_telemetry.emu_fps = tel_frames;
+                frank_telemetry.instr_per_frame  = frank_instr_count / (tel_frames ? tel_frames : 1);
+                /* Divide by FRAMES, not by call count: S9xMainLoop returns on
+                   SCAN_KEYS and can be entered more than once per video frame,
+                   so sum/calls is a per-call average and reads far too low -
+                   it made event_us look larger than total emulation. */
+                frank_telemetry.ship_emul_us = (uint32_t)(g_ship_emul_sum /
+                                                   (tel_frames ? tel_frames : 1));
+                frank_telemetry.ship_mainloop_calls =
+                    (uint32_t)((g_ship_emul_n * 100u) / (tel_frames ? tel_frames : 1));
+                frank_telemetry.ship_emu_only_us    = g_emu_only_us;
+                frank_telemetry.ship_render_cost_us = g_render_cost_us;
+                { extern volatile uint32_t frank_upd_us, frank_rs_us, frank_rs_calls;
+                  uint32_t d = tel_frames ? tel_frames : 1;
+                  frank_telemetry.ship_upd_us   = frank_upd_us / d;
+                  frank_telemetry.ship_rs_us    = frank_rs_us / d;
+                  frank_telemetry.ship_rs_calls = (frank_rs_calls * 100u) / d;
+                  { extern volatile uint32_t frank_rs_sub_us, frank_rs_sub_calls;
+                    frank_telemetry.ship_rs_sub_us    = frank_rs_sub_us / d;
+                    frank_telemetry.ship_rs_sub_calls = (frank_rs_sub_calls * 100u) / d;
+                    frank_rs_sub_us = frank_rs_sub_calls = 0; }
+                  { extern volatile uint32_t frank_tile_calls, frank_tile_lines;
+                    frank_telemetry.ship_tile_calls = frank_tile_calls / d;
+                    frank_telemetry.ship_tile_lines = frank_tile_lines / d;
+                    frank_tile_calls = frank_tile_lines = 0; }
+                  frank_upd_us = frank_rs_us = frank_rs_calls = 0; }
+                g_ship_emul_sum = 0; g_ship_emul_n = 0;
+                frank_telemetry.events_per_frame = frank_event_count / (tel_frames ? tel_frames : 1);
+                { extern volatile uint32_t frank_event_us;
+                  frank_telemetry.event_us_per_frame = frank_event_us / (tel_frames ? tel_frames : 1);
+                  frank_event_us = 0; }
+                { extern volatile uint32_t frank_ev_us_by_type[8], frank_ev_n_by_type[8];
+                  uint32_t d = tel_frames ? tel_frames : 1;
+                  for (int q = 0; q < 7; q++) {
+                      frank_telemetry.ev_us_type[q] = frank_ev_us_by_type[q] / d;
+                      frank_telemetry.ev_n_type[q]  = frank_ev_n_by_type[q] / d;
+                      frank_ev_us_by_type[q] = 0; frank_ev_n_by_type[q] = 0;
+                  } }
+                { extern volatile uint32_t frank_hdma_bytes, frank_hdma_chan;
+                  uint32_t d = tel_frames ? tel_frames : 1;
+                  frank_telemetry.hdma_bytes_per_frame = frank_hdma_bytes / d;
+                  frank_telemetry.hdma_chan_per_frame  = frank_hdma_chan / d;
+                  frank_hdma_bytes = 0; frank_hdma_chan = 0; }
+                { extern volatile uint32_t frank_hdma_calls, frank_getmemptr;
+                  uint32_t d = tel_frames ? tel_frames : 1;
+                  frank_telemetry.hdma_calls_per_frame = frank_hdma_calls / d;
+                  frank_telemetry.getmemptr_per_frame  = frank_getmemptr / d;
+                  frank_hdma_calls = 0; frank_getmemptr = 0; }
+                frank_instr_count = 0;
+                frank_event_count = 0;
+                frank_telemetry.seq++;
+                tel_frames  = 0;
+                tel_last_us = tel_now;
+            }
+        }
+
 #ifdef FRANK_SNES_PROFILE
         // Update stats (keep overhead tiny; print at most once/sec)
         uint32_t now_us = time_us_32();
@@ -2088,6 +2459,12 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             g_perf.frames_render++;
             perf_max_u32(&g_perf.max_emul_render_us, emul_us);
         }
+        /* t4/t5 bracketed the audio pack stage; those markers were removed at
+           some point but the accounting below still referenced them, so this
+           whole block stopped compiling. Report pack as zero rather than
+           attribute garbage to it - the mix and emul figures are the ones
+           that matter here. */
+        uint32_t t4 = t3, t5 = t3;
         g_perf.sum_mix_us  += (uint32_t)(t3 - t2);
         g_perf.sum_pack_us += (uint32_t)(t5 - t4);
         perf_max_u32(&g_perf.max_emul_us, emul_us);
@@ -2224,6 +2601,38 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             uint8_t r2131 = Memory.FillRAM[0x2131];
             uint8_t r2133 = Memory.FillRAM[0x2133];
 
+            frank_telemetry.seq++;              /* odd: write in progress */
+            frank_telemetry.emu_fps      = frames;
+            frank_telemetry.rend_fps     = g_perf.rendered;
+            frank_telemetry.skip_fps     = g_perf.skipped;
+            frank_telemetry.avg_emul_us  = avg_emul;
+            frank_telemetry.max_emul_us  = g_perf.max_emul_us;
+            frank_telemetry.avg_mix_us   = avg_mix;
+            frank_telemetry.avg_pack_us  = avg_pack;
+            frank_telemetry.avg_upd_us   = upd_avg;
+            frank_telemetry.avg_rs_us    = rs_avg;
+            frank_telemetry.avg_zclear_us    = uz_avg;
+            frank_telemetry.avg_colormath_us = ucm_avg;
+            frank_telemetry.avg_scale_us     = usc_avg;
+            frank_telemetry.avg_obj_us       = ro_avg;
+            frank_telemetry.avg_bg0_us       = r0_avg;
+            /* static, not automatic: this core's stack is 2 KB and this
+               function already holds a dozen 64-bit accumulators. 120 bytes
+               of extra locals here is not worth the risk. */
+            { static uint64_t _s[15];
+              _s[0]=upd_sum;  _s[1]=rs_sum;   _s[2]=ro_sum;   _s[3]=r0_sum;
+              _s[4]=r1_sum;   _s[5]=r2_sum;   _s[6]=r3_sum;   _s[7]=r7_sum;
+              _s[8]=uz_sum;   _s[9]=usub_sum; _s[10]=umain_sum; _s[11]=ucm_sum;
+              _s[12]=ubd_sum; _s[13]=usc_sum; _s[14]=tc_sum;
+              for (int _i = 0; _i < 15; _i++)
+                  frank_telemetry.rend_us[_i] = (uint32_t)(_s[_i] / frames); }
+            frank_telemetry.seq++;              /* even: sample is coherent */
+
+            /* The [perf] line is ~1000 characters to a 115200 UART: about
+               87 ms of blocking transmit every second, which is far more
+               disruptive than the thing being measured. PROF_QUIET keeps the
+               measurement and the telemetry block and drops the printf. */
+#ifndef PROF_QUIET
             LOG("[perf] emu_fps=%lu rend_fps=%lu skip_fps=%lu late_max=%ldus qmin=%lu qmax=%lu | tilec=%lu | bgm=%u 2106=%02x 2107=%02x 2108=%02x 2109=%02x 210a=%02x 210b=%02x 210c=%02x | 2123=%02x 2124=%02x 2125=%02x 2126=%02x 2127=%02x 2128=%02x 2129=%02x 212a=%02x 212b=%02x | 212c=%02x 212d=%02x 212e=%02x 212f=%02x 2130=%02x 2131=%02x 2133=%02x | emu avg/max=%lu/%lu us | emuR avg/max=%lu/%lu us | emuS avg/max=%lu/%lu us | mix avg/max=%lu/%lu us | pack avg/max=%lu/%lu us | upd avg/max=%lu/%lu us (%lu) | uz avg/max=%lu/%lu us (%lu) | uSub avg/max=%lu/%lu us (%lu) | uMain avg/max=%lu/%lu us (%lu) | uMath avg/max=%lu/%lu us (%lu) | uBack avg/max=%lu/%lu us (%lu) | uScale avg/max=%lu/%lu us (%lu) | rs avg/max=%lu/%lu us (%lu) | ro avg/max=%lu/%lu us (%lu) | r0 avg/max=%lu/%lu us (%lu) | r1 avg/max=%lu/%lu us (%lu) | r2 avg/max=%lu/%lu us (%lu) | r3 avg/max=%lu/%lu us (%lu) | r7 avg/max=%lu/%lu us (%lu)\n",
                 (unsigned long)frames,
                 (unsigned long)g_perf.rendered,
@@ -2275,6 +2684,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                 (unsigned long)r2_avg, (unsigned long)r2_max, (unsigned long)r2_cnt,
                 (unsigned long)r3_avg, (unsigned long)r3_max, (unsigned long)r3_cnt,
                 (unsigned long)r7_avg, (unsigned long)r7_max, (unsigned long)r7_cnt);
+#endif
             perf_reset_window(now_us);
         }
 #endif
@@ -2462,6 +2872,16 @@ int main(void) {
         // Mark PSRAM so we can restore after emulation
         psram_mark_session();
 
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+        /* The 1.6x core owns the ROM buffer, so it has to exist before the
+         * file is read into it. The 1.43 order is the other way round only
+         * because load_rom_from_sd sets Settings.ForceSuperFX as a hint for
+         * S9xInitMemory; this core sizes SRAM from the header it parses and
+         * needs no such hint. */
+        LOG("Initializing SNES emulator...\n");
+        snes9x_init();
+#endif
+
         // Load ROM from SD card
         LOG("Loading ROM...\n");
         bool rom_loaded = load_rom_from_sd(rom_path);
@@ -2472,13 +2892,19 @@ int main(void) {
             continue;  // Back to ROM selector
         }
 
+#ifndef FRANK_SNES_CPU_CORE_S9X16
         // Initialize SNES emulator
         LOG("Initializing SNES emulator...\n");
         snes9x_init();
+#endif
 
         // Load the ROM into SNES memory map
         LOG("Setting up ROM mapping...\n");
+#ifdef FRANK_SNES_CPU_CORE_S9X16
+        if (!s9x16_load_rom_inplace(g_rom_content_size, rom_path)) {
+#else
         if (!LoadROM(NULL)) {
+#endif
             LOG("Failed to initialize ROM!\n");
             psram_restore_session();
             continue;  // Back to ROM selector

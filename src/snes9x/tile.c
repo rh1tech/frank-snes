@@ -626,8 +626,16 @@ static void DrawClippedTile16_Direct4bpp(uint32_t Tile, int32_t Offset, uint32_t
 }
 #endif
 
+/* Counted, not timed: 6,000+ calls/frame means a time_us_32() pair per call
+   would cost far more than the thing being measured. Dividing the main-screen
+   timer by this gives the true per-tile cost. */
+volatile uint32_t frank_tile_calls;
+volatile uint32_t frank_tile_lines;
+
 void DrawTile16(uint32_t Tile, int32_t Offset, uint32_t StartLine, uint32_t LineCount)
 {
+   frank_tile_calls++;
+   frank_tile_lines += LineCount;
 #if defined(DIRECT_DECODE_TILES)
    /* For 4bpp tiles, use direct decode to skip tile cache entirely */
    if (BG.BitShift == 4) {

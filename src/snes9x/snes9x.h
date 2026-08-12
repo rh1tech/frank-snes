@@ -41,7 +41,11 @@
 
 #define SNES_CLOCK_LEN (1.0 / SNES_CLOCK_SPEED)
 
-#define SNES_CYCLES_PER_SCANLINE ((uint32_t) ((SNES_SCANLINE_TIME / SNES_CLOCK_LEN) * 6 + 0.5))
+/* The old expression evaluated to 1368: 63.695us / (1/3579545) is 227.999 CPU
+ * cycles, rounded up to 228 and multiplied by six. The hardware scanline is
+ * 1364 master cycles (341 dots of four), and every event position below is
+ * quoted in those units. */
+#define SNES_CYCLES_PER_SCANLINE 1364
 
 #ifdef SNES_OVERCLOCK_CYCLES
 #define ONE_CYCLE        (overclock_cycles ? one_c : 6u)
@@ -122,11 +126,76 @@ typedef struct
    uint32_t IRQCycleCount;
 } SCPUState;
 
-#define HBLANK_START_EVENT  0u
-#define HBLANK_END_EVENT    1u
-#define HTIMER_BEFORE_EVENT 2u
-#define HTIMER_AFTER_EVENT  3u
-#define NO_EVENT            4u
+#define ONE_DOT_CYCLE       4
+#define ONE_DOT_CYCLE_DIV_2 2
+
+/* Event positions within a scanline, in master cycles. */
+#define SNES_HBLANK_END_HC     4     /* H=1   */
+#define SNES_HDMA_INIT_HC      20
+#define SNES_RENDER_START_HC   192   /* H=48; this core renders a line at once */
+#define SNES_WRAM_REFRESH_HC_v2                   538
+#define SNES_WRAM_REFRESH_HC_v2_MIN_ONE_DOT_CYCLE 534
+#define SNES_HBLANK_START_HC   1096  /* H=274 */
+#define SNES_HDMA_START_HC     1106
+
+/* The CPU is held off the bus while WRAM is refreshed, once per scanline.
+ * This core never modelled it, handing the 65816 2.9% of every line that the
+ * hardware does not - and that the SPC700, clocked separately, never got. */
+#define SNES_WRAM_REFRESH_CYCLES 40
+
+/* Six events per scanline, in the order they occur:
+ *
+ *   HDMA_INIT 20 -> RENDER 192 -> WRAM_REFRESH 534/538 -> HBLANK_START 1096
+ *      -> HDMA_START 1106 -> HCOUNTER_MAX 1364 (rebase, next line)
+ *
+ * There used to be two real positions, HBlankStart and H_Max, with every
+ * per-line action crowded onto the latter: the line was rendered, HDMA was
+ * started, VBlank began and the APU was resynchronised all at the same
+ * instant, at the END of the line.
+ *
+ * Each base event has an IRQ_x_y twin, scheduled in its place when the
+ * programmable H/V timer falls between the two surrounding events. */
+#define HC_HBLANK_START_EVENT  1u
+#define HC_IRQ_1_3_EVENT       2u
+#define HC_HDMA_START_EVENT    3u
+#define HC_IRQ_3_5_EVENT       4u
+#define HC_HCOUNTER_MAX_EVENT  5u
+#define HC_IRQ_5_7_EVENT       6u
+#define HC_HDMA_INIT_EVENT     7u
+#define HC_IRQ_7_9_EVENT       8u
+#define HC_RENDER_EVENT        9u
+#define HC_IRQ_9_A_EVENT      10u
+#define HC_WRAM_REFRESH_EVENT 11u
+#define HC_IRQ_A_1_EVENT      12u
+
+/* Scanline geometry and event positions.
+ *
+ * Deliberately NOT part of SCPUState: that struct is written to savestates
+ * raw and its byte offsets are hardcoded in cpu_asm.S, so it must not grow. */
+struct STimings
+{
+   int32_t H_Max_Master;
+   int32_t H_Max;
+   int32_t V_Max_Master;
+   int32_t V_Max;
+   int32_t HBlankStart;
+   int32_t HBlankEnd;
+   int32_t HDMAInit;
+   int32_t HDMAStart;
+   int32_t RenderPos;
+   int32_t WRAMRefreshPos;
+   int32_t DMACPUSync;       /* cycles to resync the CPU to the DMA clock */
+   int32_t IRQTriggerCycles; /* comparator -> /IRQ -> taken */
+   int32_t NextIRQTimer;     /* absolute cycle deadline of the H/V timer */
+   bool    InterlaceField;
+};
+
+extern struct STimings Timings;
+/* The scanline a timer IRQ actually lands on - a free-standing global rather
+   than a PPU field, because PPU is serialised raw into savestates too. */
+extern int16_t S9xVTimerPosition;
+
+void S9xInitTimings(void);
 
 typedef struct
 {

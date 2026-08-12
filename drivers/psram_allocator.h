@@ -1,6 +1,11 @@
 #ifndef PSRAM_ALLOCATOR_H
 #define PSRAM_ALLOCATOR_H
 
+/* Included from C++ too (the 1.6x core and its glue). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 // Total external PSRAM size (bytes). Keep in sync with the hardware used.
@@ -25,5 +30,9 @@ size_t psram_get_temp_offset(void);
 void psram_set_temp_offset(size_t offset);
 
 void psram_set_sram_mode(int enable); // Force SRAM allocation for proper malloc/free
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
