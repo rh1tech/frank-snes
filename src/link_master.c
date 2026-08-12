@@ -306,6 +306,17 @@ uint32_t link_master_ppu_got(void) { return g_ppu_fb_got; }
 /* The slave's per-frame diagnostics, published so a probe on the MASTER can
    see inside the slave - there is no console or probe on that chip. */
 volatile link_ppu_stat_t g_ppu_stat;
+
+/* Where the exchange's time goes. The total jumped from 370 us to 10,445 us
+   the moment the slave began returning real framebuffers, and 57 KB at the
+   bulk rate should cost ~0.6 ms - so the time is being spent WAITING, and
+   this says on what. */
+volatile uint32_t g_ph_sound, g_ph_ev, g_ph_aram, g_ph_ppu_tx, g_ph_ack, g_ph_fb;
+
+/* The slave's palette, and whether one has arrived. The master pushes it into
+   the HDMI driver; it no longer computes one itself. */
+uint32_t g_ppu_palette[256];
+volatile bool g_ppu_pal_valid;
 #endif
 
 bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
@@ -321,13 +332,26 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
     /* --- header (carrying the run table), then this frame's payloads --- */
     if (n_runs > LINK_ARAM_MAX_RUNS) n_runs = LINK_ARAM_MAX_RUNS;
 
-    if (!link_m_send_ctrl(&g_sess, LINK_OP_FRAME, n_events,
-                          LINK_FRAME_ARG1(n_runs, chunks),
-                          runs, n_runs * sizeof(link_aram_run_t))) {
-        go_offline("frame header failed");
-        return false;
+    /* The PPU stream length rides in this frame's payload, exactly as the run
+       table does and for the same reason the note on LINK_OP_FRAME gives: a
+       separate control frame costs a doorbell round trip whatever it carries.
+       Measured, it cost 10.2 ms of a 10.5 ms exchange - the 57 KB framebuffer
+       bulk itself was 105 us. Phases, not bytes. */
+    {
+        uint8_t pl[LINK_PAYLOAD_BYTES];
+        uint32_t rt = n_runs * sizeof(link_aram_run_t);
+        memset(pl, 0, sizeof(pl));
+        memcpy(pl, runs, rt);
+        memcpy(pl + LINK_PPU_LEN_OFFSET, &g_ppu_len, sizeof(uint32_t));
+        if (!link_m_send_ctrl(&g_sess, LINK_OP_FRAME, n_events,
+                              LINK_FRAME_ARG1(n_runs, chunks),
+                              pl, LINK_PPU_LEN_OFFSET + sizeof(uint32_t))) {
+            go_offline("frame header failed");
+            return false;
+        }
     }
 
+    g_ph_sound = time_us_32() - t0;
     if (n_events) {
         if (!link_m_bulk_send(&g_sess, events,
                               n_events * sizeof(link_event_t))) {
@@ -336,6 +360,7 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
         }
     }
 
+    g_ph_ev = time_us_32() - t0;
     if (n_runs) {
         for (uint32_t i = 0; i < n_runs; i++) {
             const uint8_t *src = aram +
@@ -352,24 +377,23 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
 #ifdef FRANK_SNES_PPU_CAPTURE
     /* The PPU command stream rides here: after the sound payloads, before
        the reply, so it costs no extra doorbell phase. */
-    /* The header goes out UNCONDITIONALLY once the offload is active, even
-       for an empty frame. The slave waits for it, so skipping it on a frame
-       that captured nothing left the slave blocking on link_s_wait_ctrl for
-       its full 100 ms timeout - 13 fps, with the screen black. A protocol
-       whose phases depend on payload size is a protocol that deadlocks. */
+    g_ph_aram = time_us_32() - t0;
+
+    /* No control frame of its own: the length was in the FRAME payload. */
     g_ppu_fb_got = 0;
-    if (g_ppu_fb) {
-        if (!link_m_send_ctrl(&g_sess, LINK_OP_PPU_STREAM, g_ppu_len, 0,
-                              NULL, 0)) {
-            go_offline("ppu stream header failed");
-            return false;
-        }
-        if (g_ppu_len && !link_m_bulk_send(&g_sess, g_ppu_stream, g_ppu_len)) {
-            go_offline("ppu stream bulk failed");
-            return false;
-        }
+    /* LINK_ALIGN4, matching the slave's arm exactly. The sample bulk aligns
+       on both sides; aligning on only one leaves the receiver's DMA waiting
+       for the padding bytes that were never sent - it times out and the
+       sender stalls. Measured: 10.2 ms of a 10.4 ms exchange, for three
+       missing bytes. */
+    if (g_ppu_len && !link_m_bulk_send(&g_sess, g_ppu_stream,
+                                       LINK_ALIGN4(g_ppu_len))) {
+        go_offline("ppu stream bulk failed");
+        return false;
     }
 #endif
+
+    g_ph_ppu_tx = time_us_32() - t0;
 
     /* --- the reply --- */
     if (!link_m_recv_ctrl(&g_sess)) {
@@ -392,6 +416,7 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
      * and receiving fewer would leave the surplus in flight and
      * desynchronise every exchange after it. Dropping the link is
      * recoverable; a desynchronised wire is not. */
+    g_ph_ack = time_us_32() - t0;
     uint32_t got = reply->samples;
     if (got > n_samples) {
         go_offline("slave returned more samples than requested");
@@ -414,17 +439,8 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
        wire whatever we do, and receiving fewer desynchronises every exchange
        after it. */
     if (g_ppu_fb) {
-        if (!link_m_recv_ctrl(&g_sess)) {
-            go_offline("no ppu frame header");
-            return false;
-        }
-        if (link_rx_hdr(&g_sess)->op != LINK_OP_PPU_FRAME) {
-            go_offline("wrong ppu frame op");
-            return false;
-        }
-        uint32_t fb = link_rx_hdr(&g_sess)->arg0;
-        memcpy((void *)&g_ppu_stat, g_ctrl_rx + sizeof(link_hdr_t),
-               sizeof(g_ppu_stat));
+        uint32_t fb = reply->ppu_fb_bytes;
+        g_ppu_stat  = reply->ppu_stat;
         if (fb > g_ppu_fb_max) {
             go_offline("slave returned an oversized framebuffer");
             return false;
@@ -435,7 +451,15 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
                 return false;
             }
         }
+        /* The palette always follows the picture - see the slave. */
+        if (!link_m_bulk_recv(&g_sess, (void *)g_ppu_palette,
+                              sizeof(g_ppu_palette))) {
+            go_offline("ppu palette bulk failed");
+            return false;
+        }
+        g_ppu_pal_valid = true;
         g_ppu_fb_got = fb;
+        g_ph_fb = time_us_32() - t0;
     }
 #endif
 

@@ -61,6 +61,7 @@ volatile uint32_t slave_ppu_records;
 volatile uint32_t slave_ppu_psram_ok;
 volatile uint32_t slave_ppu_alloc_fail;
 uint8_t *slave_ppu_stream_buf;
+uint8_t *slave_ppu_screen;   /* set per frame: where this frame is drawn */
 
 void graphics_set_palette(uint8_t i, uint32_t color888)
 {
@@ -95,6 +96,25 @@ bool slave_ppu_init(void)
    /* psram_malloc does not zero; ConvertTile fills entries on demand but the
       "is it cached" flags above must start clear, and they do (snes_calloc). */
 
+   slave_ppu_stream_buf = (uint8_t *) psram_malloc(256u * 1024u);
+
+   /* GFX must be set up before S9xInitGFX: it takes GFX.Pitch as an INPUT and
+      copies it to RealPitch. Leaving it zero made slave_ppu_copy_frame
+      compute a zero-byte picture, so the master received nothing and the
+      screen stayed blank - with every other diagnostic reading healthy.
+      Mirrors the master's S9xInitDisplay, except that the sub-screen and both
+      Z buffers go to PSRAM: the slave has ~82 KB of SRAM free against 172 KB
+      of buffers, and it renders a frame in ~200 us of a ~7,600 us budget, so
+      it can afford the slower memory far more easily than the space.
+      GFX.Screen is not allocated at all - the renderer draws straight into
+      the framebuffer that goes on the wire. */
+   GFX.Pitch  = SNES_WIDTH;
+   GFX.ZPitch = SNES_WIDTH;
+   GFX.SubScreen  = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
+   GFX.ZBuffer    = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
+   GFX.SubZBuffer = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
+   if (GFX.SubScreen) memset(GFX.SubScreen, 0, SNES_WIDTH * SNES_HEIGHT);
+
    Memory.VRAM     = (uint8_t *) snes_calloc(VRAM_SIZE, 1);
    Memory.FillRAM  = (uint8_t *) snes_calloc(0x8000, 1);
    IPPU.ScreenColors = (uint16_t *) snes_calloc(256 * 9, sizeof(uint16_t));
@@ -112,18 +132,40 @@ bool slave_ppu_init(void)
       | (!IPPU.TileCache[TILE_8BIT]? 0x20u : 0u)
       | (!IPPU.TileCached[TILE_2BIT]?0x40u : 0u);
 
-   if (!Memory.VRAM || !Memory.FillRAM || !IPPU.ScreenColors
+   slave_ppu_alloc_fail |= (!slave_ppu_stream_buf ? 0x80u : 0u)
+                        |  (!GFX.SubScreen        ? 0x100u : 0u)
+                        |  (!GFX.ZBuffer          ? 0x200u : 0u);
+
+   if (!GFX.SubScreen || !GFX.ZBuffer || !GFX.SubZBuffer ||
+       !slave_ppu_stream_buf ||
+       !Memory.VRAM || !Memory.FillRAM || !IPPU.ScreenColors
        || !IPPU.TileCache[TILE_2BIT] || !IPPU.TileCache[TILE_4BIT]
        || !IPPU.TileCache[TILE_8BIT] || !IPPU.TileCached[TILE_2BIT]
        || !IPPU.TileCached[TILE_4BIT] || !IPPU.TileCached[TILE_8BIT])
       return false;
 
-   slave_ppu_stream_buf = (uint8_t *) psram_malloc(256u * 1024u);
 
    slave_ppu_psram_ok = (IPPU.TileCache[TILE_2BIT] != NULL) &&
                         (IPPU.TileCache[TILE_4BIT] != NULL) &&
                         (IPPU.TileCache[TILE_8BIT] != NULL);
-   return S9xInitGFX();
+   if (!S9xInitGFX())
+      return false;
+
+   /* The slave has never had a PPU reset - the master does that inside
+      S9xReset, which is CPU-side and does not come with the renderer. The
+      consequence that mattered: IPPU.RenderThisFrame was zero, and BOTH
+      RenderLine and S9xUpdateScreen are guarded by it, so the slave replayed
+      every record and drew nothing. The symptom was a perfectly sized,
+      perfectly delivered framebuffer of colour 0 with every counter healthy.
+
+      Calling S9xResetPPU() outright is NOT the fix: it is a whole-machine
+      reset that reaches into CPU-era state the slave does not have, and it
+      took the link down at handshake. Everything else the renderer needs
+      arrives in the stream - the master's own register writes set it. Only
+      these two are never transmitted. */
+   IPPU.RenderThisFrame = true;
+   PPU.ScreenHeight     = SNES_HEIGHT;
+   return true;
 }
 
 /* Replay one frame's worth of records. Returns when the end-of-frame record
@@ -138,6 +180,7 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
 {
    uint32_t i = 0;
    uint32_t t0 = time_us_32();
+   GFX.Screen = slave_ppu_screen;
    uint32_t n  = 0;
 
    while (i < len)
@@ -204,4 +247,12 @@ uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max)
    if (!dst || n > max) return 0;
    memcpy(dst, GFX.Screen, n);
    return n;
+}
+
+/* The renderer guards every draw on IPPU.RenderThisFrame. Nothing on the slave
+   clears it, but arming it explicitly each frame keeps the intent visible -
+   without it the slave replays the whole stream and draws nothing at all. */
+void slave_ppu_arm_frame(void)
+{
+   IPPU.RenderThisFrame = true;
 }

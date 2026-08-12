@@ -289,6 +289,11 @@ static void screen16_to_indexed(uint8_t *dst)
 // Current display buffer (double buffering) - accessed by HDMI driver
 volatile uint32_t current_buffer = 0;
 
+#ifdef FRANK_SNES_PPU_CAPTURE
+/* PSRAM landing area for the slave's picture - see the staging call. */
+static uint8_t *g_ppu_stage;
+#endif
+
 //=============================================================================
 // Audio - Core 0 mixes into buffer, Core 1 plays
 //=============================================================================
@@ -690,6 +695,12 @@ typedef struct {
     uint32_t slave_psram_ok;
     uint32_t slave_impossible;
     uint32_t ship_cap_overflow;    /* master records dropped: frame is WRONG */
+    uint32_t ph_sound, ph_ppu_tx, ph_ack, ph_fb, ph_ev, ph_aram;
+    uint32_t slave_want;
+    uint32_t ppu_fb_got;   /* framebuffer bytes the master actually received */
+    uint32_t fb_hash;      /* FNV of the received picture: 0 or constant = blank */
+    uint32_t fb_nonzero;   /* how many pixels are not colour 0 */
+    uint32_t pal0, pal1;   /* two palette entries, to see if colours arrived */
 } frank_telemetry_t;
 /* 0 upd 1 rs 2 obj 3 bg0 4 bg1 5 bg2 6 bg3 7 mode7 8 zclear 9 sub 10 main
    11 colormath 12 backdrop 13 scale 14 tileconv */
@@ -1269,6 +1280,9 @@ static inline void snes9x_init(void) {
        ~22 KB free, and a static buffer there hung the board. */
     if (!ppucap_init())
         LOG("FATAL: ppucap_init failed (no PSRAM for the PPU stream)\n");
+    g_ppu_stage = (uint8_t *)psram_malloc(SNES_WIDTH * SNES_HEIGHT);
+    if (!g_ppu_stage)
+        LOG("FATAL: no PSRAM for the PPU staging buffer\n");
 #endif
     S9xInitAPU();
     S9xInitSound(0, 0);
@@ -1966,9 +1980,26 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         {
             uint32_t cap_len = 0;
             const uint8_t *cap = ppucap_take(&cap_len);
-            link_master_ppu_stage(cap, cap_len,
-                                  SCREEN[current_buffer],
+            /* Stage into PSRAM, not straight into SCREEN[]: the link's RX DMA
+               would otherwise write the very buffer the HDMI scanout is
+               reading, live, every frame. The copy below is ~57 KB of CPU
+               work against a frame with ~10 ms of slack. */
+            link_master_ppu_stage(cap, cap_len, SCREEN[current_buffer],
                                   SNES_WIDTH * SNES_HEIGHT);
+        }
+#endif
+
+#ifdef FRANK_SNES_PPU_CAPTURE
+        /* Hand the slave's picture to the display. */
+        /* Push the slave's palette into the HDMI driver. Without this the
+           master has no palette at all: it stopped rendering, and rendering
+           is what used to call graphics_set_palette. */
+        if (g_ppu_pal_valid) {
+            for (int pi = 0; pi < 256; pi++)
+                graphics_set_palette((uint8_t)pi, g_ppu_palette[pi]);
+            { extern void graphics_request_palette_update(void);
+              graphics_request_palette_update(); }
+            g_ppu_pal_valid = false;
         }
 #endif
 
@@ -2465,9 +2496,32 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.slave_records    = g_ppu_stat.records;
                       frank_telemetry.slave_oversize   = g_ppu_stat.oversize;
                       frank_telemetry.slave_psram_ok   = g_ppu_stat.psram_ok;
-                      frank_telemetry.slave_impossible = g_ppu_stat.impossible; }
+                      frank_telemetry.slave_impossible = g_ppu_stat.impossible;
+                      frank_telemetry.slave_want = g_ppu_stat.want;
+                      frank_telemetry.ppu_fb_got = link_master_ppu_got();
+                      { /* Is the picture actually a picture? A correct-sized
+                           buffer of zeros looks identical to success in every
+                           counter measured so far. */
+                        const uint8_t *fb = SCREEN[current_buffer];
+                        uint32_t h = 2166136261u, nz = 0;
+                        for (uint32_t q = 0; q < SNES_WIDTH * SNES_HEIGHT; q += 7) {
+                            h ^= fb[q]; h *= 16777619u;
+                            if (fb[q]) nz++;
+                        }
+                        frank_telemetry.fb_hash = h;
+                        frank_telemetry.fb_nonzero = nz;
+                        frank_telemetry.pal0 = g_ppu_palette[1];
+                        frank_telemetry.pal1 = g_ppu_palette[17]; } }
                     { extern volatile uint32_t frank_cap_overflow;
-                      frank_telemetry.ship_cap_overflow = frank_cap_overflow; } }
+                      frank_telemetry.ship_cap_overflow = frank_cap_overflow; }
+                    { extern volatile uint32_t g_ph_sound, g_ph_ppu_tx, g_ph_ack, g_ph_fb;
+                      frank_telemetry.ph_sound  = g_ph_sound;
+                      frank_telemetry.ph_ppu_tx = g_ph_ppu_tx;
+                      frank_telemetry.ph_ack    = g_ph_ack;
+                      frank_telemetry.ph_fb     = g_ph_fb;
+                      { extern volatile uint32_t g_ph_ev, g_ph_aram;
+                        frank_telemetry.ph_ev = g_ph_ev;
+                        frank_telemetry.ph_aram = g_ph_aram; } } }
 #endif
                   frank_upd_us = frank_rs_us = frank_rs_calls = 0; }
                 g_ship_emul_sum = 0; g_ship_emul_n = 0;

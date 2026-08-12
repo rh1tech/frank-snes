@@ -38,3 +38,12 @@ uint8_t S9xGetSRTC(uint16_t a)                   { (void)a; impossible(); return
 void    S9xSetIRQ(uint32_t s)                    { (void)s; impossible(); }
 void    S9xSetPCBase(uint32_t a)                 { (void)a; impossible(); }
 void    S9xSetSRTC(uint8_t d, uint16_t a)        { (void)d; (void)a; impossible(); }
+
+/* Pulled in by S9xResetPPU. There is no input path on the slave at all - the
+   master owns input entirely. */
+bool S9xReadMousePosition(int32_t which, int32_t *x, int32_t *y, uint32_t *buttons)
+{
+   (void)which; (void)x; (void)y; (void)buttons;
+   impossible();
+   return false;
+}

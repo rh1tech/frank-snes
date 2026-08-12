@@ -160,7 +160,8 @@ static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
 static uint32_t g_ppu_fb_bytes;
 static uint32_t g_ppu_slot;
 static bool     g_ppu_fb_valid;
-volatile uint32_t g_ppu_oversize;   /* frames too big for the buffer */
+volatile uint32_t g_ppu_oversize;
+static uint32_t g_ppu_last_want;   /* frames too big for the buffer */
 #endif
 
 /* Boot progress marker.
@@ -280,6 +281,15 @@ static void handle_frame(void)
         memcpy(g_runs, g_ctrl_rx + sizeof(link_hdr_t),
                n_runs * sizeof(link_aram_run_t));
 
+#ifdef FRANK_SNES_PPU_SLAVE
+    /* Same rule as the run table: the PPU stream length rides in this
+       payload and MUST be copied out before the first bulk arms, or
+       g_ctrl_rx is overwritten underneath it. */
+    uint32_t ppu_want = 0;
+    memcpy(&ppu_want, g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_LEN_OFFSET,
+           sizeof(ppu_want));
+#endif
+
     if (n_events) {
         if (!link_s_bulk_recv(&g_sess, g_events,
                               n_events * sizeof(link_event_t))) {
@@ -358,8 +368,10 @@ static void handle_frame(void)
     uint32_t ppu_len = 0;
     extern uint8_t *slave_ppu_stream_buf;
     g_ppu_stream = slave_ppu_stream_buf;
-    if (g_ppu_stream && link_s_wait_ctrl(&g_sess, 100000u) == LINK_OP_PPU_STREAM) {
-        uint32_t want = link_rx_hdr(&g_sess)->arg0;
+    {
+        /* Copied out of the payload above, before the bulks armed. */
+        uint32_t want = ppu_want;
+        g_ppu_last_want = want;
 
         /* Whatever the master announced MUST be taken off the wire. Skipping
            it because it does not fit leaves those bytes in flight and every
@@ -381,6 +393,24 @@ static void handle_frame(void)
         uint32_t send_slot = g_mix_slot ^ 1u;
         uint32_t got = g_pending_reply.samples;
 
+#ifdef FRANK_SNES_PPU_SLAVE
+        /* The picture's length and the slave's diagnostics ride in the sound
+           reply. A control frame of their own cost 10.2 ms of a 10.5 ms
+           exchange; the 57 KB bulk it carried cost 105 us. */
+        {
+            extern volatile uint32_t slave_ppu_render_us, slave_ppu_records,
+                                     slave_ppu_psram_ok, slave_ppu_impossible,
+                                     slave_ppu_alloc_fail;
+            g_pending_reply.ppu_fb_bytes = g_ppu_fb_valid ? g_ppu_fb_bytes : 0;
+            g_pending_reply.ppu_stat.render_us  = slave_ppu_render_us;
+            g_pending_reply.ppu_stat.records    = slave_ppu_records;
+            g_pending_reply.ppu_stat.oversize   = g_ppu_oversize;
+            g_pending_reply.ppu_stat.psram_ok   = slave_ppu_psram_ok |
+                                                  (slave_ppu_alloc_fail << 8);
+            g_pending_reply.ppu_stat.impossible = slave_ppu_impossible;
+            g_pending_reply.ppu_stat.want       = g_ppu_last_want;
+        }
+#endif
         link_s_send_ctrl(&g_sess, LINK_OP_FRAME_ACK, 0, 0,
                          &g_pending_reply, sizeof(g_pending_reply));
         if (got)
@@ -401,23 +431,22 @@ static void handle_frame(void)
        The cost is one frame of video latency, which was accepted in the
        design; the alternative is not a slower link, it is no link. */
     {
-        uint32_t fb_bytes = g_ppu_fb_valid ? g_ppu_fb_bytes : 0;
-        {
-            extern volatile uint32_t slave_ppu_render_us, slave_ppu_records,
-                                     slave_ppu_psram_ok, slave_ppu_impossible;
-            link_ppu_stat_t st;
-            st.render_us  = slave_ppu_render_us;
-            st.records    = slave_ppu_records;
-            st.oversize   = g_ppu_oversize;
-            { extern volatile uint32_t slave_ppu_alloc_fail;
-              st.psram_ok = slave_ppu_psram_ok | (slave_ppu_alloc_fail << 8); }
-            st.impossible = slave_ppu_impossible;
-            link_s_send_ctrl(&g_sess, LINK_OP_PPU_FRAME, fb_bytes, 0,
-                             &st, sizeof(st));
-        }
+        /* Length and stats already went out in the FRAME_ACK payload above;
+           only the bulks remain, and they need no handshake of their own. */
+        uint32_t fb_bytes = g_have_pending ? g_pending_reply.ppu_fb_bytes : 0;
         if (fb_bytes)
             link_s_bulk_send(&g_sess, g_ppu_fb[g_ppu_slot ^ 1u],
                              LINK_ALIGN4(fb_bytes));
+
+        /* The palette, every frame and unconditionally. The master no longer
+           renders, so it never calls graphics_set_palette itself - without
+           this its HDMI has no palette at all. 1 KB/frame is 50 KB/s against
+           a 50 MB/s link; making it conditional to save that would risk the
+           phase desync that has already cost two debugging rounds. */
+        {
+            extern uint32_t slave_palette[256];
+            link_s_bulk_send(&g_sess, slave_palette, sizeof(slave_palette));
+        }
     }
 #endif
 
@@ -433,9 +462,13 @@ static void handle_frame(void)
     if (ppu_len) {
         extern void slave_ppu_replay(const uint8_t *rec, uint32_t len);
         extern uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max);
+        /* Draw straight into the buffer that goes on the wire: GFX.Screen is
+           pointed at it, so there is no copy and no second screen buffer. */
+        extern uint8_t *slave_ppu_screen;
+        slave_ppu_screen = g_ppu_fb[g_ppu_slot];
+        { extern void slave_ppu_arm_frame(void); slave_ppu_arm_frame(); }
         slave_ppu_replay(g_ppu_stream, ppu_len);
-        g_ppu_fb_bytes = slave_ppu_copy_frame(g_ppu_fb[g_ppu_slot],
-                                              LINK_PPU_MAX_BYTES);
+        g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
         g_ppu_slot ^= 1u;
         g_ppu_fb_valid = true;
     }

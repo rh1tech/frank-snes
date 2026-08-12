@@ -94,6 +94,9 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
 void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
                            uint8_t *fb, uint32_t fb_max);
 
+extern uint32_t g_ppu_palette[256];
+extern volatile bool g_ppu_pal_valid;
+
 /* Bytes of framebuffer the last exchange returned, 0 if none. */
 uint32_t link_master_ppu_got(void);
 #endif
