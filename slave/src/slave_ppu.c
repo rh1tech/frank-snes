@@ -28,6 +28,7 @@
 #include "snes_alloc.h"
 #include "psram_allocator.h"
 #include "psram_init.h"
+#include "pico/stdlib.h"
 #include "settings.h"
 
 /* RP2350A QFN-60: the slave's PSRAM chip select is GPIO0 (slave/CMakeLists). */
@@ -53,6 +54,13 @@ settings_t g_settings = {
  * palette store that the link transport will ship alongside the frame. */
 uint32_t slave_palette[256];
 volatile bool slave_palette_dirty;
+
+/* Diagnostics returned to the master each frame - see link_ppu_stat_t. */
+volatile uint32_t slave_ppu_render_us;
+volatile uint32_t slave_ppu_records;
+volatile uint32_t slave_ppu_psram_ok;
+volatile uint32_t slave_ppu_alloc_fail;
+uint8_t *slave_ppu_stream_buf;
 
 void graphics_set_palette(uint8_t i, uint32_t color888)
 {
@@ -92,12 +100,29 @@ bool slave_ppu_init(void)
    IPPU.ScreenColors = (uint16_t *) snes_calloc(256 * 9, sizeof(uint16_t));
    IPPU.DirectColors = IPPU.ScreenColors + 256;
 
+   /* Report WHICH allocation failed: a single psram_ok=0 said only that
+      something did, and the something turned out to be an SRAM allocation,
+      not PSRAM at all. */
+   slave_ppu_alloc_fail =
+        (!Memory.VRAM              ? 0x01u : 0u)
+      | (!Memory.FillRAM           ? 0x02u : 0u)
+      | (!IPPU.ScreenColors        ? 0x04u : 0u)
+      | (!IPPU.TileCache[TILE_2BIT]? 0x08u : 0u)
+      | (!IPPU.TileCache[TILE_4BIT]? 0x10u : 0u)
+      | (!IPPU.TileCache[TILE_8BIT]? 0x20u : 0u)
+      | (!IPPU.TileCached[TILE_2BIT]?0x40u : 0u);
+
    if (!Memory.VRAM || !Memory.FillRAM || !IPPU.ScreenColors
        || !IPPU.TileCache[TILE_2BIT] || !IPPU.TileCache[TILE_4BIT]
        || !IPPU.TileCache[TILE_8BIT] || !IPPU.TileCached[TILE_2BIT]
        || !IPPU.TileCached[TILE_4BIT] || !IPPU.TileCached[TILE_8BIT])
       return false;
 
+   slave_ppu_stream_buf = (uint8_t *) psram_malloc(256u * 1024u);
+
+   slave_ppu_psram_ok = (IPPU.TileCache[TILE_2BIT] != NULL) &&
+                        (IPPU.TileCache[TILE_4BIT] != NULL) &&
+                        (IPPU.TileCache[TILE_8BIT] != NULL);
    return S9xInitGFX();
 }
 
@@ -112,6 +137,8 @@ bool slave_ppu_init(void)
 void slave_ppu_replay(const uint8_t *rec, uint32_t len)
 {
    uint32_t i = 0;
+   uint32_t t0 = time_us_32();
+   uint32_t n  = 0;
 
    while (i < len)
    {
@@ -156,9 +183,13 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
          break;
 
       default:
-         return;                 /* desynced: drop the rest of the frame */
+         goto done;              /* desynced: drop the rest of the frame */
       }
+      n++;
    }
+done:
+   slave_ppu_render_us = time_us_32() - t0;
+   slave_ppu_records   = n;
 }
 
 /* Copy the finished picture out of GFX.Screen for transmission. The renderer

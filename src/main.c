@@ -681,6 +681,15 @@ typedef struct {
     uint32_t ship_norender;        /* 1 = this sample had rendering skipped */
     uint32_t ship_cap_bytes;       /* PPU stream bytes captured per frame */
     uint32_t ship_cap_on;          /* 1 = capture was enabled for this sample */
+    uint32_t ship_link_us;         /* duration of the last link exchange */
+    uint32_t ship_link_fail;       /* cumulative exchange failures */
+    uint32_t ship_link_why;        /* address of the last go_offline reason */
+    uint32_t slave_render_us;
+    uint32_t slave_records;
+    uint32_t slave_oversize;
+    uint32_t slave_psram_ok;
+    uint32_t slave_impossible;
+    uint32_t ship_cap_overflow;    /* master records dropped: frame is WRONG */
 } frank_telemetry_t;
 /* 0 upd 1 rs 2 obj 3 bg0 4 bg1 5 bg2 6 bg3 7 mode7 8 zclear 9 sub 10 main
    11 colormath 12 backdrop 13 scale 14 tileconv */
@@ -2445,6 +2454,20 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                   { extern volatile uint32_t frank_cap_bytes, frank_cap_on;
                     frank_telemetry.ship_cap_bytes = frank_cap_bytes;
                     frank_telemetry.ship_cap_on    = frank_cap_on; }
+                  { uint32_t ex = 0, fa = 0, lu = 0;
+                    link_master_get_stats(&ex, &fa, &lu);
+                    frank_telemetry.ship_link_us   = lu;
+                    frank_telemetry.ship_link_fail = fa;
+                    { extern volatile const char *frank_link_why;
+                      frank_telemetry.ship_link_why = (uint32_t)frank_link_why; }
+                    { extern volatile link_ppu_stat_t g_ppu_stat;
+                      frank_telemetry.slave_render_us  = g_ppu_stat.render_us;
+                      frank_telemetry.slave_records    = g_ppu_stat.records;
+                      frank_telemetry.slave_oversize   = g_ppu_stat.oversize;
+                      frank_telemetry.slave_psram_ok   = g_ppu_stat.psram_ok;
+                      frank_telemetry.slave_impossible = g_ppu_stat.impossible; }
+                    { extern volatile uint32_t frank_cap_overflow;
+                      frank_telemetry.ship_cap_overflow = frank_cap_overflow; } }
 #endif
                   frank_upd_us = frank_rs_us = frank_rs_calls = 0; }
                 g_ship_emul_sum = 0; g_ship_emul_n = 0;

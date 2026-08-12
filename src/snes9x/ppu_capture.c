@@ -27,13 +27,18 @@
    It must NOT be in SRAM: a 16 KB static buffer here hung the board - master
    SRAM went from 22,032 to 7,128 bytes free and the heap starved. There is no
    room in SRAM for a frame store, and this is the frame store. */
-#define PPUCAP_BUF_BYTES (48u * 1024u)
+/* 256 KB. 48 KB was not enough: MK3's ROM/attract upload frames push ~11,955
+   writes to $2118 AND $2119 in a single frame, about 72 KB of records, and a
+   dropped record corrupts the slave's VRAM mirror permanently - it is not a
+   cosmetic loss. Measured overflow with a 48 KB store rose continuously in
+   attract mode. PSRAM has 8 MB; there is no reason to be tight here. */
+#define PPUCAP_BUF_BYTES (256u * 1024u)
 
 static uint8_t *ppucap_buf;        /* PSRAM, allocated by ppucap_init() */
 static uint32_t ppucap_len;
 
 volatile uint32_t frank_cap_bytes;
-volatile uint32_t frank_cap_on = 1;
+volatile uint32_t frank_cap_on = 1;   /* never cleared; see endframe */
 volatile uint32_t frank_cap_overflow;
 
 
@@ -100,12 +105,11 @@ void ppucap_endframe(void)
    ppucap_len   = 0;
    ppucap_total = 0;
 
-   /* Alternate capture on and off every 10 s so its cost is measured in the
-      SAME scene, as FRANK_SNES_NO_RENDER does for the renderer. Comparing
-      across sessions is worthless here - frame time swings 4% with scene. */
-#ifdef PICO_ON_DEVICE
-   frank_cap_on = ((time_us_32() / 10000000u) & 1u) ^ 1u;
-#endif
+   /* Capture stays ON. It alternated once, to measure its own cost against
+      the same scene - and that toggle survived into the offload, where every
+      OFF phase sent the slave an empty stream, so it rendered nothing and the
+      screen went black. The cost measurement is not worth a variable that can
+      silently stop the picture. */
 }
 
 #endif /* FRANK_SNES_PPU_CAPTURE */

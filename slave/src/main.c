@@ -145,11 +145,22 @@ static uint32_t g_frames, g_bad_frames;
 /* Double-buffered like the audio: one picture is on the wire while the next
    is being rendered. 8bpp paletted, the format the master's HDMI path already
    consumes, so the master needs no conversion. */
-static uint8_t  g_ppu_stream[8192];
+/* Must match the master's capture store (48 KB). A frame is ~2 KB in play,
+   but a ROM-load frame pushes ~12,000 VRAM writes = ~36 KB. Sizing this
+   smaller than the master's store desynchronises the WIRE, not just the
+   frame: the master sends a bulk the slave decided to skip, and every
+   exchange afterwards is misaligned. */
+/* In PSRAM, and the same size as the master's store. A frame is ~2 KB in
+   play but an upload frame is ~72 KB, and the slave has ~33 KB of SRAM free -
+   this cannot live there. PSRAM is otherwise unused apart from the tile
+   caches (448 KB of 8 MB). */
+#define SLAVE_PPU_STREAM_BYTES (256u * 1024u)
+static uint8_t *g_ppu_stream;
 static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
 static uint32_t g_ppu_fb_bytes;
 static uint32_t g_ppu_slot;
 static bool     g_ppu_fb_valid;
+volatile uint32_t g_ppu_oversize;   /* frames too big for the buffer */
 #endif
 
 /* Boot progress marker.
@@ -345,12 +356,24 @@ static void handle_frame(void)
     /* The PPU command stream rides in the same exchange, after the sound
        payloads. Receive it now; render it AFTER the reply. */
     uint32_t ppu_len = 0;
-    if (link_s_wait_ctrl(&g_sess, 100000u) == LINK_OP_PPU_STREAM) {
-        ppu_len = link_rx_hdr(&g_sess)->arg0;
-        if (ppu_len > sizeof(g_ppu_stream)) ppu_len = 0;
-        if (ppu_len && !link_s_bulk_recv(&g_sess, g_ppu_stream,
-                                         LINK_ALIGN4(ppu_len)))
-            ppu_len = 0;
+    extern uint8_t *slave_ppu_stream_buf;
+    g_ppu_stream = slave_ppu_stream_buf;
+    if (g_ppu_stream && link_s_wait_ctrl(&g_sess, 100000u) == LINK_OP_PPU_STREAM) {
+        uint32_t want = link_rx_hdr(&g_sess)->arg0;
+
+        /* Whatever the master announced MUST be taken off the wire. Skipping
+           it because it does not fit leaves those bytes in flight and every
+           later exchange misaligned - the link then never recovers. Receive
+           it, and only then decide whether it is usable. */
+        if (want > SLAVE_PPU_STREAM_BYTES) {
+            g_ppu_oversize++;
+            if (link_s_bulk_recv(&g_sess, g_ppu_stream,
+                                 LINK_ALIGN4(SLAVE_PPU_STREAM_BYTES)))
+                ppu_len = 0;          /* drained what we could; frame is lost */
+        } else if (want) {
+            if (link_s_bulk_recv(&g_sess, g_ppu_stream, LINK_ALIGN4(want)))
+                ppu_len = want;
+        }
     }
 #endif
 
@@ -377,9 +400,21 @@ static void handle_frame(void)
        picture would mean rendering before the reply and dropping the link.
        The cost is one frame of video latency, which was accepted in the
        design; the alternative is not a slower link, it is no link. */
-    if (ppu_len) {
+    {
         uint32_t fb_bytes = g_ppu_fb_valid ? g_ppu_fb_bytes : 0;
-        link_s_send_ctrl(&g_sess, LINK_OP_PPU_FRAME, fb_bytes, 0, NULL, 0);
+        {
+            extern volatile uint32_t slave_ppu_render_us, slave_ppu_records,
+                                     slave_ppu_psram_ok, slave_ppu_impossible;
+            link_ppu_stat_t st;
+            st.render_us  = slave_ppu_render_us;
+            st.records    = slave_ppu_records;
+            st.oversize   = g_ppu_oversize;
+            { extern volatile uint32_t slave_ppu_alloc_fail;
+              st.psram_ok = slave_ppu_psram_ok | (slave_ppu_alloc_fail << 8); }
+            st.impossible = slave_ppu_impossible;
+            link_s_send_ctrl(&g_sess, LINK_OP_PPU_FRAME, fb_bytes, 0,
+                             &st, sizeof(st));
+        }
         if (fb_bytes)
             link_s_bulk_send(&g_sess, g_ppu_fb[g_ppu_slot ^ 1u],
                              LINK_ALIGN4(fb_bytes));

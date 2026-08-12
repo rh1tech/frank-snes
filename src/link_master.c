@@ -57,11 +57,16 @@ static uint32_t g_exchanges, g_failures, g_last_us;
 /* Bring-up                                                           */
 /* ------------------------------------------------------------------ */
 
+/* The reason string's address, published so a probe can read WHY the link
+   dropped without a console - this board has no usable UART. */
+volatile const char *frank_link_why;
+
 static void go_offline(const char *why)
 {
     if (g_online) {
         LOG("[link] offline: %s\n", why);
         g_failures++;
+        frank_link_why = why;
     }
     g_online = false;
 }
@@ -297,6 +302,10 @@ void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
 }
 
 uint32_t link_master_ppu_got(void) { return g_ppu_fb_got; }
+
+/* The slave's per-frame diagnostics, published so a probe on the MASTER can
+   see inside the slave - there is no console or probe on that chip. */
+volatile link_ppu_stat_t g_ppu_stat;
 #endif
 
 bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
@@ -343,14 +352,19 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
 #ifdef FRANK_SNES_PPU_CAPTURE
     /* The PPU command stream rides here: after the sound payloads, before
        the reply, so it costs no extra doorbell phase. */
+    /* The header goes out UNCONDITIONALLY once the offload is active, even
+       for an empty frame. The slave waits for it, so skipping it on a frame
+       that captured nothing left the slave blocking on link_s_wait_ctrl for
+       its full 100 ms timeout - 13 fps, with the screen black. A protocol
+       whose phases depend on payload size is a protocol that deadlocks. */
     g_ppu_fb_got = 0;
-    if (g_ppu_len) {
+    if (g_ppu_fb) {
         if (!link_m_send_ctrl(&g_sess, LINK_OP_PPU_STREAM, g_ppu_len, 0,
                               NULL, 0)) {
             go_offline("ppu stream header failed");
             return false;
         }
-        if (!link_m_bulk_send(&g_sess, g_ppu_stream, g_ppu_len)) {
+        if (g_ppu_len && !link_m_bulk_send(&g_sess, g_ppu_stream, g_ppu_len)) {
             go_offline("ppu stream bulk failed");
             return false;
         }
@@ -399,7 +413,7 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
        is fatal, not clamped - the slave is about to put those bytes on the
        wire whatever we do, and receiving fewer desynchronises every exchange
        after it. */
-    if (g_ppu_len && g_ppu_fb) {
+    if (g_ppu_fb) {
         if (!link_m_recv_ctrl(&g_sess)) {
             go_offline("no ppu frame header");
             return false;
@@ -409,6 +423,8 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
             return false;
         }
         uint32_t fb = link_rx_hdr(&g_sess)->arg0;
+        memcpy((void *)&g_ppu_stat, g_ctrl_rx + sizeof(link_hdr_t),
+               sizeof(g_ppu_stat));
         if (fb > g_ppu_fb_max) {
             go_offline("slave returned an oversized framebuffer");
             return false;

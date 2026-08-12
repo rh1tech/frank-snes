@@ -144,6 +144,16 @@ enum {
 #define LINK_PPU_MAX_HEIGHT  239
 #define LINK_PPU_MAX_BYTES   (LINK_PPU_MAX_WIDTH * LINK_PPU_MAX_HEIGHT)
 
+/* Rides in the LINK_OP_PPU_FRAME control frame's payload. The slave has no
+ * console and no probe on it, so this is the only way to see inside it. */
+typedef struct __attribute__((packed)) {
+    uint32_t render_us;      /* time in slave_ppu_replay for the last frame */
+    uint32_t records;        /* records replayed */
+    uint32_t oversize;       /* streams too big for the slave's buffer */
+    uint32_t psram_ok;       /* 1 if the PSRAM tile caches allocated         */
+    uint32_t impossible;     /* CPU-side registers the stream should not carry */
+} link_ppu_stat_t;
+
 /* ---- Frame header (24 bytes), followed by payload, zero-padded to
  *      LINK_CTRL_BYTES. ---- */
 typedef struct __attribute__((packed)) {
