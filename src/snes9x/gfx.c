@@ -3070,6 +3070,18 @@ GFX_HOT static void RenderScreen(uint8_t* Screen, bool sub, bool force_no_add, u
 GFX_HOT void S9xUpdateScreen(void)
 {
    uint32_t __upd_a = time_us_32();
+#ifdef FRANK_SNES_PPU_CAPTURE
+   /* The slave renders. The master still runs RenderLine (it builds LineData
+      and emits the scanline markers the stream needs) and still reaches here
+      through FLUSH_REDRAW, but it draws nothing: the picture arrives over the
+      link and lands directly in SCREEN[current_buffer].
+      PreviousLine must still advance, or FLUSH_REDRAW would fire on every
+      register write for the rest of the frame. */
+   IPPU.PreviousLine = IPPU.CurrentLine;
+   frank_upd_us += time_us_32() - __upd_a;
+   return;
+#endif
+
 #ifdef FRANK_SNES_NO_RENDER
    /* Measurement build for the PPU-offload decision. Rendering is skipped on
       alternating 10-second phases rather than permanently: a permanently

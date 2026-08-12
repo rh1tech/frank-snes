@@ -30,6 +30,7 @@
 #define PPU_CAPTURE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define PPUCAP_WRITE 0x01   /* reg8 (low byte of $21xx), value8 */
 #define PPUCAP_LINE  0x05   /* scanline8 — slave runs RenderLine() */
@@ -37,6 +38,8 @@
 
 #ifdef FRANK_SNES_PPU_CAPTURE
 
+bool ppucap_init(void);                       /* allocates the PSRAM store */
+const uint8_t *ppucap_take(uint32_t *len);    /* this frame's stream */
 void ppucap_write(uint16_t address, uint8_t value);
 void ppucap_line(uint8_t line);
 void ppucap_endframe(void);

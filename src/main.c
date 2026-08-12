@@ -109,6 +109,9 @@ void s9x_link_frame(void);
 // Audio optimizations
 #include "audio_opt.h"
 
+#include "snes9x/ppu_capture.h"
+#include "link_master.h"
+
 #ifdef FRANK_SNES_HDMI_ALT
 // HDMI_ALT (libdvi-backed) entry points and audio ring write.
 #include "hdmi_alt.h"
@@ -1252,6 +1255,12 @@ static inline void snes9x_init(void) {
 #else
     S9xInitDisplay();
     S9xInitMemory();
+#ifdef FRANK_SNES_PPU_CAPTURE
+    /* The PPU command store is 48 KB and lives in PSRAM: master SRAM has only
+       ~22 KB free, and a static buffer there hung the board. */
+    if (!ppucap_init())
+        LOG("FATAL: ppucap_init failed (no PSRAM for the PPU stream)\n");
+#endif
     S9xInitAPU();
     S9xInitSound(0, 0);
     if (!S9xInitGFX()) {
@@ -1935,6 +1944,22 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             if (psram_crc_checks == 0) psram_crc_first = h;
             else if (h != psram_crc_first) psram_crc_errors++;
             psram_crc_checks++;
+        }
+#endif
+
+#ifdef FRANK_SNES_PPU_CAPTURE
+        /* PPU offload: hand this frame's command stream to the link and say
+           where the slave's finished picture should land. The capture is
+           complete here - S9xEndScreenRefresh, which closes the stream, ran
+           inside S9xMainLoop above - and the exchange happens in
+           s9x_link_frame() just below, so the stream rides the sound frame's
+           doorbell phases instead of buying its own. */
+        {
+            uint32_t cap_len = 0;
+            const uint8_t *cap = ppucap_take(&cap_len);
+            link_master_ppu_stage(cap, cap_len,
+                                  SCREEN[current_buffer],
+                                  SNES_WIDTH * SNES_HEIGHT);
         }
 #endif
 
