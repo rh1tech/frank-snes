@@ -28,9 +28,24 @@
 #include "snes_alloc.h"
 #include "psram_allocator.h"
 #include "psram_init.h"
+#include "settings.h"
 
 /* RP2350A QFN-60: the slave's PSRAM chip select is GPIO0 (slave/CMakeLists). */
 #define SLAVE_PSRAM_CS_PIN 0
+
+/* The renderer reads four fields of g_settings (bg_enabled, sprites_enabled,
+ * transparency_enabled, crt_overscan). The master's settings.c cannot come
+ * with it - that file loads the settings from the SD card through FatFS, and
+ * the slave has no SD. The master owns the user's settings and will send them
+ * over the link with the stream; until then these are the shipping defaults.
+ *
+ * They must match the master's, or the two halves render differently. */
+settings_t g_settings = {
+   .bg_enabled           = { true, true, true, true },
+   .sprites_enabled      = true,
+   .transparency_enabled = true,
+   .crt_overscan         = false,
+};
 
 /* The renderer calls into the master's HDMI palette API. The slave drives no
  * display: it renders to a paletted buffer and returns that buffer plus the
@@ -144,4 +159,18 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
          return;                 /* desynced: drop the rest of the frame */
       }
    }
+}
+
+/* Copy the finished picture out of GFX.Screen for transmission. The renderer
+ * draws 8bpp paletted at GFX.Pitch bytes per line, which is what the master's
+ * HDMI path already expects, so this is a straight copy of the visible lines
+ * and no format conversion happens on either chip. */
+uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max)
+{
+   uint32_t h = (uint32_t) PPU.ScreenHeight;
+   uint32_t w = GFX.Pitch;
+   uint32_t n = w * h;
+   if (!dst || n > max) return 0;
+   memcpy(dst, GFX.Screen, n);
+   return n;
 }

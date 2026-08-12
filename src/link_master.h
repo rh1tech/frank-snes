@@ -70,6 +70,34 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
                                 int16_t *samples, uint32_t n_samples,
                                 link_frame_reply_t *reply);
 
+#ifdef FRANK_SNES_PPU_CAPTURE
+/* PPU offload. The stream goes out inside the SAME exchange as the sound
+ * frame and the rendered picture comes back in the same reply, because the
+ * first assembled board measured that the doorbell PHASES, not the bytes,
+ * are what an exchange costs - see the note on LINK_OP_FRAME. A separate
+ * PPU exchange would double the per-frame round trips to move 4 KB across a
+ * link that is 99.94% idle.
+ *
+ *   ppu_stream / ppu_len   the captured PPU command stream for this frame
+ *   fb / fb_max            where the slave's finished 8bpp picture lands
+ *
+ * Staged, not passed: link_master_frame_exchange() picks these up and sends
+ * the stream between the sound payloads and the reply, so it lands in the
+ * same phase group. Handing them to a separate call would put them in an
+ * exchange of their own, which is exactly the cost being avoided.
+ *
+ *   ppu_stream / ppu_len   the captured PPU command stream for this frame
+ *   fb / fb_max            where the slave's finished 8bpp picture lands
+ *
+ * Staging len == 0 leaves the exchange exactly as it was, so the sound path
+ * is unaffected when the offload is off. */
+void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
+                           uint8_t *fb, uint32_t fb_max);
+
+/* Bytes of framebuffer the last exchange returned, 0 if none. */
+uint32_t link_master_ppu_got(void);
+#endif
+
 /* Per-second counters for the profile build. */
 void link_master_get_stats(uint32_t *exchanges, uint32_t *failures,
                            uint32_t *last_us);

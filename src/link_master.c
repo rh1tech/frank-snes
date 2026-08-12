@@ -278,6 +278,27 @@ bool link_master_reset_and_sync_aram(const uint8_t *aram)
 /* The per-frame exchange                                             */
 /* ------------------------------------------------------------------ */
 
+#ifdef FRANK_SNES_PPU_CAPTURE
+/* Staged by the emulation loop before the exchange; consumed inside it so the
+ * PPU traffic shares the sound frame's doorbell phases. */
+static const uint8_t *g_ppu_stream;
+static uint32_t       g_ppu_len;
+static uint8_t       *g_ppu_fb;
+static uint32_t       g_ppu_fb_max;
+static uint32_t       g_ppu_fb_got;
+
+void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
+                           uint8_t *fb, uint32_t fb_max)
+{
+    g_ppu_stream = ppu_stream;
+    g_ppu_len    = ppu_len;
+    g_ppu_fb     = fb;
+    g_ppu_fb_max = fb_max;
+}
+
+uint32_t link_master_ppu_got(void) { return g_ppu_fb_got; }
+#endif
+
 bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
                                 const link_aram_run_t *runs, uint32_t n_runs,
                                 uint32_t chunks, const uint8_t *aram,
@@ -319,6 +340,23 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
         }
     }
 
+#ifdef FRANK_SNES_PPU_CAPTURE
+    /* The PPU command stream rides here: after the sound payloads, before
+       the reply, so it costs no extra doorbell phase. */
+    g_ppu_fb_got = 0;
+    if (g_ppu_len) {
+        if (!link_m_send_ctrl(&g_sess, LINK_OP_PPU_STREAM, g_ppu_len, 0,
+                              NULL, 0)) {
+            go_offline("ppu stream header failed");
+            return false;
+        }
+        if (!link_m_bulk_send(&g_sess, g_ppu_stream, g_ppu_len)) {
+            go_offline("ppu stream bulk failed");
+            return false;
+        }
+    }
+#endif
+
     /* --- the reply --- */
     if (!link_m_recv_ctrl(&g_sess)) {
         go_offline("no frame ack");
@@ -354,6 +392,36 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
         }
     }
     reply->samples = got;
+
+#ifdef FRANK_SNES_PPU_CAPTURE
+    /* The rendered picture comes back last, still inside this exchange.
+       Same rule as the sample bulk above: a length larger than we can hold
+       is fatal, not clamped - the slave is about to put those bytes on the
+       wire whatever we do, and receiving fewer desynchronises every exchange
+       after it. */
+    if (g_ppu_len && g_ppu_fb) {
+        if (!link_m_recv_ctrl(&g_sess)) {
+            go_offline("no ppu frame header");
+            return false;
+        }
+        if (link_rx_hdr(&g_sess)->op != LINK_OP_PPU_FRAME) {
+            go_offline("wrong ppu frame op");
+            return false;
+        }
+        uint32_t fb = link_rx_hdr(&g_sess)->arg0;
+        if (fb > g_ppu_fb_max) {
+            go_offline("slave returned an oversized framebuffer");
+            return false;
+        }
+        if (fb) {
+            if (!link_m_bulk_recv(&g_sess, g_ppu_fb, LINK_ALIGN4(fb))) {
+                go_offline("ppu framebuffer bulk failed");
+                return false;
+            }
+        }
+        g_ppu_fb_got = fb;
+    }
+#endif
 
     g_last_us = time_us_32() - t0;
     g_exchanges++;

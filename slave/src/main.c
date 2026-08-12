@@ -132,6 +132,26 @@ static uint8_t __attribute__((aligned(4))) g_chunk[LINK_ARAM_CHUNK_BYTES];
 
 static uint32_t g_frames, g_bad_frames;
 
+#if defined(FRANK_SNES_PPU_SLAVE) && defined(C2_NO_PIPELINE)
+/* Not a build combination, and it must fail loudly rather than silently
+   dropping the renderer. C2_NO_PIPELINE makes the slave mix BEFORE replying;
+   with the renderer here that means rendering (~7.6 ms) before the reply,
+   against a master doorbell patience of a few milliseconds. The link would
+   drop every frame. The PPU offload requires the pipeline. */
+#error "FRANK_SNES_PPU_SLAVE requires the reply pipeline: build with -DC2_NO_PIPELINE=OFF"
+#endif
+
+#ifdef FRANK_SNES_PPU_SLAVE
+/* Double-buffered like the audio: one picture is on the wire while the next
+   is being rendered. 8bpp paletted, the format the master's HDMI path already
+   consumes, so the master needs no conversion. */
+static uint8_t  g_ppu_stream[8192];
+static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
+static uint32_t g_ppu_fb_bytes;
+static uint32_t g_ppu_slot;
+static bool     g_ppu_fb_valid;
+#endif
+
 /* Boot progress marker.
  *
  * This chip has no console — its UART is not wired on this board — so
@@ -321,6 +341,19 @@ static void handle_frame(void)
     }
 #endif
 
+#ifdef FRANK_SNES_PPU_SLAVE
+    /* The PPU command stream rides in the same exchange, after the sound
+       payloads. Receive it now; render it AFTER the reply. */
+    uint32_t ppu_len = 0;
+    if (link_s_wait_ctrl(&g_sess, 100000u) == LINK_OP_PPU_STREAM) {
+        ppu_len = link_rx_hdr(&g_sess)->arg0;
+        if (ppu_len > sizeof(g_ppu_stream)) ppu_len = 0;
+        if (ppu_len && !link_s_bulk_recv(&g_sess, g_ppu_stream,
+                                         LINK_ALIGN4(ppu_len)))
+            ppu_len = 0;
+    }
+#endif
+
     if (g_have_pending) {
         uint32_t send_slot = g_mix_slot ^ 1u;
         uint32_t got = g_pending_reply.samples;
@@ -337,12 +370,41 @@ static void handle_frame(void)
                          &empty, sizeof(empty));
     }
 
+#ifdef FRANK_SNES_PPU_SLAVE
+    /* Return the picture rendered from the PREVIOUS stream, for the same
+       reason the audio is pipelined: rendering is ~7.6 ms and the master's
+       doorbell patience is a few milliseconds. Replying with this frame's
+       picture would mean rendering before the reply and dropping the link.
+       The cost is one frame of video latency, which was accepted in the
+       design; the alternative is not a slower link, it is no link. */
+    if (ppu_len) {
+        uint32_t fb_bytes = g_ppu_fb_valid ? g_ppu_fb_bytes : 0;
+        link_s_send_ctrl(&g_sess, LINK_OP_PPU_FRAME, fb_bytes, 0, NULL, 0);
+        if (fb_bytes)
+            link_s_bulk_send(&g_sess, g_ppu_fb[g_ppu_slot ^ 1u],
+                             LINK_ALIGN4(fb_bytes));
+    }
+#endif
+
     /* Now mix, with the wire idle and the master away doing its own
      * frame. How many samples is not carried in the bulk: the count in
      * the reply tells the master what to arm for next time. */
     slave_sound_frame(g_events, n_events,
                       g_samples[g_mix_slot], slave_sound_want(chunks),
                       &g_pending_reply);
+
+#ifdef FRANK_SNES_PPU_SLAVE
+    /* Wire idle, master away: render this frame's stream for next time. */
+    if (ppu_len) {
+        extern void slave_ppu_replay(const uint8_t *rec, uint32_t len);
+        extern uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max);
+        slave_ppu_replay(g_ppu_stream, ppu_len);
+        g_ppu_fb_bytes = slave_ppu_copy_frame(g_ppu_fb[g_ppu_slot],
+                                              LINK_PPU_MAX_BYTES);
+        g_ppu_slot ^= 1u;
+        g_ppu_fb_valid = true;
+    }
+#endif
 
     g_mix_slot ^= 1u;
     g_have_pending = true;

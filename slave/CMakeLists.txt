@@ -72,11 +72,14 @@ set(SLAVE_PPU_SOURCES
     ${REPO_ROOT}/drivers/psram_allocator.c
 )
 
+option(FRANK_SNES_PPU_SLAVE "PPU offload: render on the slave" OFF)
+
 add_executable(frank-snes-slave
     src/main.c
     src/slave_glue.c
     src/slave_sound.c
     src/slave_ppu.c
+    src/slave_ppu_stubs.c
     ${SLAVE_SOUND_SOURCES}
     ${SLAVE_PPU_SOURCES}
 )
@@ -141,3 +144,10 @@ pico_enable_stdio_uart(frank-snes-slave 1)
 pico_enable_stdio_usb(frank-snes-slave 0)
 
 pico_add_extra_outputs(frank-snes-slave)
+
+if(FRANK_SNES_PPU_SLAVE)
+    # NOT FRANK_SNES_PPU_CAPTURE: that switches on the capture hooks inside the
+    # shared gfx.c/ppu.c/dma.c, which is the MASTER's role. The slave links the
+    # same files to REPLAY, and must not capture what it renders.
+    target_compile_definitions(frank-snes-slave PRIVATE FRANK_SNES_PPU_SLAVE=1)
+endif()
