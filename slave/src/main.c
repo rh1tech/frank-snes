@@ -213,6 +213,8 @@ static volatile uint32_t g_render_waits, g_render_wait_us;
 /* Which PSRAM staging buffer core 0 will fill next, and which one core 1 is
    replaying. Core 0 only has to wait when those are the same. */
 static volatile uint32_t g_ppu_stage_slot, g_render_stage_slot = 0xffffffffu;
+/* Staging copies that had to be repeated, and those that never took. */
+static volatile uint32_t g_ppu_stage_retry, g_ppu_stage_lost;
 extern uint8_t *slave_ppu_stage_buf[];
 #define G_PPU_STAGE_SLOTS 4u
 /* Diagnostic: receive the stream but skip the replay, to tell a bad RECEIVE
@@ -499,13 +501,43 @@ static void handle_frame(void)
             /* One bulk per chunk, always into SRAM, then copied to the PSRAM
                staging buffer with the CPU. The DMA never touches PSRAM, so
                there is no oversized case left to fail. */
+            /* Summed as it comes OFF THE WIRE, before it is staged, so a
+               byte that changes in transit and a byte that changes in the
+               SRAM->PSRAM staging are distinguishable. The replay sums the
+               staged copy; comparing the two against the master's says which
+               half is at fault instead of just that one of them is. */
+            uint32_t rxh = 2166136261u;
             for (uint32_t off = 0; off < want; off += LINK_PPU_STREAM_CHUNK) {
                 uint32_t n = want - off;
                 if (n > LINK_PPU_STREAM_CHUNK) n = LINK_PPU_STREAM_CHUNK;
                 if (!link_s_bulk_recv(&g_sess, g_ppu_stream_sram,
                                       LINK_ALIGN4(n))) { ok = false; break; }
-                memcpy(stage + off, g_ppu_stream_sram, n);
+                for (uint32_t i = 0; i < n; i++) {
+                    rxh ^= g_ppu_stream_sram[i]; rxh *= 16777619u;
+                }
+                /* Verify the staging copy WHILE THE SOURCE IS STILL HERE.
+                 *
+                 * Measured with the sum computed both on arrival and after
+                 * staging: 28 corrupt streams, wire 0, staging 28, every one
+                 * of them a multi-chunk frame. So the bytes are right when
+                 * they come off the wire and wrong when core 1 reads them -
+                 * this core writes ~100 KB into PSRAM through a 16 KB XIP
+                 * cache while core 1 is reading its PSRAM tile caches flat
+                 * out, and some of those writes do not survive it.
+                 *
+                 * The next bulk overwrites this SRAM buffer, so this is the
+                 * only moment a bad copy can be repeated. A retry here turns
+                 * a permanently wrong VRAM mirror - which is what the
+                 * distorted sprites were - into a few microseconds. */
+                for (uint32_t try = 0; ; try++) {
+                    memcpy(stage + off, g_ppu_stream_sram, n);
+                    if (!memcmp(stage + off, g_ppu_stream_sram, n)) break;
+                    g_ppu_stage_retry++;
+                    if (try >= 3u) { g_ppu_stage_lost++; break; }
+                }
             }
+            { extern volatile uint32_t slave_ppu_rx_sum;
+              slave_ppu_rx_sum = rxh; }
             if (!ok) {
                 g_ppu_recv_fail++;
             } else {
@@ -1114,9 +1146,11 @@ int main(void)
                                          slave_ppu_stop_why,
                                          slave_ppu_bad_lines;
                 extern volatile uint32_t slave_ppu_exp_sum, slave_ppu_sum_ok,
-                                         slave_ppu_sum_bad;
+                                         slave_ppu_sum_bad, slave_ppu_bad_multi,
+                                         slave_ppu_bad_single, slave_ppu_bad_wire,
+                                         slave_ppu_bad_stage;
                 printf(" | slen=%lu sum=%08lx exp=%08lx ok=%lu bad=%lu"
-                       " stop=%lu why=%lu ctx=%08lx badln=%lu",
+                       " stop=%lu why=%lu badm=%lu bads=%lu wire=%lu stage=%lu rt=%lu/%lu",
                        (unsigned long)slave_ppu_stream_len,
                        (unsigned long)slave_ppu_stream_sum,
                        (unsigned long)slave_ppu_exp_sum,
@@ -1124,8 +1158,12 @@ int main(void)
                        (unsigned long)slave_ppu_sum_bad,
                        (unsigned long)slave_ppu_stop_off,
                        (unsigned long)slave_ppu_stop_why,
-                       (unsigned long)slave_ppu_stop_ctx,
-                       (unsigned long)slave_ppu_bad_lines);
+                       (unsigned long)slave_ppu_bad_multi,
+                       (unsigned long)slave_ppu_bad_single,
+                       (unsigned long)slave_ppu_bad_wire,
+                       (unsigned long)slave_ppu_bad_stage,
+                       (unsigned long)g_ppu_stage_retry,
+                       (unsigned long)g_ppu_stage_lost);
                 extern volatile uint32_t slave_ppu_upd_calls, slave_ppu_vram_w,
                                          slave_ppu_cgram_w, slave_ppu_r2100_w,
                                          slave_ppu_r2100_last,

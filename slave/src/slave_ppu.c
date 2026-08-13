@@ -26,6 +26,7 @@
 #include "ppu.h"
 #include "gfx.h"
 #include "ppu_capture.h"
+#include "link_proto.h"
 #include "snes_alloc.h"
 #include "psram_allocator.h"
 #include "psram_init.h"
@@ -93,6 +94,11 @@ volatile uint32_t slave_ppu_stream_sum;
 volatile uint32_t slave_ppu_exp_sum;    /* set by the link, from the payload */
 volatile uint32_t slave_ppu_sum_ok;
 volatile uint32_t slave_ppu_sum_bad;
+volatile uint32_t slave_ppu_bad_multi, slave_ppu_bad_single, slave_ppu_bad_maxlen;
+/* Sum of the stream as it came off the wire, before staging. */
+volatile uint32_t slave_ppu_rx_sum;
+volatile uint32_t slave_ppu_bad_wire;    /* differed already on arrival     */
+volatile uint32_t slave_ppu_bad_stage;   /* arrived right, staged wrong     */
 volatile uint32_t slave_ppu_stop_off;
 volatile uint32_t slave_ppu_stop_ctx;
 volatile uint32_t slave_ppu_stop_why;   /* 1 bad tag, 2 truncated, 0 clean */
@@ -527,8 +533,23 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
       corrupt capture. */
    slave_ppu_stream_len = len;
    slave_ppu_stream_sum = ppucap_sum(rec, len);
-   if (slave_ppu_stream_sum == slave_ppu_exp_sum) slave_ppu_sum_ok++;
-   else                                           slave_ppu_sum_bad++;
+   if (slave_ppu_stream_sum == slave_ppu_exp_sum) {
+      slave_ppu_sum_ok++;
+   } else {
+      /* Split by size class. The stream is delivered as ceil(len/16 KB)
+         bulks, so a mismatch on a multi-chunk frame implicates the chunking
+         and a mismatch on a single-chunk one does not. The sprites are made
+         of tiles the game uploads once at the start of a fight and never
+         rewrites, so a stream lost THEN stays visible for the whole match -
+         which is why the corruption looks permanent while the steady-state
+         counters read clean. */
+      slave_ppu_sum_bad++;
+      if (len > LINK_PPU_STREAM_CHUNK) slave_ppu_bad_multi++;
+      else                             slave_ppu_bad_single++;
+      if (len > slave_ppu_bad_maxlen) slave_ppu_bad_maxlen = len;
+      if (slave_ppu_rx_sum != slave_ppu_exp_sum) slave_ppu_bad_wire++;
+      else                                       slave_ppu_bad_stage++;
+   }
    slave_ppu_stop_why   = 0;
    slave_ppu_stop_off   = len;
    slave_ppu_stop_ctx   = 0;

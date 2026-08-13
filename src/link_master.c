@@ -334,6 +334,8 @@ static uint32_t       g_ppu_fb_got;
 #define PPU_TX_BOUNCE_BYTES LINK_PPU_STREAM_CHUNK
 static uint8_t __attribute__((aligned(4))) g_ppu_tx_bounce[PPU_TX_BOUNCE_BYTES];
 volatile uint32_t g_ppu_tx_psram;   /* frames too big to bounce through SRAM */
+/* Does this chip read its own capture buffer the same way twice? */
+volatile uint32_t g_ppu_reread_ok, g_ppu_reread_bad;
 
 void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
                            uint8_t *fb, uint32_t fb_max)
@@ -484,15 +486,34 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
     g_ppu_sent_len = g_ppu_len;
     if (g_ppu_len) g_ppu_sends++;
     /* Chunked, through SRAM, so no DMA ever reads the XIP window. The CPU
-       copy out of PSRAM is fine - it is the DMA that is not. */
-    for (uint32_t off = 0; off < g_ppu_len; off += LINK_PPU_STREAM_CHUNK) {
+       copy out of PSRAM is fine - it is the DMA that is not.
+     *
+     * The sum is recomputed here, over the bytes actually copied, and
+     * compared with the one ppucap_take() computed over the same PSRAM a
+     * moment earlier. The slave reports about 0.57% of streams failing their
+     * checksum with no receive failures at all - the bulk completes and the
+     * bytes are wrong - and that has two very different explanations: the
+     * wire corrupted them, or this chip read PSRAM differently the second
+     * time. Reading it twice and comparing is the only thing that separates
+     * them, and it costs one pass over a buffer already in cache. */
+    { uint32_t h = 2166136261u;
+      for (uint32_t off = 0; off < g_ppu_len; off += LINK_PPU_STREAM_CHUNK) {
         uint32_t n = g_ppu_len - off;
         if (n > LINK_PPU_STREAM_CHUNK) n = LINK_PPU_STREAM_CHUNK;
         memcpy(g_ppu_tx_bounce, g_ppu_stream + off, n);
+        for (uint32_t i = 0; i < n; i++) {
+            h ^= g_ppu_tx_bounce[i]; h *= 16777619u;
+        }
         if (!link_m_bulk_send(&g_sess, g_ppu_tx_bounce, LINK_ALIGN4(n))) {
             go_offline("ppu stream bulk failed");
             return false;
         }
+      }
+      if (g_ppu_len) {
+        extern volatile uint32_t frank_cap_sum;
+        if (h == frank_cap_sum) g_ppu_reread_ok++;
+        else                    g_ppu_reread_bad++;
+      }
     }
 #endif
 
@@ -548,6 +569,19 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
     if (g_ppu_fb) {
         uint32_t fb = reply->ppu_fb_bytes;
         g_ppu_stat  = reply->ppu_stat;
+
+        /* A corrupt stream is not a dropped frame - it is a permanently wrong
+           VRAM mirror, because the slave cannot ask for those writes again
+           and the game will not resend them. That is exactly what the
+           distorted sprites were: tile data uploaded once at the start of a
+           fight, damaged by one bad stream, then left on screen for the whole
+           match while every steady-state counter read clean.
+           The slave already reports it. Repair it. */
+        { static uint32_t prev_bad;
+          uint32_t now_bad = reply->ppu_stat.sum_bad;
+          if (now_bad > prev_bad) ppucap_request_resync();
+          prev_bad = now_bad; }
+
         if (fb > g_ppu_fb_max) {
             go_offline("slave returned an oversized framebuffer");
             return false;

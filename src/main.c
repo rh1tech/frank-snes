@@ -734,6 +734,8 @@ typedef struct {
        comparable - which a debug-probe read of PSRAM is not, because the
        cache holds what the CPU wrote and the AP sees the backing store. */
     uint32_t master_vramnz;
+    /* PSRAM read stability - see link_master.c. */
+    uint32_t ppu_reread_ok, ppu_reread_bad;
     /* HDMI health. Counting interrupts alone once "proved" the generator
        healthy on a display that had no signal; the GAP is what decides it. */
     uint32_t hdmi_irqs, hdmi_gap_max, hdmi_late;
@@ -2693,6 +2695,9 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_hdmi_irqs = 0;
                       frank_hdmi_gap_max = 0;
                       frank_hdmi_late = 0; }
+                    { extern volatile uint32_t g_ppu_reread_ok, g_ppu_reread_bad;
+                      frank_telemetry.ppu_reread_ok  = g_ppu_reread_ok;
+                      frank_telemetry.ppu_reread_bad = g_ppu_reread_bad; }
                     if (Memory.VRAM) {
                         uint32_t n = 0;
                         for (uint32_t i = 0; i < 0x10000u; i += 8u)
