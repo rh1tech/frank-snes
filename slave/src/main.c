@@ -178,11 +178,13 @@ static uint8_t *g_ppu_stream;
  * replay hang that got it reverted has to be re-tested against a picture
  * rather than against another blank screen.
  *
- * 64 KB covers every frame observed in play (450 B - 2.2 KB) and the 41,760 B
- * attract uploads. A frame bigger than this still falls back to PSRAM and will
- * still mostly fail; g_ppu_oversize_sram counts those so it cannot be mistaken
- * for success. */
-#define SLAVE_PPU_SRAM_BYTES (64u * 1024u)
+ * 48 KB covers every frame observed in play (450 B - 12 KB) and the 41,760 B
+ * attract uploads. It was 64 KB until core 1 needed a 16 KB stack and RAM
+ * overflowed by 3,180 bytes; 48 KB is what fits beside that stack while still
+ * clearing the largest stream actually measured. A frame bigger than this
+ * still falls back to PSRAM and will still mostly fail; g_ppu_oversize_sram
+ * counts those so it cannot be mistaken for success. */
+#define SLAVE_PPU_SRAM_BYTES (48u * 1024u)
 static uint8_t g_ppu_stream_sram[SLAVE_PPU_SRAM_BYTES] __attribute__((aligned(4)));
 static uint32_t g_ppu_oversize_sram;
 static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
@@ -202,6 +204,16 @@ static uint8_t * volatile g_render_buf;
    and how many core 1 finished. Equal and climbing = healthy; kicks climbing
    with dones stuck = core 1 never ran or died on its first frame. */
 static volatile uint32_t g_render_kicks, g_render_dones;
+/* Core 1's stack, sized deliberately - see the launch site. */
+static __attribute__((aligned(8))) uint32_t g_render_stack[16u * 1024u / 4u];
+/* How often core 0 had to wait for core 1 to release the stream buffer.
+   Non-zero means the render is overrunning the frame and the link is paying
+   for it again; zero means the handoff is free. */
+static volatile uint32_t g_render_waits, g_render_wait_us;
+/* Which PSRAM staging buffer core 0 will fill next, and which one core 1 is
+   replaying. Core 0 only has to wait when those are the same. */
+static volatile uint32_t g_ppu_stage_slot, g_render_stage_slot = 0xffffffffu;
+static uint8_t *g_ppu_stage[2];
 /* Diagnostic: receive the stream but skip the replay, to tell a bad RECEIVE
    from a bad REPLAY. Flipped over the wire is not possible here, so it is a
    build-time default that can be patched live via the debugger on the master
@@ -435,12 +447,30 @@ static void handle_frame(void)
     /* The PPU command stream rides in the same exchange, after the sound
        payloads. Receive it now; render it AFTER the reply. */
     uint32_t ppu_len = 0;
-    extern uint8_t *slave_ppu_stream_buf;
-    g_ppu_stream = slave_ppu_stream_buf;
+    extern uint8_t *slave_ppu_stream_buf, *slave_ppu_stream_buf2;
+    g_ppu_stage[0] = slave_ppu_stream_buf;
+    g_ppu_stage[1] = slave_ppu_stream_buf2;
+    g_ppu_stream   = g_ppu_stage[g_ppu_stage_slot];
     {
         /* Copied out of the payload above, before the bulks armed. */
         uint32_t want = ppu_want;
         g_ppu_last_want = want;
+
+        /* Core 1 replays from a PSRAM staging buffer, not from the landing
+           zone, so the landing zone is free the moment the receive completes
+           and this normally does not wait at all. It can still wait if core 1
+           is more than a whole frame behind, and it must: dropping a record
+           corrupts the slave's VRAM mirror permanently rather than
+           cosmetically, so stalling is the lesser harm. g_render_waits says
+           how often, so this cannot quietly become the old core-0 block
+           wearing a new name. */
+        if (want && g_render_req && g_ppu_stage_slot == g_render_stage_slot) {
+            uint32_t w0 = time_us_32();
+            g_render_waits++;
+            while (g_render_req) tight_loop_contents();
+            g_render_wait_us = time_us_32() - w0;
+        }
+        __dmb();
 
         /* Whatever the master announced MUST be taken off the wire. Skipping
            it because it does not fit leaves those bytes in flight and every
@@ -456,11 +486,18 @@ static void handle_frame(void)
         } else {
             /* SRAM when it fits, PSRAM only when it cannot - see the note on
                g_ppu_stream_sram for the measurement that decides this. */
+            extern volatile uint32_t slave_ppu_stream_dma;
             uint8_t *dst;
+            bool by_dma;
             if (want <= SLAVE_PPU_SRAM_BYTES) {
                 dst = g_ppu_stream_sram;
+                by_dma = false;
             } else {
-                dst = g_ppu_stream;
+                /* No landing zone big enough: the DMA writes PSRAM directly,
+                   which mostly fails, and the replay then needs the cache
+                   maintenance the staged path does not. */
+                dst = g_ppu_stage[g_ppu_stage_slot];
+                by_dma = true;
                 g_ppu_oversize_sram++;
             }
             if (!link_s_bulk_recv(&g_sess, dst, LINK_ALIGN4(want))) {
@@ -468,7 +505,14 @@ static void handle_frame(void)
             } else {
                 g_ppu_recv_ok++;
                 ppu_len = want;
-                g_ppu_stream = dst;    /* the renderer replays from here */
+                if (!by_dma) {
+                    /* Stage it out of the landing zone so the next receive can
+                       reuse that buffer while core 1 is still replaying this
+                       frame. CPU-written and CPU-read, so no cache op. */
+                    memcpy(g_ppu_stage[g_ppu_stage_slot], dst, want);
+                }
+                g_ppu_stream = g_ppu_stage[g_ppu_stage_slot];
+                slave_ppu_stream_dma = by_dma;
                 /* Checked inside slave_ppu_replay, which is where the cache
                    invalidate happens - summing before it would compare the
                    master against stale lines and blame the wire for the
@@ -578,38 +622,24 @@ static void handle_frame(void)
      * overlaps the master's next frame instead of blocking it, which is what
      * the two-chip design was for. The double buffer already separates the
      * picture being sent from the one being drawn. */
-    /* Render here, on core 0.
+    /* The render is 16 ms. It cannot stay on this core.
      *
-     * The renderer was moved to core 1 to keep it off the link loop, and core
-     * 1 could not be made to run it: it entered the replay and never returned,
-     * on both the PSRAM and the SRAM buffer, leaving the picture dead for the
-     * whole session. That is an optimisation, and it is not worth a black
-     * screen - the block it was meant to remove turned out to be the link's
-     * RX DMA writing into PSRAM, which is fixed independently (see
-     * g_ppu_stream_sram) and took the master's exchange from 10,842 us to
-     * ~335 us on its own.
+     * With it here, the master's exchange measured 12,184 us and the link
+     * failed 31 times a minute: the master's next stream bulk cannot complete
+     * until this loop comes back round and arms its receive, so the whole
+     * render lands inside the master's exchange. The earlier attempt at core 1
+     * "entered the replay and never returned" - which is what the SDK's
+     * 2 KB default core 1 stack does to a recursive tile renderer, and is
+     * fixed by launching with an explicit 16 KB one.
      *
-     * So the render costs the master its ~5 ms again, and everything works.
-     * Revisit core 1 from here, with a picture on the screen to regress
-     * against, rather than blind. */
+     * g_ppu_slot needs no lock. Core 1 renders into g_ppu_fb[g_ppu_slot] and
+     * flips only when it is finished, so core 0's g_ppu_fb[g_ppu_slot ^ 1] is
+     * the last COMPLETED frame whether core 1 is mid-render or not. */
     if (ppu_len) {
-        extern void slave_ppu_replay(const uint8_t *rec, uint32_t len);
-        extern uint8_t *slave_ppu_screen;
-        extern void slave_ppu_arm_frame(void);
-
-        slave_ppu_screen = g_ppu_fb[g_ppu_slot];
-        slave_ppu_arm_frame();
-        /* What actually landed in the buffer? A stream that arrives as zeros
-           and one that never arrives are indistinguishable from the counters,
-           and the replay's behaviour on garbage is what hangs the slave. */
-        g_dbg_len = ppu_len;
+        g_dbg_len  = ppu_len;
         g_dbg_sram = ((uintptr_t)g_ppu_stream == (uintptr_t)g_ppu_stream_sram);
         memcpy((void *)g_dbg_head, g_ppu_stream, 8);
-        if (!g_render_disable)
-            slave_ppu_replay(g_ppu_stream, ppu_len);
-        /* AFTER the replay, which is where the cache invalidate happens, so
-           this is the same view of the buffer the replay parsed. Latched only
-           on a disagreement, and only until the heartbeat has printed it. */
+
         { extern volatile uint32_t slave_ppu_stream_sum;
           if (!g_ppu_head_valid && slave_ppu_stream_sum != ppu_exp_sum) {
               uint32_t n = ppu_len < LINK_PPU_HEAD_BYTES ? ppu_len
@@ -618,24 +648,22 @@ static void handle_frame(void)
                   g_ppu_got_head[q] = g_ppu_stream[q];
               g_ppu_head_valid = 1;
           } }
-        g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
 
-        /* Did the renderer actually put pixels in the buffer, and is it the
-           buffer we ship? The master receives 57,344 bytes of zeros every
-           frame while the slave reports a healthy render, so one of those two
-           things is false and the counters so far cannot say which. */
-        { const uint8_t *drawn = g_ppu_fb[g_ppu_slot];
-          const uint8_t *sent  = g_ppu_fb[g_ppu_slot ^ 1u];
-          uint32_t nzd = 0, nzs = 0;
-          for (uint32_t q = 0; q < 256u * 224u; q += 37) {
-              if (drawn[q]) nzd++;
-              if (sent[q])  nzs++;
-          }
-          g_dbg_nz_drawn = nzd;
-          g_dbg_nz_sent  = nzs; }
-
-        g_ppu_slot ^= 1u;
-        g_ppu_fb_valid = true;
+        if (g_render_disable) {
+            g_ppu_fb_bytes = 256u * 224u;
+            g_ppu_fb_valid = true;
+        } else {
+            g_render_buf        = g_ppu_stream;
+            g_render_len        = ppu_len;
+            g_render_stage_slot = g_ppu_stage_slot;
+            g_render_kicks++;
+            __dmb();
+            g_render_req = true;
+            __sev();
+            /* The next frame stages into the other buffer, so receiving it
+               does not overwrite what core 1 is replaying. */
+            g_ppu_stage_slot ^= 1u;
+        }
     }
 #endif
 
@@ -681,12 +709,29 @@ static void slave_render_core(void)
         slave_ppu_arm_frame();
         slave_ppu_replay(g_render_buf, g_render_len);
 
+        /* Did the renderer actually put pixels in the buffer, and is it the
+           buffer core 0 ships? Sampled here rather than on core 0 because
+           only this core knows when the frame is finished. */
+        { const uint8_t *drawn = g_ppu_fb[g_ppu_slot];
+          const uint8_t *sent  = g_ppu_fb[g_ppu_slot ^ 1u];
+          uint32_t nzd = 0, nzs = 0;
+          for (uint32_t q = 0; q < 256u * 224u; q += 37) {
+              if (drawn[q]) nzd++;
+              if (sent[q])  nzs++;
+          }
+          g_dbg_nz_drawn = nzd;
+          g_dbg_nz_sent  = nzs; }
+
         g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
+        /* The flip is the publish: everything above must be visible to core 0
+           before the slot moves, and the slot before the request clears. */
+        __dmb();
         g_ppu_slot ^= 1u;
         g_ppu_fb_valid = true;
         g_render_dones++;
         __dmb();
         g_render_req = false;
+        __sev();
     }
 }
 #endif
@@ -856,7 +901,17 @@ int main(void)
              paths far past that. Launched with the default, core 1 accepted
              1,745 render requests and completed none - it died on its first
              frame, silently, while the link stayed perfectly healthy. */
-          /* Core 1 is NOT launched: see the note at the render call. */
+          /* 16 KB, explicitly. The SDK's default core 1 stack is a couple of
+             KB and the tile renderer goes far past that; launched with the
+             default, core 1 accepted 1,745 render requests and completed
+             none - it died on its first frame, silently, while the link
+             stayed perfectly healthy. That is almost certainly the whole of
+             the "core 1 entered the replay and never returned" result that
+             kept the renderer on core 0. */
+          multicore_launch_core1_with_stack(slave_render_core, g_render_stack,
+                                            sizeof(g_render_stack));
+          printf("[slave] render core launched (%u byte stack)\n",
+                 (unsigned)sizeof(g_render_stack));
       } }
 
     STAGE(6);
@@ -1015,7 +1070,13 @@ int main(void)
                        (unsigned long)g_ppu_want_zero,
                        (unsigned long)g_ppu_oversize,
                        (unsigned long)g_ppu_oversize_sram,
-                       (unsigned long)g_dbg_sram); } }
+                       (unsigned long)g_dbg_sram);
+                printf(" | core1 alive=%lu kick=%lu done=%lu wait=%lu/%luus",
+                       (unsigned long)g_render_alive,
+                       (unsigned long)g_render_kicks,
+                       (unsigned long)g_render_dones,
+                       (unsigned long)g_render_waits,
+                       (unsigned long)g_render_wait_us); } }
             /* The two heads, same frame, whenever one has been latched. This
                is the whole point: a checksum says the delivery is wrong, these
                say what it actually is. */

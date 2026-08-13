@@ -110,6 +110,11 @@ volatile uint32_t slave_ppu_r2100_seen; /* bitmap of high nibbles ever seen  */
    handling hangs" from "the renderer hangs". */
 volatile uint32_t slave_ppu_skip_lines = 0;
 uint8_t *slave_ppu_stream_buf;
+uint8_t *slave_ppu_stream_buf2;
+/* Set by core 0 per frame: 1 when the link's DMA wrote the replay buffer
+   directly (the oversized-frame fallback), 0 when core 0 staged it with the
+   CPU. Decides whether cache maintenance is needed at all. */
+volatile uint32_t slave_ppu_stream_dma;
 uint8_t *slave_ppu_screen;   /* set per frame: where this frame is drawn */
 volatile bool slave_psram_ready;
 
@@ -162,8 +167,25 @@ bool slave_ppu_init(void)
    PSTAGE("tilecache %p %p %p cached %p",
           IPPU.TileCache[TILE_2BIT], IPPU.TileCache[TILE_4BIT],
           IPPU.TileCache[TILE_8BIT], IPPU.TileCached[TILE_2BIT]);
-   slave_ppu_stream_buf = (uint8_t *) psram_malloc(256u * 1024u);
-   PSTAGE("stream %p", slave_ppu_stream_buf);
+   /* TWO staging buffers, in PSRAM.
+    *
+    * The link's RX DMA lands the stream in an SRAM buffer (it cannot write
+    * PSRAM at the wire rate - see slave/src/main.c), but core 1 then holds
+    * that buffer for the whole ~19 ms render, so core 0 cannot arm the next
+    * receive and the master waits exactly as it did before the render moved
+    * off core 0. Core 0 therefore copies each stream out of the landing zone
+    * into one of these and is free immediately; core 1 replays the other.
+    *
+    * PSRAM is fine to REPLAY from - the stream is read once, sequentially,
+    * and is 2 KB in play. It was never the read that failed.
+    *
+    * No cache maintenance is needed for these: core 0 writes them and core 1
+    * reads them, and both cores sit behind the same XIP cache. Maintenance is
+    * only needed when a DMA writes PSRAM behind the cache's back, which is
+    * exactly the oversized-frame fallback path. */
+   slave_ppu_stream_buf  = (uint8_t *) psram_malloc(256u * 1024u);
+   slave_ppu_stream_buf2 = (uint8_t *) psram_malloc(256u * 1024u);
+   PSTAGE("stream %p %p", slave_ppu_stream_buf, slave_ppu_stream_buf2);
 
    /* GFX must be set up before S9xInitGFX: it takes GFX.Pitch as an INPUT and
       copies it to RealPitch. Leaving it zero made slave_ppu_copy_frame
@@ -221,12 +243,13 @@ bool slave_ppu_init(void)
       | (!IPPU.TileCache[TILE_8BIT]? 0x20u : 0u)
       | (!IPPU.TileCached[TILE_2BIT]?0x40u : 0u);
 
-   slave_ppu_alloc_fail |= (!slave_ppu_stream_buf ? 0x80u : 0u)
+   slave_ppu_alloc_fail |= (!slave_ppu_stream_buf || !slave_ppu_stream_buf2
+                                                     ? 0x80u : 0u)
                         |  (!GFX.SubScreen        ? 0x100u : 0u)
                         |  (!GFX.ZBuffer          ? 0x200u : 0u);
 
    if (!GFX.SubScreen || !GFX.ZBuffer || !GFX.SubZBuffer ||
-       !slave_ppu_stream_buf ||
+       !slave_ppu_stream_buf || !slave_ppu_stream_buf2 ||
        !Memory.VRAM || !Memory.FillRAM || !IPPU.ScreenColors
        || !IPPU.TileCache[TILE_2BIT] || !IPPU.TileCache[TILE_4BIT]
        || !IPPU.TileCache[TILE_8BIT] || !IPPU.TileCached[TILE_2BIT]
@@ -325,13 +348,19 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
     * slave hung on its first upload frame and the watchdog bounced it into
     * BOOTSEL three resets later. Cache maintenance is correct here; the alias
     * is not. */
-   /* XIP is a RANGE, not a half-line. SRAM starts at 0x20000000, which is
-      also >= XIP_BASE, so a `>= XIP_BASE` test called the whole-cache
-      maintenance on every frame once the stream moved to an SRAM landing
-      zone - invalidating the PSRAM tile caches, SubScreen and ZBuffer along
-      with it, so the renderer re-fetched all of them from PSRAM every frame.
-      An SRAM stream needs no cache maintenance at all. */
-   if (len && (uintptr_t)rec >= XIP_BASE && (uintptr_t)rec < XIP_END)
+   /* Only when a DMA wrote this buffer behind the cache's back.
+    *
+    * Two earlier versions of this test were wrong in opposite directions.
+    * `>= XIP_BASE` alone also matches SRAM at 0x20000000, so once the stream
+    * moved to an SRAM landing zone the whole-cache maintenance ran every
+    * frame, discarding the PSRAM tile caches, SubScreen and ZBuffer with it.
+    * Adding the XIP_END bound fixed that, but the stream is now STAGED into
+    * PSRAM by core 0 and replayed by core 1 - both CPUs, one cache, already
+    * coherent - so an address test alone would still clean needlessly on
+    * every frame. Only the oversized-frame path, where the DMA writes PSRAM
+    * directly, needs it, and core 0 says so explicitly. */
+   if (len && slave_ppu_stream_dma && (uintptr_t)rec >= XIP_BASE
+           && (uintptr_t)rec < XIP_END)
       xip_cache_clean_all();
 
    slave_ppu_stage = 3;          /* cache guard passed */
