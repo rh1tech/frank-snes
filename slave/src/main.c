@@ -187,7 +187,24 @@ static uint8_t *g_ppu_stream;
  * still falls back to PSRAM and will still mostly fail; g_ppu_oversize_sram
  * counts those so it cannot be mistaken for success. */
 #define SLAVE_PPU_SRAM_BYTES LINK_PPU_STREAM_CHUNK
-static uint8_t g_ppu_stream_sram[SLAVE_PPU_SRAM_BYTES] __attribute__((aligned(4)));
+/* TWO SRAM landing buffers, and core 1 replays straight out of them.
+ *
+ * Staging every stream into PSRAM meant core 0 was writing PSRAM while core 1
+ * was writing its PSRAM tile caches from ConvertTile, through one shared
+ * 16 KB XIP cache. Core 1's converted tiles were the casualty: the picture
+ * broke at 8x8 tile granularity, and clearing every cache flag per frame -
+ * which forces those tiles to be written again - made it vanish. So the
+ * cached PIXELS were wrong while VRAM was right, and slowing the PSRAM clock
+ * to 100 MHz changed nothing, so it is contention rather than timing.
+ *
+ * A stream that fits in one landing buffer is now replayed from SRAM
+ * directly and core 0 touches PSRAM not at all. Two buffers because core 1
+ * can be a frame behind, so the next receive must not overwrite the one
+ * being replayed. */
+static uint8_t g_ppu_stream_sram[2][SLAVE_PPU_SRAM_BYTES] __attribute__((aligned(4)));
+static volatile uint32_t g_ppu_sram_slot;      /* core 0 fills this one   */
+static volatile uint32_t g_render_sram_slot = 0xffffffffu; /* core 1 reads */
+static volatile uint32_t g_ppu_sram_direct;    /* replayed from SRAM      */
 static uint32_t g_ppu_oversize_sram;
 static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
 static uint32_t g_ppu_fb_bytes;
@@ -492,7 +509,9 @@ static void handle_frame(void)
            cosmetically, so stalling is the lesser harm. g_render_waits says
            how often, so this cannot quietly become the old core-0 block
            wearing a new name. */
-        if (want && g_render_req && g_ppu_stage_slot == g_render_stage_slot) {
+        if (want && g_render_req &&
+            (g_ppu_stage_slot == g_render_stage_slot ||
+             g_ppu_sram_slot  == g_render_sram_slot)) {
             uint32_t w0 = time_us_32();
             g_render_waits++;
             while (g_render_req) tight_loop_contents();
@@ -526,14 +545,21 @@ static void handle_frame(void)
                staged copy; comparing the two against the master's says which
                half is at fault instead of just that one of them is. */
             uint32_t rxh = 2166136261u;
+            uint8_t *land = g_ppu_stream_sram[g_ppu_sram_slot];
+            const bool direct = (want <= SLAVE_PPU_SRAM_BYTES);
             for (uint32_t off = 0; off < want; off += LINK_PPU_STREAM_CHUNK) {
                 uint32_t n = want - off;
                 if (n > LINK_PPU_STREAM_CHUNK) n = LINK_PPU_STREAM_CHUNK;
-                if (!link_s_bulk_recv(&g_sess, g_ppu_stream_sram,
-                                      LINK_ALIGN4(n))) { ok = false; break; }
-                for (uint32_t i = 0; i < n; i++) {
-                    rxh ^= g_ppu_stream_sram[i]; rxh *= 16777619u;
+                /* When it all fits, land each chunk where it finally
+                   belongs; there is then nothing to stage. */
+                uint8_t *dst = direct ? land + off : land;
+                if (!link_s_bulk_recv(&g_sess, dst, LINK_ALIGN4(n))) {
+                    ok = false; break;
                 }
+                for (uint32_t i = 0; i < n; i++) {
+                    rxh ^= dst[i]; rxh *= 16777619u;
+                }
+                if (direct) continue;   /* already in its final place */
                 /* Verify the staging copy WHILE THE SOURCE IS STILL HERE.
                  *
                  * Measured with the sum computed both on arrival and after
@@ -549,8 +575,8 @@ static void handle_frame(void)
                  * a permanently wrong VRAM mirror - which is what the
                  * distorted sprites were - into a few microseconds. */
                 for (uint32_t try = 0; ; try++) {
-                    memcpy(stage + off, g_ppu_stream_sram, n);
-                    if (!memcmp(stage + off, g_ppu_stream_sram, n)) break;
+                    memcpy(stage + off, land, n);
+                    if (!memcmp(stage + off, land, n)) break;
                     g_ppu_stage_retry++;
                     if (try >= 3u) { g_ppu_stage_lost++; break; }
                 }
@@ -562,7 +588,8 @@ static void handle_frame(void)
             } else {
                 g_ppu_recv_ok++;
                 ppu_len = want;
-                g_ppu_stream = stage;
+                g_ppu_stream = direct ? land : stage;
+                g_ppu_sram_direct = direct;
                 slave_ppu_stream_dma = 0;
                 /* Checked inside slave_ppu_replay, which is where the cache
                    invalidate happens - summing before it would compare the
@@ -695,7 +722,7 @@ static void handle_frame(void)
      * the last COMPLETED frame whether core 1 is mid-render or not. */
     if (ppu_len) {
         g_dbg_len  = ppu_len;
-        g_dbg_sram = ((uintptr_t)g_ppu_stream == (uintptr_t)g_ppu_stream_sram);
+        g_dbg_sram = g_ppu_sram_direct;
         memcpy((void *)g_dbg_head, g_ppu_stream, 8);
 
         { extern volatile uint32_t slave_ppu_stream_sum;
@@ -714,6 +741,8 @@ static void handle_frame(void)
             g_render_buf        = g_ppu_stream;
             g_render_len        = ppu_len;
             g_render_stage_slot = g_ppu_stage_slot;
+            g_render_sram_slot  = g_ppu_sram_direct ? g_ppu_sram_slot
+                                                    : 0xffffffffu;
             /* Handed over WITH the request. Core 1 runs up to a frame behind
                core 0, so a global that core 0 overwrites per frame would have
                core 1 checking frame N-1's VRAM against frame N's hash and
@@ -737,6 +766,7 @@ static void handle_frame(void)
             /* The next frame stages into the other buffer, so receiving it
                does not overwrite what core 1 is replaying. */
             if (++g_ppu_stage_slot >= G_PPU_STAGE_SLOTS) g_ppu_stage_slot = 0;
+            g_ppu_sram_slot ^= 1u;
         }
     }
 #endif

@@ -201,6 +201,23 @@ bool slave_ppu_init(void)
    /* psram_malloc does not zero; ConvertTile fills entries on demand but the
       "is it cached" flags above must start clear, and they do (snes_calloc). */
 
+   /* Does this PSRAM hold what is written to it?
+    *
+    * The picture breaks at 8x8 tile granularity and clearing every tile-cache
+    * flag per frame - which forces those tiles to be converted and written
+    * again - makes it vanish. So the cached PIXELS are wrong while VRAM is
+    * right, and the cache lives here. Before blaming the renderer, establish
+    * whether the memory keeps what it is given. */
+   { volatile uint32_t bad = 0, n = MAX_4BIT_TILES * 64u / 4u;
+     uint32_t *p32 = (uint32_t *) IPPU.TileCache[TILE_4BIT];
+     if (p32) {
+        for (uint32_t i = 0; i < n; i++) p32[i] = i * 2654435761u;
+        for (uint32_t i = 0; i < n; i++)
+           if (p32[i] != i * 2654435761u) bad++;
+        PSTAGE("psram test: %lu of %lu words bad", (unsigned long)bad,
+               (unsigned long)n);
+     } }
+
    PSTAGE("tilecache %p %p %p cached %p",
           IPPU.TileCache[TILE_2BIT], IPPU.TileCache[TILE_4BIT],
           IPPU.TileCache[TILE_8BIT], IPPU.TileCached[TILE_2BIT]);

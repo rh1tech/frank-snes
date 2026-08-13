@@ -135,6 +135,20 @@ target_compile_definitions(frank-snes-slave PRIVATE
     CPU_VOLTAGE=${CPU_VOLTAGE}
     PICO_ON_DEVICE=1
     C2_SOUND_SLAVE=1
+
+    # PSRAM timing margin, and it is a CORRECTNESS setting here.
+    #
+    # This chip writes PSRAM from BOTH cores at once - core 1 fills the tile
+    # caches from ConvertTile while core 0 stages the incoming stream - which
+    # the master never does with its read-mostly ROM. Writes get lost under
+    # that contention: measured 28 corrupt stream stagings with the wire
+    # provably clean, and, once the tile cache was implicated, tile-granular
+    # picture corruption that forcing reconversion every frame makes vanish.
+    # Stale entries in a PSRAM-resident cache look exactly like that.
+    #
+    # 100 MHz picks a bigger QMI divisor than the 133 default and buys
+    # setup/hold margin at 504 MHz.
+    PSRAM_MAX_FREQ_MHZ=100
 )
 
 # The DSP is the whole reason this chip exists; give it the same
