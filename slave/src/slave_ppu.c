@@ -291,7 +291,13 @@ bool slave_ppu_init(void)
    if (!Memory.VRAM)   /* fall back rather than fail to render at all */
       Memory.VRAM  = (uint8_t *) psram_malloc(VRAM_SIZE);
    Memory.FillRAM  = (uint8_t *) psram_malloc(0x8000);
-   IPPU.ScreenColors = (uint16_t *) psram_malloc(256 * 9 * sizeof(uint16_t));
+   /* SRAM: tile.c reads ScreenColors[Pixel] for EVERY pixel it draws, so
+      this 4.6 KB is one of the hottest things the renderer touches. It sat in
+      PSRAM only because the SRAM budget was tight before the stream landing
+      zone shrank from 48 KB to 16. */
+   IPPU.ScreenColors = (uint16_t *) snes_malloc(256 * 9 * sizeof(uint16_t));
+   if (!IPPU.ScreenColors)
+      IPPU.ScreenColors = (uint16_t *) psram_malloc(256 * 9 * sizeof(uint16_t));
    if (Memory.VRAM)      memset(Memory.VRAM, 0, VRAM_SIZE);
    if (Memory.FillRAM)   memset(Memory.FillRAM, 0, 0x8000);
    IPPU.DirectColors = IPPU.ScreenColors + 256;
