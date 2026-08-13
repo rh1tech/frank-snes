@@ -740,6 +740,7 @@ typedef struct {
        hooked and the slave can never converge. */
     /* This chip's PPU memory, hashed the same way the slave hashes its own. */
     uint32_t cap_vma_fix;
+    uint32_t cap_vram_rec;
     uint32_t m_vram_hash, m_cgram_hash, m_oam_hash;
     uint32_t s_vram_hash, s_cgram_hash, s_oam_hash;
     /* HDMI health. Counting interrupts alone once "proved" the generator
@@ -2703,8 +2704,9 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.cap_vram_w  = frank_cap_vram_w;
                       frank_telemetry.cap_cgram_w = frank_cap_cgram_w;
                       frank_telemetry.cap_oam_w   = frank_cap_oam_w; }
-                    { extern volatile uint32_t frank_cap_vma_fix;
-                      frank_telemetry.cap_vma_fix = frank_cap_vma_fix; }
+                    { extern volatile uint32_t frank_cap_vma_fix, frank_cap_vram_rec;
+                      frank_telemetry.cap_vma_fix  = frank_cap_vma_fix;
+                      frank_telemetry.cap_vram_rec = frank_cap_vram_rec; }
 
                     { extern volatile uint32_t frank_hdmi_irqs,
                                                frank_hdmi_gap_max,

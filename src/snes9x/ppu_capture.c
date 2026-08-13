@@ -73,6 +73,11 @@ volatile uint32_t frank_cap_vma_fix;   /* address corrections emitted */
 /* Hash of this chip's VRAM at the end of the frame just captured - what the
    slave must hold once it has replayed that frame's stream. Diagnostic; it
    costs a 64 KB pass per frame, so it is switchable. */
+/* Every $2118/$2119 WRITE RECORD this chip emits, whether it came from the
+   game or from a resync sweep. The slave counts the same records as it
+   replays them; the two must be equal, and if they are the divergence is
+   about WHERE the writes land rather than whether they arrive. */
+volatile uint32_t frank_cap_vram_rec;
 volatile uint32_t frank_cap_vram_hash;
 volatile uint32_t frank_cap_vram_block[PPUCAP_VRAM_BLOCKS];
 volatile uint32_t frank_cap_hash_on = 1;
@@ -224,7 +229,7 @@ void ppucap_write(uint16_t address, uint8_t value)
       need completely different fixes. The slave counts the same three; the
       pair of numbers decides it. */
    switch (r[1]) {
-   case 0x18: case 0x19: frank_cap_vram_w++;  break;
+   case 0x18: case 0x19: frank_cap_vram_w++; frank_cap_vram_rec++; break;
    case 0x22:            frank_cap_cgram_w++; break;
    case 0x04:            frank_cap_oam_w++;   break;
    default: break;
@@ -285,6 +290,10 @@ volatile uint32_t frank_cap_resyncs;
 
 void ppucap_request_resync(void)
 {
+   /* Already sweeping: restarting would keep it perpetually at phase 1 and
+      it would never reach the VRAM it is being asked to repair. */
+   if (resync_phase) return;
+
    /* The resync drives $2116/$2117 itself, so whatever the shadow held is
       no longer what the slave will believe. */
    cap_vma_valid = false;
@@ -299,6 +308,7 @@ static void ppucap_emit(uint16_t addr, uint8_t val)
    r[0] = PPUCAP_WRITE;
    r[1] = (uint8_t)(addr & 0x3f);
    r[2] = val;
+   if (r[1] == 0x18 || r[1] == 0x19) frank_cap_vram_rec++;
    ppucap_put(r, 3);
 }
 

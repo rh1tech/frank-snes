@@ -736,8 +736,25 @@ uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max)
 /* The renderer guards every draw on IPPU.RenderThisFrame. Nothing on the slave
    clears it, but arming it explicitly each frame keeps the intent visible -
    without it the slave replays the whole stream and draws nothing at all. */
+/* Diagnostic: throw away every converted tile each frame, so the picture
+ * depends only on whether VRAM is right.
+ *
+ * Sprites break specifically when they ANIMATE - which is when the game
+ * streams new tile data into VRAM - and the corruption looks like pieces of
+ * other animation frames. That is equally consistent with "VRAM is wrong"
+ * and with "VRAM is right but the renderer is drawing a cached conversion of
+ * what used to be there". Those need opposite fixes, and this separates them
+ * in one run: with the cache forced empty the second explanation cannot
+ * survive. */
+volatile uint32_t slave_ppu_force_reconvert = 0;
+
 void slave_ppu_arm_frame(void)
 {
+   if (slave_ppu_force_reconvert) {
+      if (IPPU.TileCached[TILE_2BIT]) memset(IPPU.TileCached[TILE_2BIT], 0, MAX_2BIT_TILES);
+      if (IPPU.TileCached[TILE_4BIT]) memset(IPPU.TileCached[TILE_4BIT], 0, MAX_4BIT_TILES);
+      if (IPPU.TileCached[TILE_8BIT]) memset(IPPU.TileCached[TILE_8BIT], 0, MAX_8BIT_TILES);
+   }
    IPPU.RenderThisFrame = true;
 
    /* Re-assert the height every frame. The replayed stream contains the

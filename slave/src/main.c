@@ -32,6 +32,8 @@
 #include "link_bus.h"
 #include "link_pins.h"
 #include "link_proto.h"
+#include "snes9x.h"
+#include "memmap.h"
 #include "link_session.h"
 
 #include "slave_sound.h"
@@ -390,13 +392,10 @@ static void handle_frame(void)
       memcpy((void *)slave_ppu_exp_peek,
              g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_VRAMPEEK_OFFSET,
              LINK_PPU_VRAMPEEK_BYTES); }
-    { extern volatile uint32_t slave_ppu_exp_block[];
-      for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++) {
-          uint32_t v;
-          memcpy(&v, g_ctrl_rx + sizeof(link_hdr_t)
-                     + LINK_PPU_VRAMBLK_OFFSET + b * 4u, sizeof(v));
-          slave_ppu_exp_block[b] = v;
-      } }
+    uint32_t ppu_exp_block[LINK_PPU_VRAM_BLOCKS];
+    for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++)
+        memcpy(&ppu_exp_block[b], g_ctrl_rx + sizeof(link_hdr_t)
+                                  + LINK_PPU_VRAMBLK_OFFSET + b * 4u, 4u);
 #endif
 
     if (n_events) {
@@ -716,6 +715,14 @@ static void handle_frame(void)
                core 1 checking frame N-1's VRAM against frame N's hash and
                reporting differences that are only the pipeline. */
             g_render_exp_hash   = ppu_exp_vram_hash;
+            /* The block hashes need the same frame alignment as the whole
+               one, for the same reason: core 0 would otherwise have core 1
+               comparing frame N-1's VRAM against frame N's blocks, and the
+               resulting map is worse than no map - it said "no block
+               differs" while the whole-VRAM hash said every frame did. */
+            { extern volatile uint32_t slave_ppu_exp_block[];
+              for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++)
+                  slave_ppu_exp_block[b] = ppu_exp_block[b]; }
             g_render_kicks++;
             __dmb();
             g_render_req = true;
@@ -1232,8 +1239,9 @@ int main(void)
                        (unsigned long)(ct & 0xffffu),
                        (unsigned long)(ct >> 16));
                 extern uint32_t slave_ppu_dbg_regs(void);
-                printf(" | upd=%lu vram=%lu cgram=%lu regs=%08lx"
+                printf(" | vramat=%08lx upd=%lu vram=%lu cgram=%lu regs=%08lx"
                        " want=%lu rx=%lu/%lu zero=%lu over=%lu/%lu sram=%lu",
+                       (unsigned long)(uintptr_t)Memory.VRAM,
                        (unsigned long)slave_ppu_upd_calls,
                        (unsigned long)slave_ppu_vram_w,
                        (unsigned long)slave_ppu_cgram_w,

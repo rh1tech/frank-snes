@@ -591,10 +591,28 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
            fight, damaged by one bad stream, then left on screen for the whole
            match while every steady-state counter read clean.
            The slave already reports it. Repair it. */
-        { static uint32_t prev_bad;
+        { static uint32_t prev_bad, prev_vdiff;
           uint32_t now_bad = reply->ppu_stat.sum_bad;
+          uint32_t now_vdiff = reply->ppu_stat.vram_diff;
+          /* A corrupt stream, or a VRAM mirror the slave has measured as
+             different from this chip's. The second is the one that matters
+             in practice: a burst of animation writes goes wrong, and with
+             nothing rewriting that region afterwards the damage simply
+             stays - measured, a window with ZERO VRAM writes still had
+             every frame divergent. The slave can see it directly, so let it
+             ask. */
+          /* NOT armed on vram_diff. A resync chunk carries VRAM sampled when
+             the chunk was generated and delivers it a frame later, so while
+             a sweep is running the slave's VRAM is deliberately one frame
+             stale in the region being repaired - and the frame-aligned hash
+             therefore differs BY CONSTRUCTION. Arming on that difference
+             makes the sweep permanent and the difference permanent with it:
+             measured 100% of frames divergent, with the resync replaying
+             417,000 extra VRAM records over 20 s and never converging.
+             sum_bad is a real fault; vram_diff is not, while a sweep runs. */
           if (now_bad > prev_bad) ppucap_request_resync();
-          prev_bad = now_bad; }
+          (void)now_vdiff;
+          prev_bad = now_bad; prev_vdiff = now_vdiff; }
 
         if (fb > g_ppu_fb_max) {
             go_offline("slave returned an oversized framebuffer");
