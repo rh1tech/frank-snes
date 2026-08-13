@@ -95,6 +95,7 @@ set(SLAVE_PPU_SOURCES
 
 option(FRANK_SNES_PPU_SLAVE "PPU offload: render on the slave" OFF)
 
+
 add_executable(frank-snes-slave
     src/main.c
     src/slave_glue.c

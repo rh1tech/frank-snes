@@ -85,6 +85,24 @@ volatile uint32_t slave_ppu_stage;
 volatile uint32_t slave_ppu_live_recs;
 volatile uint32_t slave_ppu_last_tag;
 volatile uint32_t slave_ppu_bad_lines;
+/* Where the frame's time actually goes, split three ways so the 32 ms can be
+   attributed rather than guessed at: drawing, taking VRAM pages in, and the
+   end-of-frame S9xUpdateScreen. Microseconds and counts, for ONE frame.
+
+   Published as a set at the end of the replay, not accumulated in place. Core
+   1 replays for ~31 ms out of every ~22 ms, so it is essentially never idle,
+   and a heartbeat on core 0 that reads counters the replay zeroes on entry
+   reads them after the zeroing every single time. The first version of this
+   measurement reported draw=0 vpage=0 endf=0 on every line printed - which
+   looks exactly like "the renderer is not running" and is really "you cannot
+   read a counter that is being reset behind you". */
+volatile uint32_t slave_ppu_us_draw;
+volatile uint32_t slave_ppu_us_vpage;
+volatile uint32_t slave_ppu_us_endf;
+volatile uint32_t slave_ppu_n_draw;
+volatile uint32_t slave_ppu_n_vpage;
+volatile uint32_t slave_ppu_us_write;   /* S9xSetPPU, the register writes */
+volatile uint32_t slave_ppu_us_pre;     /* checksum + cache guard, before the loop */
 /* Where and why the replay stopped, and a checksum of what it replayed from.
    See link_ppu_stat_t: these three numbers plus the master's frank_cap_sum
    separate "the wire corrupted it" from "the capture produced it" from "the
@@ -258,7 +276,10 @@ bool slave_ppu_init(void)
    GFX.Pitch  = SNES_WIDTH;
    GFX.ZPitch = SNES_WIDTH;
    GFX.SubScreen  = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
-   GFX.ZBuffer    = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
+   /* SRAM, and it is the difference between 31 ms a frame and 13 - see
+      slave_zbuffer in main.c for the measurement and for what paid for it. */
+   { extern uint8_t slave_zbuffer[];
+     GFX.ZBuffer = slave_zbuffer; }
    GFX.SubZBuffer = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
    /* All three, not just the sub-screen.
     *
@@ -518,6 +539,8 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
    slave_ppu_stage = 1;
    uint32_t t0 = time_us_32();
    slave_ppu_stage = 2;          /* time_us_32 returned */
+   uint32_t us_draw = 0, us_vpage = 0, us_endf = 0, n_draw = 0, n_vpage = 0;
+   uint32_t us_write = 0, us_pre = 0;
 
    /* A PSRAM stream still needs its cache lines invalidated before the CPU
     * reads what the link's DMA just wrote; an SRAM stream needs nothing.
@@ -596,6 +619,8 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
    slave_ppu_stop_off   = len;
    slave_ppu_stop_ctx   = 0;
 
+   us_pre = time_us_32() - t0;
+
    while (i < len)
    {
       slave_ppu_live_recs++;
@@ -623,7 +648,9 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
             slave_ppu_r2100_last = rec[i + 2];
             slave_ppu_r2100_seen |= 1u << (rec[i + 2] >> 4);
          }
-         S9xSetPPU(rec[i + 2], (uint16_t)(0x2100 | (rec[i + 1] & 0x3f)));
+         { uint32_t w0 = time_us_32();
+           S9xSetPPU(rec[i + 2], (uint16_t)(0x2100 | (rec[i + 1] & 0x3f)));
+           us_write += time_us_32() - w0; }
          slave_ppu_stage = 21;
          i += 3;
          break;
@@ -645,7 +672,10 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
             SNES_HEIGHT. */
          if (rec[i + 1] < SNES_HEIGHT && !slave_ppu_skip_lines) {
             slave_ppu_stage = 10;
-            RenderLine(rec[i + 1]);
+            { uint32_t d0 = time_us_32();
+              RenderLine(rec[i + 1]);
+              us_draw += time_us_32() - d0;
+              n_draw++; }
             slave_ppu_stage = 11;
          } else {
             slave_ppu_bad_lines++;
@@ -660,7 +690,8 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
          if (i + 1u + PPUCAP_PAGE_BYTES >= len) {
             slave_ppu_stop_why = 2; goto done;
          }
-         { uint32_t page = rec[i + 1];
+         { uint32_t v0 = time_us_32();
+           uint32_t page = rec[i + 1];
            uint32_t base = page * PPUCAP_PAGE_BYTES;
            if (Memory.VRAM && base + PPUCAP_PAGE_BYTES <= VRAM_SIZE) {
               memcpy(Memory.VRAM + base, &rec[i + 2], PPUCAP_PAGE_BYTES);
@@ -674,13 +705,17 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
                  memset(IPPU.TileCached[TILE_8BIT] + (base >> 6), 0,
                         PPUCAP_PAGE_BYTES >> 6);
               slave_ppu_vram_w++;
-           } }
+           }
+           us_vpage += time_us_32() - v0;
+           n_vpage++; }
          i += 2u + PPUCAP_PAGE_BYTES;
          break; }
 
       case PPUCAP_ENDF:
          if (i + 1 >= len) { slave_ppu_stop_why = 2; goto done; }
-         S9xEndScreenRefresh();
+         { uint32_t e0 = time_us_32();
+           S9xEndScreenRefresh();
+           us_endf += time_us_32() - e0; }
          /* Sampled HERE, between the two calls: S9xStartScreenRefresh below
             zeroes g_upd_screen_calls, so reading it anywhere else always
             returns 0 and looks like "the renderer never ran". */
@@ -725,6 +760,10 @@ done:
          c |= (uint32_t)rec[i + k] << (8u * k);
       slave_ppu_stop_ctx = c;
    }
+   slave_ppu_us_draw  = us_draw;   slave_ppu_n_draw  = n_draw;
+   slave_ppu_us_vpage = us_vpage;  slave_ppu_n_vpage = n_vpage;
+   slave_ppu_us_endf  = us_endf;
+   slave_ppu_us_write = us_write;  slave_ppu_us_pre = us_pre;
    slave_ppu_render_us = time_us_32() - t0;
    slave_ppu_records   = n;
 }

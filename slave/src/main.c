@@ -206,9 +206,29 @@ static volatile uint32_t g_ppu_sram_slot;      /* core 0 fills this one   */
 static volatile uint32_t g_render_sram_slot = 0xffffffffu; /* core 1 reads */
 static volatile uint32_t g_ppu_sram_direct;    /* replayed from SRAM      */
 static uint32_t g_ppu_oversize_sram;
-static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
+/* ONE framebuffer, and the Z buffer that the second slot used to be.
+ *
+ * The renderer touches GFX.ZBuffer once per pixel per layer - tile.c only
+ * draws where Z1 > Depth[x] - so it is swept five times a frame, 57 KB at a
+ * time. In PSRAM that is the single most expensive thing the slave does.
+ * Measured on the same 808-record frame, changing nothing else:
+ *
+ *     ZBuffer in PSRAM   31,000 us      ZBuffer in SRAM   13,100 us
+ *
+ * and the sub-screen Z buffer, which is only written when a layer actually
+ * reaches the sub-screen, is worth 3,000 us on the same test - so it stays in
+ * PSRAM and this one does not.
+ *
+ * The 57 KB comes from the second framebuffer slot, because there is nothing
+ * else: the slave's SRAM already holds VRAM, APU RAM, the sound buffers and
+ * the stream landing zones, and the tile caches are 448 KB. The cost is that
+ * core 1 cannot draw frame N while core 0 ships frame N-1; it waits for the
+ * bulk send instead, about 1 ms on a link that moves 57 KB in roughly that.
+ * Paying 1 ms to save 18 is the whole trade, and the 13,100 us above already
+ * includes it. */
+static uint8_t  g_ppu_fb[LINK_PPU_MAX_BYTES];
 static uint32_t g_ppu_fb_bytes;
-static uint32_t g_ppu_slot;
+uint8_t         slave_zbuffer[LINK_PPU_MAX_BYTES];
 static bool     g_ppu_fb_valid;
 volatile uint32_t g_ppu_oversize;
 /* Core 0 -> core 1 render handoff. */
@@ -676,8 +696,7 @@ static void handle_frame(void)
            only the bulks remain, and they need no handshake of their own. */
         uint32_t fb_bytes = g_have_pending ? g_pending_reply.ppu_fb_bytes : 0;
         if (fb_bytes)
-            link_s_bulk_send(&g_sess, g_ppu_fb[g_ppu_slot ^ 1u],
-                             LINK_ALIGN4(fb_bytes));
+            link_s_bulk_send(&g_sess, g_ppu_fb, LINK_ALIGN4(fb_bytes));
 
         /* The palette, every frame and unconditionally. The master no longer
            renders, so it never calls graphics_set_palette itself - without
@@ -722,8 +741,8 @@ static void handle_frame(void)
      * 2 KB default core 1 stack does to a recursive tile renderer, and is
      * fixed by launching with an explicit 16 KB one.
      *
-     * g_ppu_slot needs no lock. Core 1 renders into g_ppu_fb[g_ppu_slot] and
-     * flips only when it is finished, so core 0's g_ppu_fb[g_ppu_slot ^ 1] is
+     * There is one framebuffer now, so core 0 must not start a bulk send while
+     * core 1 is drawing: the handoff below is what keeps them apart. What was
      * the last COMPLETED frame whether core 1 is mid-render or not. */
     if (ppu_len) {
         g_dbg_len  = ppu_len;
@@ -861,7 +880,7 @@ static void slave_render_core(void)
         extern void slave_ppu_arm_frame(void);
         extern void slave_ppu_set_render(bool);
 
-        slave_ppu_screen = g_ppu_fb[g_ppu_slot];
+        slave_ppu_screen = g_ppu_fb;
         const bool skip_draw = (g_render_skip != 0u);
 
         /* Synthetic picture: prove the DELIVERY path on its own.
@@ -922,15 +941,12 @@ static void slave_render_core(void)
         /* Did the renderer actually put pixels in the buffer, and is it the
            buffer core 0 ships? Sampled here rather than on core 0 because
            only this core knows when the frame is finished. */
-        { const uint8_t *drawn = g_ppu_fb[g_ppu_slot];
-          const uint8_t *sent  = g_ppu_fb[g_ppu_slot ^ 1u];
-          uint32_t nzd = 0, nzs = 0;
-          for (uint32_t q = 0; q < 256u * 224u; q += 37) {
+        { const uint8_t *drawn = g_ppu_fb;   /* drawn and sent are one buffer */
+          uint32_t nzd = 0;
+          for (uint32_t q = 0; q < 256u * 224u; q += 37)
               if (drawn[q]) nzd++;
-              if (sent[q])  nzs++;
-          }
           g_dbg_nz_drawn = nzd;
-          g_dbg_nz_sent  = nzs; }
+          g_dbg_nz_sent  = nzd; }
 
         /* On this core, after the render - see slave_ppu_hash_state. */
         { extern void slave_ppu_hash_state(void);
@@ -945,7 +961,6 @@ static void slave_render_core(void)
         if (!skip_draw) {
             /* Only a frame that was actually DRAWN may be published, or the
                master would be shipped a buffer holding the frame before last. */
-            g_ppu_slot ^= 1u;
             g_ppu_fb_valid = true;
         }
         g_render_dones++;
@@ -1220,7 +1235,7 @@ int main(void)
                 extern uint8_t *slave_ppu_screen;
                 static bool st_built;
                 if (!st_built) { st_built = true; slave_ppu_selftest_build(); }
-                slave_ppu_screen = g_ppu_fb[g_ppu_slot];
+                slave_ppu_screen = g_ppu_fb;
                 memset(slave_ppu_screen, 0xAA, 256u * 224u);
                 slave_ppu_selftest_frame();
                 { uint32_t nz = 0, touched = 0;
@@ -1231,7 +1246,6 @@ int main(void)
                   }
                   g_dbg_touched = touched; g_dbg_selftest_nz = nz; }
                 g_ppu_fb_bytes = 256u * 224u;
-                g_ppu_slot ^= 1u;
                 g_ppu_fb_valid = true;
             }
 #endif
@@ -1262,7 +1276,23 @@ int main(void)
                      (unsigned long)g_dbg_len,
                      (unsigned long)g_dbg_nz_drawn,
                      (unsigned long)g_dbg_nz_sent,
-                     (unsigned long)g_ppu_slot);
+                     0UL);
+              /* Where the frame's microseconds went. Printed here rather than
+                 shipped over the link because it is a bring-up measurement,
+                 not something the master acts on. */
+              { extern volatile uint32_t slave_ppu_us_draw, slave_ppu_us_vpage,
+                                         slave_ppu_us_endf, slave_ppu_n_draw,
+                                         slave_ppu_n_vpage, slave_ppu_us_write,
+                                         slave_ppu_us_pre;
+                printf(" | split draw=%luus/%lu vpage=%luus/%lu endf=%luus",
+                       (unsigned long)slave_ppu_us_draw,
+                       (unsigned long)slave_ppu_n_draw,
+                       (unsigned long)slave_ppu_us_vpage,
+                       (unsigned long)slave_ppu_n_vpage,
+                       (unsigned long)slave_ppu_us_endf);
+                printf(" write=%luus pre=%luus",
+                       (unsigned long)slave_ppu_us_write,
+                       (unsigned long)slave_ppu_us_pre); }
               extern volatile uint32_t frank_gfx_fail,
                                        frank_gfx_localstate_bytes,
                                        frank_gfx_zero_bytes;
