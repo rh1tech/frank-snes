@@ -69,6 +69,7 @@ volatile uint32_t frank_cap_min = 0xffffffffu;
 volatile uint32_t frank_cap_max;
 volatile uint32_t frank_cap_takes;
 volatile uint32_t frank_cap_vram_w, frank_cap_cgram_w, frank_cap_oam_w;
+volatile uint32_t frank_vram_writes;   /* see ppu.h - every real VRAM write */
 
 
 static uint32_t ppucap_total;      /* bytes the frame WOULD have produced */

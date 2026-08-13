@@ -736,6 +736,9 @@ typedef struct {
     uint32_t master_vramnz;
     /* PSRAM read stability - see link_master.c. */
     uint32_t ppu_reread_ok, ppu_reread_bad;
+    /* Real VRAM writes vs captured ones. A gap means a write path is not
+       hooked and the slave can never converge. */
+    uint32_t vram_writes_real;
     /* HDMI health. Counting interrupts alone once "proved" the generator
        healthy on a display that had no signal; the GAP is what decides it. */
     uint32_t hdmi_irqs, hdmi_gap_max, hdmi_late;
@@ -2686,6 +2689,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.cap_vram_w  = frank_cap_vram_w;
                       frank_telemetry.cap_cgram_w = frank_cap_cgram_w;
                       frank_telemetry.cap_oam_w   = frank_cap_oam_w; }
+
                     { extern volatile uint32_t frank_hdmi_irqs,
                                                frank_hdmi_gap_max,
                                                frank_hdmi_late;
