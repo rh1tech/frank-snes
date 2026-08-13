@@ -35,6 +35,10 @@
 #include "pico/stdlib.h"
 #include "settings.h"
 
+/* How many PSRAM staging buffers core 0 rotates through while core 1
+   renders. See slave_ppu_stage_buf. */
+#define SLAVE_PPU_STAGE_SLOTS 4u
+
 /* RP2350A QFN-60: the slave's PSRAM chip select is GPIO0 (slave/CMakeLists). */
 #define SLAVE_PSRAM_CS_PIN 0
 
@@ -111,6 +115,15 @@ volatile uint32_t slave_ppu_r2100_seen; /* bitmap of high nibbles ever seen  */
 volatile uint32_t slave_ppu_skip_lines = 0;
 uint8_t *slave_ppu_stream_buf;
 uint8_t *slave_ppu_stream_buf2;
+/* Four staging buffers, not two.
+ *
+ * Core 0 must never block: if it does, the master's control frame finds
+ * nobody listening and the exchange fails with "frame header failed", which
+ * then arms a resync, which makes the next frames heavier still. Two slots
+ * tolerate core 1 being one frame behind; four tolerate three, which covers
+ * the heavy frames without pretending a persistently slow render is
+ * survivable. PSRAM is 8 MB and this costs 1 MB of it. */
+uint8_t *slave_ppu_stage_buf[SLAVE_PPU_STAGE_SLOTS];
 /* Set by core 0 per frame: 1 when the link's DMA wrote the replay buffer
    directly (the oversized-frame fallback), 0 when core 0 staged it with the
    CPU. Decides whether cache maintenance is needed at all. */
@@ -183,9 +196,12 @@ bool slave_ppu_init(void)
     * reads them, and both cores sit behind the same XIP cache. Maintenance is
     * only needed when a DMA writes PSRAM behind the cache's back, which is
     * exactly the oversized-frame fallback path. */
-   slave_ppu_stream_buf  = (uint8_t *) psram_malloc(256u * 1024u);
-   slave_ppu_stream_buf2 = (uint8_t *) psram_malloc(256u * 1024u);
-   PSTAGE("stream %p %p", slave_ppu_stream_buf, slave_ppu_stream_buf2);
+   for (uint32_t i = 0; i < SLAVE_PPU_STAGE_SLOTS; i++)
+      slave_ppu_stage_buf[i] = (uint8_t *) psram_malloc(256u * 1024u);
+   slave_ppu_stream_buf  = slave_ppu_stage_buf[0];
+   slave_ppu_stream_buf2 = slave_ppu_stage_buf[1];
+   PSTAGE("stream %p %p (%u slots)", slave_ppu_stream_buf,
+          slave_ppu_stream_buf2, (unsigned)SLAVE_PPU_STAGE_SLOTS);
 
    /* GFX must be set up before S9xInitGFX: it takes GFX.Pitch as an INPUT and
       copies it to RealPitch. Leaving it zero made slave_ppu_copy_frame
@@ -276,10 +292,12 @@ bool slave_ppu_init(void)
       | (!IPPU.TileCache[TILE_8BIT]? 0x20u : 0u)
       | (!IPPU.TileCached[TILE_2BIT]?0x40u : 0u);
 
-   slave_ppu_alloc_fail |= (!slave_ppu_stream_buf || !slave_ppu_stream_buf2
-                                                     ? 0x80u : 0u)
-                        |  (!GFX.SubScreen        ? 0x100u : 0u)
-                        |  (!GFX.ZBuffer          ? 0x200u : 0u);
+   { bool st_ok = true;
+     for (uint32_t i = 0; i < SLAVE_PPU_STAGE_SLOTS; i++)
+        if (!slave_ppu_stage_buf[i]) st_ok = false;
+     slave_ppu_alloc_fail |= (!st_ok        ? 0x80u  : 0u)
+                          |  (!GFX.SubScreen ? 0x100u : 0u)
+                          |  (!GFX.ZBuffer   ? 0x200u : 0u); }
 
    if (!GFX.SubScreen || !GFX.ZBuffer || !GFX.SubZBuffer ||
        !slave_ppu_stream_buf || !slave_ppu_stream_buf2 ||
@@ -674,9 +692,12 @@ uint32_t slave_ppu_dbg_regs(void)
  * slave is simply missing the state the game established before it was
  * listening. Returns non-zero VRAM bytes, capped, in the low 16 bits and
  * non-zero palette entries in the high 16. */
+volatile uint32_t slave_ppu_dbg_deep;   /* see slave_ppu_dbg_render */
+
 uint32_t slave_ppu_dbg_content(void)
 {
    uint32_t v = 0, c = 0;
+   if (!slave_ppu_dbg_deep) return 0;     /* 64 KB sweep - same cost, same rule */
    if (Memory.VRAM)
       for (uint32_t i = 0; i < VRAM_SIZE; i += 8)   /* sampled, not summed */
          if (Memory.VRAM[i]) v++;
@@ -702,15 +723,24 @@ void slave_ppu_dbg_render(uint32_t *out)
           | ((uint32_t)IPPU.Clip[1].Count[0] << 16);
    /* Has ConvertTile produced anything? An empty cache draws nothing however
       correct everything else is. Sampled, not summed. */
-   { uint32_t n = 0;
-     const uint8_t *c = IPPU.TileCache[TILE_4BIT];
-     if (c) for (uint32_t i = 0; i < MAX_4BIT_TILES * 64u; i += 64u)
-                if (c[i]) n++;
-     out[4] = n; }
-   { uint32_t n = 0;
-     const uint8_t *f = IPPU.TileCached[TILE_4BIT];
-     if (f) for (uint32_t i = 0; i < MAX_4BIT_TILES; i++) if (f[i]) n++;
-     out[5] = n; }
+   /* Off by default: these two sweep the 4bpp tile cache in PSRAM, and they
+      run on core 0 between exchanges. At one heartbeat a second they cost the
+      link exactly one failure a second - the master's control frame arrives
+      while this core is still counting and finds nobody armed, which reads as
+      "frame header failed" and then arms a resync. A diagnostic that changes
+      the number it is measuring is worse than no diagnostic. */
+   out[4] = out[5] = 0;
+   if (slave_ppu_dbg_deep) {
+      uint32_t n = 0;
+      const uint8_t *c = IPPU.TileCache[TILE_4BIT];
+      if (c) for (uint32_t i = 0; i < MAX_4BIT_TILES * 64u; i += 64u)
+                 if (c[i]) n++;
+      out[4] = n;
+      n = 0;
+      const uint8_t *f = IPPU.TileCached[TILE_4BIT];
+      if (f) for (uint32_t i = 0; i < MAX_4BIT_TILES; i++) if (f[i]) n++;
+      out[5] = n;
+   }
 }
 
 uint32_t slave_ppu_dbg_flags(void)

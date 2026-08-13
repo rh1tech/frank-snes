@@ -201,10 +201,19 @@ void ppucap_line(uint8_t line)
  * both halves land the stream in SRAM and neither buffer is that big - the
  * master bounces through 16 KB and the slave through 48 KB, and a stream
  * that overruns either falls back to a PSRAM DMA, which is what breaks
- * HDMI and what fails to receive. 2 KB of VRAM per frame is 6,147 bytes of
- * records, so even a busy frame stays inside both buffers, and the whole
- * 64 KB is resynced in 32 frames - under two thirds of a second. */
-#define RESYNC_VRAM_CHUNK 2048u
+ * HDMI and what fails to receive.
+ *
+ * 512 bytes of VRAM per frame, not 2 KB. The cost of a resync chunk is not
+ * the bytes on the wire, it is the RENDER: every $2118/$2119 write
+ * invalidates the tile-cache entries it touches, so the slave re-converts
+ * them. At 2 KB a frame the slave's render went from ~14 ms to 26 ms, which
+ * is past the 20 ms frame, so core 0 blocked waiting for a staging slot, the
+ * master's control frame found nobody listening ("frame header failed"), and
+ * the recovery armed another resync - a feedback loop running at one link
+ * failure per second. At 512 bytes the chunk is 1,539 bytes of records and a
+ * full 64 KB sweep takes 128 frames, about 2.5 seconds, which only ever
+ * happens on a link-up. */
+#define RESYNC_VRAM_CHUNK 512u
 
 static uint32_t resync_phase;   /* 0 idle, 1 registers+CGRAM, 2 VRAM, 3 OAM */
 static uint32_t resync_off;     /* byte offset within the VRAM sweep        */

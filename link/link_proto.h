@@ -375,6 +375,26 @@ typedef struct __attribute__((packed)) {
  * slave print what the master sent beside what it received, for the same
  * frame, on one console - which is the difference between "corrupted" and
  * "this is a different frame's stream". 32 bytes of a 232-byte payload. */
+/* The stream travels in chunks of this size, however long it is.
+ *
+ * Neither chip can put a bulk DMA on PSRAM: on the master a DMA READING the
+ * XIP window starves the HDMI scanline channel and the display loses lock,
+ * and on the slave a DMA WRITING it cannot keep up with the wire and the
+ * receive fails outright. Both therefore stage through SRAM - and SRAM is
+ * what neither has much of, so a single bulk had to be capped at whatever
+ * they could spare, and any frame bigger than that fell back to PSRAM and
+ * broke. Those frames are precisely the VRAM uploads, so what was lost was
+ * the graphics: 7 oversized frames a run, each one leaving the slave's
+ * mirror permanently wrong.
+ *
+ * Chunking removes the cap instead of raising it. A stream of any length is
+ * sent as ceil(len/CHUNK) bulks through one 16 KB SRAM buffer on each side,
+ * so PSRAM is never on a DMA's end, and the slave's landing zone drops from
+ * 48 KB to 16 KB. The cost is one extra doorbell handshake per chunk, and
+ * only on frames big enough to need one - in play the whole stream is 2,199
+ * bytes and there is exactly one chunk, as before. */
+#define LINK_PPU_STREAM_CHUNK (16u * 1024u)
+
 #define LINK_PPU_HEAD_BYTES  32u
 #define LINK_PPU_HEAD_OFFSET (LINK_PPU_SUM_OFFSET + sizeof(uint32_t))
 

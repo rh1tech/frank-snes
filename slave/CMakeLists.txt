@@ -37,6 +37,27 @@ message(STATUS "C2 slave: CPU ${CPU_SPEED} MHz, vreg ${CPU_VOLTAGE}")
 include(${REPO_ROOT}/pico_sdk_import.cmake)
 project(frank-snes-slave C CXX ASM)
 set(CMAKE_C_STANDARD 11)
+
+# The console must not be able to stall the link.
+#
+# pico_stdio_usb blocks inside printf until the host drains the CDC buffer,
+# for up to PICO_STDIO_USB_STDOUT_TIMEOUT_US - half a second by default. The
+# heartbeat runs on core 0 between exchanges, so a blocked printf is an
+# exchange the master cannot start: it finds nobody armed, fails with "frame
+# header failed", and the recovery then arms a full PPU resync which makes
+# the following frames heavier still.
+#
+# Measured by changing nothing but the heartbeat interval: 30 link failures
+# per 30 s at one heartbeat a second, 6 per 30 s at one every five. Exactly
+# one failure per heartbeat - the diagnostic was the fault it appeared to be
+# reporting.
+#
+# It must be set at DIRECTORY scope and before pico_sdk_init(): the macro is
+# read inside pico_stdio_usb's own compilation unit, which is a separate
+# target, so target_compile_definitions on the firmware does not reach it.
+# That mistake looks identical to the fix not working.
+add_compile_definitions(PICO_STDIO_USB_STDOUT_TIMEOUT_US=1000)
+
 pico_sdk_init()
 
 add_subdirectory(${REPO_ROOT}/link link)
@@ -153,7 +174,21 @@ target_link_libraries(frank-snes-slave
 # It also buys remote recovery. `picotool reboot -u -f` over this interface
 # puts the slave back in BOOTSEL without anyone touching the board, which is
 # what makes flashing it unattended possible at all.
-pico_enable_stdio_uart(frank-snes-slave 1)
+# UART stdio is OFF, and that is a link fix rather than a tidy-up.
+#
+# This board's UART1 is dead at the wire - a beacon firmware printing
+# unconditionally to it delivered 0 bytes to the host - but the driver does
+# not know that. It writes into the UART FIFO and busy-waits when the FIFO is
+# full, at 115200 baud, and nothing on the other end ever drains it. The
+# ~600-character heartbeat line is therefore about 52 ms of blocking on core
+# 0: more than two frames, during which the master's control frame finds
+# nobody armed and the exchange fails with "frame header failed".
+#
+# Measured, changing nothing else: one link failure per heartbeat, tracked
+# exactly as the heartbeat interval was moved between one and five seconds.
+# Bounding PICO_STDIO_USB_STDOUT_TIMEOUT_US did not help because the USB half
+# was never the one blocking.
+pico_enable_stdio_uart(frank-snes-slave 0)
 pico_enable_stdio_usb(frank-snes-slave 1)
 
 pico_add_extra_outputs(frank-snes-slave)
@@ -179,13 +214,19 @@ if(FRANK_SNES_PPU_SLAVE)
     # SIMPLE_COLOR_MATH takes the same colour-math path the master takes.
     #
     # Found by diffing the two builds' flags.make rather than by reading the
-    # renderer, which is the only way this class of mismatch shows up:
-    # FRANK_SNES_FAST_MODE alone changes the BG cache, the tile-dirty
-    # tracking, the colour-math path, the backdrop fill and whether
-    # FLUSH_REDRAW_EFFECT does anything at all.
+    # renderer, which is the only way this class of mismatch shows up.
+    #
+    # FRANK_SNES_FAST_MODE is deliberately NOT among them, even though the
+    # master sets it. Its BG cache and tile-dirty tracking are keyed on
+    # `current_buffer` and on the master's double-buffered SCREEN, neither of
+    # which means anything here, so on the slave it does not cache - it
+    # invalidates. Measured: with it, the tile cache reported 0 entries valid
+    # and a steady 808-record frame took 36,698 us; without it, 608 entries
+    # valid and 14,310 us for the same frame. It also cost a link failure a
+    # second, because a 37 ms render on a 20 ms frame leaves core 1 a whole
+    # frame behind.
     target_compile_definitions(frank-snes-slave PRIVATE
         NO_WINDOW_CLIPPING=1
         SIMPLE_COLOR_MATH=1
-        NO_ZERO_LUT=1
-        FRANK_SNES_FAST_MODE=1)
+        NO_ZERO_LUT=1)
 endif()

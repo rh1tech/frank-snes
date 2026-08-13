@@ -184,7 +184,7 @@ static uint8_t *g_ppu_stream;
  * clearing the largest stream actually measured. A frame bigger than this
  * still falls back to PSRAM and will still mostly fail; g_ppu_oversize_sram
  * counts those so it cannot be mistaken for success. */
-#define SLAVE_PPU_SRAM_BYTES (48u * 1024u)
+#define SLAVE_PPU_SRAM_BYTES LINK_PPU_STREAM_CHUNK
 static uint8_t g_ppu_stream_sram[SLAVE_PPU_SRAM_BYTES] __attribute__((aligned(4)));
 static uint32_t g_ppu_oversize_sram;
 static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
@@ -213,7 +213,8 @@ static volatile uint32_t g_render_waits, g_render_wait_us;
 /* Which PSRAM staging buffer core 0 will fill next, and which one core 1 is
    replaying. Core 0 only has to wait when those are the same. */
 static volatile uint32_t g_ppu_stage_slot, g_render_stage_slot = 0xffffffffu;
-static uint8_t *g_ppu_stage[2];
+extern uint8_t *slave_ppu_stage_buf[];
+#define G_PPU_STAGE_SLOTS 4u
 /* Diagnostic: receive the stream but skip the replay, to tell a bad RECEIVE
    from a bad REPLAY. Flipped over the wire is not possible here, so it is a
    build-time default that can be patched live via the debugger on the master
@@ -456,10 +457,7 @@ static void handle_frame(void)
     /* The PPU command stream rides in the same exchange, after the sound
        payloads. Receive it now; render it AFTER the reply. */
     uint32_t ppu_len = 0;
-    extern uint8_t *slave_ppu_stream_buf, *slave_ppu_stream_buf2;
-    g_ppu_stage[0] = slave_ppu_stream_buf;
-    g_ppu_stage[1] = slave_ppu_stream_buf2;
-    g_ppu_stream   = g_ppu_stage[g_ppu_stage_slot];
+    g_ppu_stream = slave_ppu_stage_buf[g_ppu_stage_slot];
     {
         /* Copied out of the payload above, before the bulks armed. */
         uint32_t want = ppu_want;
@@ -496,32 +494,25 @@ static void handle_frame(void)
             /* SRAM when it fits, PSRAM only when it cannot - see the note on
                g_ppu_stream_sram for the measurement that decides this. */
             extern volatile uint32_t slave_ppu_stream_dma;
-            uint8_t *dst;
-            bool by_dma;
-            if (want <= SLAVE_PPU_SRAM_BYTES) {
-                dst = g_ppu_stream_sram;
-                by_dma = false;
-            } else {
-                /* No landing zone big enough: the DMA writes PSRAM directly,
-                   which mostly fails, and the replay then needs the cache
-                   maintenance the staged path does not. */
-                dst = g_ppu_stage[g_ppu_stage_slot];
-                by_dma = true;
-                g_ppu_oversize_sram++;
+            uint8_t *stage = slave_ppu_stage_buf[g_ppu_stage_slot];
+            bool ok = true;
+            /* One bulk per chunk, always into SRAM, then copied to the PSRAM
+               staging buffer with the CPU. The DMA never touches PSRAM, so
+               there is no oversized case left to fail. */
+            for (uint32_t off = 0; off < want; off += LINK_PPU_STREAM_CHUNK) {
+                uint32_t n = want - off;
+                if (n > LINK_PPU_STREAM_CHUNK) n = LINK_PPU_STREAM_CHUNK;
+                if (!link_s_bulk_recv(&g_sess, g_ppu_stream_sram,
+                                      LINK_ALIGN4(n))) { ok = false; break; }
+                memcpy(stage + off, g_ppu_stream_sram, n);
             }
-            if (!link_s_bulk_recv(&g_sess, dst, LINK_ALIGN4(want))) {
+            if (!ok) {
                 g_ppu_recv_fail++;
             } else {
                 g_ppu_recv_ok++;
                 ppu_len = want;
-                if (!by_dma) {
-                    /* Stage it out of the landing zone so the next receive can
-                       reuse that buffer while core 1 is still replaying this
-                       frame. CPU-written and CPU-read, so no cache op. */
-                    memcpy(g_ppu_stage[g_ppu_stage_slot], dst, want);
-                }
-                g_ppu_stream = g_ppu_stage[g_ppu_stage_slot];
-                slave_ppu_stream_dma = by_dma;
+                g_ppu_stream = stage;
+                slave_ppu_stream_dma = 0;
                 /* Checked inside slave_ppu_replay, which is where the cache
                    invalidate happens - summing before it would compare the
                    master against stale lines and blame the wire for the
@@ -671,7 +662,7 @@ static void handle_frame(void)
             __sev();
             /* The next frame stages into the other buffer, so receiving it
                does not overwrite what core 1 is replaying. */
-            g_ppu_stage_slot ^= 1u;
+            if (++g_ppu_stage_slot >= G_PPU_STAGE_SLOTS) g_ppu_stage_slot = 0;
         }
     }
 #endif

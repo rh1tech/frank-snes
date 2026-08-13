@@ -331,7 +331,7 @@ static uint32_t       g_ppu_fb_got;
  * (41,760 bytes measured) exceed it, and those still go straight from PSRAM
  * and still disturb the display - g_ppu_tx_psram counts them so that stays
  * visible rather than becoming a mystery flicker. */
-#define PPU_TX_BOUNCE_BYTES (16u * 1024u)
+#define PPU_TX_BOUNCE_BYTES LINK_PPU_STREAM_CHUNK
 static uint8_t __attribute__((aligned(4))) g_ppu_tx_bounce[PPU_TX_BOUNCE_BYTES];
 volatile uint32_t g_ppu_tx_psram;   /* frames too big to bounce through SRAM */
 
@@ -342,13 +342,7 @@ void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
        doorbell handshake, so it cannot add to the master's stall if it is
        ever slow. Reading PSRAM with the CPU is fine - it is the DMA that
        cannot. */
-    if (ppu_stream && ppu_len && ppu_len <= PPU_TX_BOUNCE_BYTES) {
-        memcpy(g_ppu_tx_bounce, ppu_stream, ppu_len);
-        g_ppu_stream = g_ppu_tx_bounce;
-    } else {
-        if (ppu_len > PPU_TX_BOUNCE_BYTES) g_ppu_tx_psram++;
-        g_ppu_stream = ppu_stream;
-    }
+    g_ppu_stream = ppu_stream;      /* copied out chunk by chunk at send time */
     g_ppu_len    = ppu_len;
     g_ppu_fb     = fb;
     g_ppu_fb_max = fb_max;
@@ -489,10 +483,16 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
        missing bytes. */
     g_ppu_sent_len = g_ppu_len;
     if (g_ppu_len) g_ppu_sends++;
-    if (g_ppu_len && !link_m_bulk_send(&g_sess, g_ppu_stream,
-                                       LINK_ALIGN4(g_ppu_len))) {
-        go_offline("ppu stream bulk failed");
-        return false;
+    /* Chunked, through SRAM, so no DMA ever reads the XIP window. The CPU
+       copy out of PSRAM is fine - it is the DMA that is not. */
+    for (uint32_t off = 0; off < g_ppu_len; off += LINK_PPU_STREAM_CHUNK) {
+        uint32_t n = g_ppu_len - off;
+        if (n > LINK_PPU_STREAM_CHUNK) n = LINK_PPU_STREAM_CHUNK;
+        memcpy(g_ppu_tx_bounce, g_ppu_stream + off, n);
+        if (!link_m_bulk_send(&g_sess, g_ppu_tx_bounce, LINK_ALIGN4(n))) {
+            go_offline("ppu stream bulk failed");
+            return false;
+        }
     }
 #endif
 
