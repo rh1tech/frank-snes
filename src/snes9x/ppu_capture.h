@@ -76,7 +76,7 @@ extern volatile uint32_t frank_cap_min, frank_cap_max, frank_cap_takes;
    own counts for the same three registers. */
 extern volatile uint32_t frank_cap_vram_w, frank_cap_cgram_w, frank_cap_oam_w;
 /* VRAM is hashed in blocks so a divergence can be located, not just counted. */
-#define PPUCAP_VRAM_BLOCKS 8u
+#define PPUCAP_VRAM_BLOCKS 32u
 extern volatile uint32_t frank_cap_vram_block[PPUCAP_VRAM_BLOCKS];
 
 #define PPUCAP_WRITE_HOOK(addr, val) \

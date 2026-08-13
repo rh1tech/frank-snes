@@ -386,6 +386,10 @@ static void handle_frame(void)
     memcpy(&ppu_exp_vram_hash,
            g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_VRAMHASH_OFFSET,
            sizeof(ppu_exp_vram_hash));
+    { extern volatile uint8_t slave_ppu_exp_peek[];
+      memcpy((void *)slave_ppu_exp_peek,
+             g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_VRAMPEEK_OFFSET,
+             LINK_PPU_VRAMPEEK_BYTES); }
     { extern volatile uint32_t slave_ppu_exp_block[];
       for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++) {
           uint32_t v;
@@ -1250,6 +1254,17 @@ int main(void)
             /* The two heads, same frame, whenever one has been latched. This
                is the whole point: a checksum says the delivery is wrong, these
                say what it actually is. */
+            { extern volatile uint32_t slave_ppu_peek_valid;
+              extern volatile uint8_t slave_ppu_exp_peek[], slave_ppu_got_peek[];
+              if (slave_ppu_peek_valid) {
+                  printf("\n[slave] vram@8000 master:");
+                  for (uint32_t q = 0; q < LINK_PPU_VRAMPEEK_BYTES; q++)
+                      printf(" %02x", slave_ppu_exp_peek[q]);
+                  printf("\n[slave] vram@8000 slave :");
+                  for (uint32_t q = 0; q < LINK_PPU_VRAMPEEK_BYTES; q++)
+                      printf(" %02x", slave_ppu_got_peek[q]);
+                  slave_ppu_peek_valid = 0;
+              } }
             if (g_ppu_head_valid) {
                 printf("\n[slave] sent:");
                 for (uint32_t q = 0; q < LINK_PPU_HEAD_BYTES; q++)

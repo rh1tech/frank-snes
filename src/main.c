@@ -1479,7 +1479,18 @@ static inline int16_t soft_limit16(int32_t v) {
    S9xFixColourBrightness is called between frames" - which was true when the
    renderer drove it and is not true now. Set to 1 to take the palette out of
    the picture entirely while testing whether the display holds lock. */
-volatile uint32_t g_pal_push_disable = 0;
+/* The palette is the MASTER's, not the slave's.
+ *
+ * The master still runs the whole emulator: it sees every CGRAM write and
+ * every $2100, and S9xFixColourBrightness turns those into the HDMI palette
+ * exactly as it always did. Pushing the slave's palette on top of that
+ * overwrote it with one that has no brightness applied - so a fade, which is
+ * nothing but brightness stepping down and back up, never appeared. The
+ * slave's job is to produce INDICES; the colours were never its business.
+ *
+ * Left as a switch rather than deleted because the slave's palette is still
+ * shipped and still useful as a cross-check that both halves agree. */
+volatile uint32_t g_pal_push_disable = 1;
 volatile bool g_hdmi_irq_core1_ready;   /* core 1 is at its service loop */
 volatile bool g_hdmi_irq_released;      /* core 0 has given the IRQ up */
 extern void graphics_hdmi_irq_take_this_core(void);

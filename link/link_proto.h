@@ -419,7 +419,13 @@ typedef struct __attribute__((packed)) {
 /* Eight 8 KB block hashes, so a divergence can be located within VRAM
    rather than merely counted. */
 #define LINK_PPU_VRAMBLK_OFFSET (LINK_PPU_VRAMHASH_OFFSET + sizeof(uint32_t))
-#define LINK_PPU_VRAM_BLOCKS 8u
+#define LINK_PPU_VRAM_BLOCKS 32u
+/* Sixteen bytes of the master's VRAM at LINK_PPU_VRAMPEEK_ADDR, so the two
+   chips' actual content can be printed side by side. A hash says the region
+   differs; only the bytes say HOW - shifted, stale, or absent. */
+#define LINK_PPU_VRAMPEEK_OFFSET (LINK_PPU_VRAMBLK_OFFSET + LINK_PPU_VRAM_BLOCKS * 4u)
+#define LINK_PPU_VRAMPEEK_BYTES  16u
+#define LINK_PPU_VRAMPEEK_ADDR   0x8000u
 
 #define LINK_ARAM_BITMAP_BYTES (LINK_ARAM_PAGES / 8u)         /* 32  */
 

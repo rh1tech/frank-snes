@@ -101,7 +101,10 @@ volatile uint32_t slave_ppu_vram_hash, slave_ppu_cgram_hash, slave_ppu_oam_hash;
 volatile uint32_t slave_ppu_exp_vram_hash;   /* the master's, for this frame */
 volatile uint32_t slave_ppu_exp_block[LINK_PPU_VRAM_BLOCKS];
 volatile uint32_t slave_ppu_blk_diff[LINK_PPU_VRAM_BLOCKS];
-volatile uint32_t slave_ppu_blk_bitmap;
+volatile uint32_t slave_ppu_blk_bitmap;   /* 32 blocks of 2 KB */
+volatile uint8_t  slave_ppu_exp_peek[LINK_PPU_VRAMPEEK_BYTES];
+volatile uint8_t  slave_ppu_got_peek[LINK_PPU_VRAMPEEK_BYTES];
+volatile uint32_t slave_ppu_peek_valid;
 volatile uint32_t slave_ppu_vram_match, slave_ppu_vram_diff;
 volatile uint32_t slave_ppu_bad_wire;    /* differed already on arrival     */
 volatile uint32_t slave_ppu_bad_stage;   /* arrived right, staged wrong     */
@@ -688,6 +691,14 @@ void slave_ppu_hash_state(void)
       }
    }
    slave_ppu_blk_bitmap = bits;
+   /* Latch the bytes at the peek address whenever its block disagrees, so
+      the two chips' actual content can be printed side by side. */
+   if (Memory.VRAM && !slave_ppu_peek_valid &&
+       (bits & (1u << (LINK_PPU_VRAMPEEK_ADDR / (VRAM_SIZE / LINK_PPU_VRAM_BLOCKS))))) {
+      for (uint32_t i = 0; i < LINK_PPU_VRAMPEEK_BYTES; i++)
+         slave_ppu_got_peek[i] = Memory.VRAM[LINK_PPU_VRAMPEEK_ADDR + i];
+      slave_ppu_peek_valid = 1;
+   }
 
    h = 2166136261u;
    for (uint32_t i = 0; i < 256u; i++) {
