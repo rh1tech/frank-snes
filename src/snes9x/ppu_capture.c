@@ -13,6 +13,10 @@
  * it.
  */
 #include "snes9x.h"
+/* The resync reads this chip's live PPU state - VRAM, CGRAM, OAM and the
+   register mirror - and re-emits it as write records. */
+#include "memmap.h"
+#include "ppu.h"
 #include "ppu_capture.h"
 
 #ifdef FRANK_SNES_PPU_CAPTURE
@@ -173,6 +177,118 @@ void ppucap_line(uint8_t line)
    ppucap_put(r, 2);
 }
 
+/* ---- Full PPU state resync ------------------------------------------
+ *
+ * The stream only ever carries writes made SINCE the slave started
+ * listening. Everything the game uploaded before link-up, and everything
+ * lost while the link was down, is gone from the slave permanently: a
+ * dropped VRAM write is not a cosmetic glitch, it leaves the mirror wrong
+ * for as long as the game does not happen to rewrite that address.
+ *
+ * Measured, each chip counting its own VRAM identically: master 3,640
+ * non-zero bytes of 8,192 sampled, slave 1,154, with 783,324 writes
+ * replayed against 1,196,690 captured. About a third never arrived, and
+ * what was missing included the tilemap - which is why the slave drew a
+ * structurally perfect frame of nothing while its renderer was provably
+ * able to draw (see g_ppu_selftest).
+ *
+ * The reconstruction is emitted as ORDINARY WRITE RECORDS: set the VRAM
+ * address, then write the bytes; set the CGRAM address, then write the
+ * palette. The slave replays them through the same S9xSetPPU as everything
+ * else and needs no new record type, no new code and no new state machine.
+ *
+ * It is spread over frames rather than sent as one 200 KB burst, because
+ * both halves land the stream in SRAM and neither buffer is that big - the
+ * master bounces through 16 KB and the slave through 48 KB, and a stream
+ * that overruns either falls back to a PSRAM DMA, which is what breaks
+ * HDMI and what fails to receive. 2 KB of VRAM per frame is 6,147 bytes of
+ * records, so even a busy frame stays inside both buffers, and the whole
+ * 64 KB is resynced in 32 frames - under two thirds of a second. */
+#define RESYNC_VRAM_CHUNK 2048u
+
+static uint32_t resync_phase;   /* 0 idle, 1 registers+CGRAM, 2 VRAM, 3 OAM */
+static uint32_t resync_off;     /* byte offset within the VRAM sweep        */
+volatile uint32_t frank_cap_resyncs;
+
+void ppucap_request_resync(void)
+{
+   resync_phase = 1;
+   resync_off   = 0;
+   frank_cap_resyncs++;
+}
+
+static void ppucap_emit(uint16_t addr, uint8_t val)
+{
+   uint8_t r[3];
+   r[0] = PPUCAP_WRITE;
+   r[1] = (uint8_t)(addr & 0x3f);
+   r[2] = val;
+   ppucap_put(r, 3);
+}
+
+/* Emitted at the HEAD of a frame's stream, so the reconstructed state is in
+   place before that frame's own writes are applied on top of it. */
+static void ppucap_emit_resync(void)
+{
+   if (!resync_phase || !Memory.VRAM || !Memory.FillRAM) return;
+
+   if (resync_phase == 1) {
+      /* Layout, windows and colour math. The write-twice scroll registers
+         ($210D-$2114) are deliberately not reconstructed: one byte cannot
+         restore a two-write latch, and games rewrite scroll every frame. */
+      static const uint16_t regs[] = {
+         0x2100, 0x2101, 0x2105, 0x2106, 0x2107, 0x2108, 0x2109, 0x210a,
+         0x210b, 0x210c, 0x2123, 0x2124, 0x2125, 0x2126, 0x2127, 0x2128,
+         0x2129, 0x212a, 0x212b, 0x212c, 0x212d, 0x212e, 0x212f, 0x2130,
+         0x2131, 0x2133,
+      };
+      for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
+         ppucap_emit(regs[i], Memory.FillRAM[regs[i]]);
+
+      /* CGRAM, all 256 entries, low byte then high. */
+      ppucap_emit(0x2121, 0x00);
+      for (uint32_t i = 0; i < 256u; i++) {
+         ppucap_emit(0x2122, (uint8_t)(PPU.CGDATA[i] & 0xff));
+         ppucap_emit(0x2122, (uint8_t)(PPU.CGDATA[i] >> 8));
+      }
+      resync_phase = 2;
+      resync_off   = 0;
+      return;
+   }
+
+   if (resync_phase == 2) {
+      uint32_t n = RESYNC_VRAM_CHUNK;
+      if (resync_off + n > VRAM_SIZE) n = VRAM_SIZE - resync_off;
+      /* +1 word after $2119, which is what makes the pair of byte writes
+         below advance one word at a time. */
+      ppucap_emit(0x2115, 0x80);
+      ppucap_emit(0x2116, (uint8_t)((resync_off >> 1) & 0xff));
+      ppucap_emit(0x2117, (uint8_t)((resync_off >> 1) >> 8));
+      for (uint32_t i = 0; i < n; i += 2u) {
+         ppucap_emit(0x2118, Memory.VRAM[resync_off + i]);
+         ppucap_emit(0x2119, Memory.VRAM[resync_off + i + 1u]);
+      }
+      resync_off += n;
+      if (resync_off >= VRAM_SIZE) { resync_phase = 3; resync_off = 0; }
+      return;
+   }
+
+   /* OAM, then hand the address registers back to whatever the game had
+      them set to, so the resync cannot disturb a transfer in progress. */
+   ppucap_emit(0x2102, 0x00);
+   ppucap_emit(0x2103, 0x00);
+   for (uint32_t i = 0; i < 544u; i++)
+      ppucap_emit(0x2104, PPU.OAMData[i]);
+
+   ppucap_emit(0x2115, Memory.FillRAM[0x2115]);
+   ppucap_emit(0x2116, Memory.FillRAM[0x2116]);
+   ppucap_emit(0x2117, Memory.FillRAM[0x2117]);
+   ppucap_emit(0x2121, Memory.FillRAM[0x2121]);
+   ppucap_emit(0x2102, Memory.FillRAM[0x2102]);
+   ppucap_emit(0x2103, Memory.FillRAM[0x2103]);
+   resync_phase = 0;
+}
+
 void ppucap_endframe(void)
 {
    uint8_t r[2];
@@ -189,6 +305,10 @@ void ppucap_endframe(void)
    ppucap_buf    = ppucap_bufs[ppucap_which];
    ppucap_len    = 0;
    ppucap_total = 0;
+
+   /* At the head of the frame that is only now beginning, so the frame's own
+      writes land on top of the reconstructed state rather than under it. */
+   ppucap_emit_resync();
 
    /* Capture stays ON. It alternated once, to measure its own cost against
       the same scene - and that toggle survived into the offload, where every

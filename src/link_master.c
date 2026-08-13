@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "ppu_capture.h"
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -135,6 +136,10 @@ bool link_master_init(void)
 
     /* Steady state from here on. */
     g_sess.handshake_timeout_us = LINK_FRAME_TIMEOUT_US;
+#ifdef FRANK_SNES_PPU_CAPTURE
+    /* The slave starts with an empty PPU and cannot ask for what it missed. */
+    ppucap_request_resync();
+#endif
     return true;
 }
 
@@ -184,6 +189,11 @@ bool link_master_reprobe(void)
 
     LOG("[link] recovered\n");
     g_sess.handshake_timeout_us = LINK_FRAME_TIMEOUT_US;
+#ifdef FRANK_SNES_PPU_CAPTURE
+    /* Every exchange missed while offline is a write the slave will never
+       see again, so a recovery is exactly as damaging as a cold start. */
+    ppucap_request_resync();
+#endif
     return true;
 }
 

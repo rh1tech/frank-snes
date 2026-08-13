@@ -54,6 +54,11 @@ const uint8_t *ppucap_take(uint32_t *len);    /* this frame's stream */
 void ppucap_write(uint16_t address, uint8_t value);
 void ppucap_line(uint8_t line);
 void ppucap_endframe(void);
+/* Rebuild the slave's entire PPU state from this chip's, as ordinary write
+   records spread over the next ~32 frames. Call whenever the link comes up:
+   the slave has no way to recover writes it was not listening for. */
+void ppucap_request_resync(void);
+extern volatile uint32_t frank_cap_resyncs;
 
 /* Bytes captured per frame, and dropped-record count. The capture's COST is
    measured by alternating it on and off (see ppu_capture.c), not by timing
