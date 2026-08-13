@@ -100,6 +100,15 @@ volatile uint32_t slave_ppu_rx_sum;
 volatile uint32_t slave_ppu_vram_hash, slave_ppu_cgram_hash, slave_ppu_oam_hash;
 volatile uint32_t slave_ppu_exp_vram_hash;   /* the master's, for this frame */
 volatile uint32_t slave_ppu_exp_block[LINK_PPU_VRAM_BLOCKS];
+volatile uint32_t slave_ppu_exp_vma[LINK_PPU_VMA_WORDS];
+/* Which VMA field disagreed, ever: b0 Address, b1 Increment, b2 High,
+   b3 FullGraphicCount, b4 Shift, b5 Mask1. */
+volatile uint32_t slave_ppu_vma_bad;
+volatile uint32_t slave_ppu_vma_ok_n, slave_ppu_vma_bad_n;
+/* The actual values at the first disagreement, so the field can be READ. */
+volatile uint32_t slave_ppu_vma_got0, slave_ppu_vma_got1;
+volatile uint32_t slave_ppu_vma_exp0, slave_ppu_vma_exp1;
+volatile uint32_t slave_ppu_vma_latched;
 volatile uint32_t slave_ppu_blk_diff[LINK_PPU_VRAM_BLOCKS];
 volatile uint32_t slave_ppu_blk_bitmap;   /* 32 blocks of 2 KB */
 volatile uint8_t  slave_ppu_exp_peek[LINK_PPU_VRAMPEEK_BYTES];
@@ -691,6 +700,35 @@ void slave_ppu_hash_state(void)
       }
    }
    slave_ppu_blk_bitmap = bits;
+
+   /* Name the field, not just the region. */
+   { uint32_t v0 = (uint32_t)PPU.VMA.Address
+                 | ((uint32_t)PPU.VMA.Increment << 16)
+                 | ((uint32_t)(PPU.VMA.High ? 1u : 0u) << 24);
+     uint32_t v1 = (uint32_t)PPU.VMA.FullGraphicCount
+                 | ((uint32_t)PPU.VMA.Shift << 16)
+                 | ((uint32_t)(PPU.VMA.Mask1 & 0xffu) << 24);
+     uint32_t e0 = slave_ppu_exp_vma[0], e1 = slave_ppu_exp_vma[1];
+     if (v0 == e0 && v1 == e1) slave_ppu_vma_ok_n++;
+     else {
+        slave_ppu_vma_bad_n++;
+        /* Address only is expected: the capture's shadow re-emits the
+           address before the next VRAM write, so an end-of-frame drift is
+           harmless. Latch a sample where something ELSE differs - those are
+           not corrected by anything. */
+        if (!slave_ppu_vma_latched &&
+            (((v0 >> 16) != (e0 >> 16)) || v1 != e1)) {
+           slave_ppu_vma_got0 = v0; slave_ppu_vma_got1 = v1;
+           slave_ppu_vma_exp0 = e0; slave_ppu_vma_exp1 = e1;
+           slave_ppu_vma_latched = 1;
+        }
+        if ((v0 & 0xffffu) != (e0 & 0xffffu))           slave_ppu_vma_bad |= 1u;
+        if (((v0 >> 16) & 0xffu) != ((e0 >> 16) & 0xffu)) slave_ppu_vma_bad |= 2u;
+        if (((v0 >> 24) & 1u) != ((e0 >> 24) & 1u))       slave_ppu_vma_bad |= 4u;
+        if ((v1 & 0xffffu) != (e1 & 0xffffu))           slave_ppu_vma_bad |= 8u;
+        if (((v1 >> 16) & 0xffu) != ((e1 >> 16) & 0xffu)) slave_ppu_vma_bad |= 16u;
+        if (((v1 >> 24) & 0xffu) != ((e1 >> 24) & 0xffu)) slave_ppu_vma_bad |= 32u;
+     } }
    /* Latch the bytes at the peek address whenever its block disagrees, so
       the two chips' actual content can be printed side by side. */
    if (Memory.VRAM && !slave_ppu_peek_valid &&

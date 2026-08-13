@@ -426,6 +426,17 @@ typedef struct __attribute__((packed)) {
 #define LINK_PPU_VRAMPEEK_OFFSET (LINK_PPU_VRAMBLK_OFFSET + LINK_PPU_VRAM_BLOCKS * 4u)
 #define LINK_PPU_VRAMPEEK_BYTES  16u
 #define LINK_PPU_VRAMPEEK_ADDR   0x8000u
+/* The master's PPU.VMA, packed into two words.
+ *
+ * Every write record arrives - 660,480 emitted against 661,052 replayed -
+ * so the divergence is about WHERE they land, and where they land is
+ * computed entirely from this struct. A hash says a 2 KB region differs;
+ * this names the field that made it differ. FullGraphicCount in particular
+ * remaps the address NON-LINEARLY, so a disagreement there scatters the
+ * bytes rather than shifting them - which is what "pieces of other
+ * animation frames" looks like. */
+#define LINK_PPU_VMA_OFFSET (LINK_PPU_VRAMPEEK_OFFSET + LINK_PPU_VRAMPEEK_BYTES)
+#define LINK_PPU_VMA_WORDS  2u
 
 #define LINK_ARAM_BITMAP_BYTES (LINK_ARAM_PAGES / 8u)         /* 32  */
 

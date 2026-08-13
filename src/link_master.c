@@ -18,6 +18,7 @@
 #include <string.h>
 #include "ppu_capture.h"
 #include "memmap.h"
+#include "ppu.h"
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -443,8 +444,16 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
             memcpy(pl + LINK_PPU_VRAMPEEK_OFFSET,
                    Memory.VRAM + LINK_PPU_VRAMPEEK_ADDR,
                    LINK_PPU_VRAMPEEK_BYTES);
-        const uint32_t pl_bytes = LINK_PPU_VRAMPEEK_OFFSET
-                                + LINK_PPU_VRAMPEEK_BYTES;
+        { uint32_t v0 = (uint32_t)PPU.VMA.Address
+                      | ((uint32_t)PPU.VMA.Increment << 16)
+                      | ((uint32_t)(PPU.VMA.High ? 1u : 0u) << 24);
+          uint32_t v1 = (uint32_t)PPU.VMA.FullGraphicCount
+                      | ((uint32_t)PPU.VMA.Shift << 16)
+                      | ((uint32_t)(PPU.VMA.Mask1 & 0xffu) << 24);
+          memcpy(pl + LINK_PPU_VMA_OFFSET,     &v0, 4u);
+          memcpy(pl + LINK_PPU_VMA_OFFSET + 4, &v1, 4u); }
+        const uint32_t pl_bytes = LINK_PPU_VMA_OFFSET
+                                + LINK_PPU_VMA_WORDS * 4u;
 #else
         const uint32_t pl_bytes = rt;
 #endif

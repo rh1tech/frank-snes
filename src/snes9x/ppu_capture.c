@@ -325,9 +325,35 @@ static void ppucap_emit(uint16_t addr, uint8_t val)
  * whole point: there is a frame boundary between chunks, and the game writes
  * VRAM in every one of them. The shadow is invalidated too, so the next real
  * VRAM write re-emits its address rather than trusting a stale match. */
+/* Reconstruct the VMAIN byte from the live PPU.VMA rather than reading it
+ * back from Memory.FillRAM.
+ *
+ * FillRAM[0x2115] only holds what the GAME wrote. A game that never writes
+ * VMAIN leaves it zero, and restoring zero sets the slave's Increment to 1
+ * and High to false - values the master never had, because its PPU.VMA came
+ * from S9xResetPPU. Measured: 330 frames in 2,535 with the slave's VMA
+ * disagreeing, and the failing fields were exactly Increment and High.
+ * Address disagreements are expected and harmless - the capture's shadow
+ * corrects those at the next VRAM write - but Increment and High are not
+ * corrected by anything, so every write after one of these lands with the
+ * wrong stride. */
+static uint8_t ppucap_vmain_byte(void)
+{
+   uint8_t b = PPU.VMA.High ? 0x80u : 0x00u;
+   if      (PPU.VMA.Increment == 32u)  b |= 1u;
+   else if (PPU.VMA.Increment == 128u) b |= 2u;
+   switch (PPU.VMA.FullGraphicCount) {
+   case 32u:  b |= 0x04u; break;
+   case 64u:  b |= 0x08u; break;
+   case 128u: b |= 0x0cu; break;
+   default:   break;               /* 0 = no remapping */
+   }
+   return b;
+}
+
 static void ppucap_resync_restore_addr(void)
 {
-   ppucap_emit(0x2115, Memory.FillRAM[0x2115]);
+   ppucap_emit(0x2115, ppucap_vmain_byte());
    ppucap_emit(0x2116, Memory.FillRAM[0x2116]);
    ppucap_emit(0x2117, Memory.FillRAM[0x2117]);
    ppucap_emit(0x2121, Memory.FillRAM[0x2121]);
@@ -354,6 +380,8 @@ static void ppucap_emit_resync(void)
       };
       for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
          ppucap_emit(regs[i], Memory.FillRAM[regs[i]]);
+      /* Same reason as the restore: VMAIN must come from the live state. */
+      ppucap_emit(0x2115, ppucap_vmain_byte());
 
       /* CGRAM, all 256 entries, low byte then high. */
       ppucap_emit(0x2121, 0x00);

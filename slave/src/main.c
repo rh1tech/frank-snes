@@ -392,6 +392,10 @@ static void handle_frame(void)
       memcpy((void *)slave_ppu_exp_peek,
              g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_VRAMPEEK_OFFSET,
              LINK_PPU_VRAMPEEK_BYTES); }
+    uint32_t ppu_exp_vma[LINK_PPU_VMA_WORDS];
+    for (uint32_t b = 0; b < LINK_PPU_VMA_WORDS; b++)
+        memcpy(&ppu_exp_vma[b],
+               g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_VMA_OFFSET + b * 4u, 4u);
     uint32_t ppu_exp_block[LINK_PPU_VRAM_BLOCKS];
     for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++)
         memcpy(&ppu_exp_block[b], g_ctrl_rx + sizeof(link_hdr_t)
@@ -723,6 +727,9 @@ static void handle_frame(void)
             { extern volatile uint32_t slave_ppu_exp_block[];
               for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++)
                   slave_ppu_exp_block[b] = ppu_exp_block[b]; }
+            { extern volatile uint32_t slave_ppu_exp_vma[];
+              for (uint32_t b = 0; b < LINK_PPU_VMA_WORDS; b++)
+                  slave_ppu_exp_vma[b] = ppu_exp_vma[b]; }
             g_render_kicks++;
             __dmb();
             g_render_req = true;
@@ -1205,6 +1212,8 @@ int main(void)
                        (unsigned long)slave_ppu_bad_stage,
                        (unsigned long)g_ppu_stage_retry,
                        (unsigned long)g_ppu_stage_lost);
+                extern volatile uint32_t slave_ppu_vma_ok_n, slave_ppu_vma_bad_n,
+                                         slave_ppu_vma_bad;
                 extern volatile uint32_t slave_ppu_upd_calls, slave_ppu_vram_w,
                                          slave_ppu_cgram_w, slave_ppu_r2100_w,
                                          slave_ppu_r2100_last,
@@ -1239,8 +1248,11 @@ int main(void)
                        (unsigned long)(ct & 0xffffu),
                        (unsigned long)(ct >> 16));
                 extern uint32_t slave_ppu_dbg_regs(void);
-                printf(" | vramat=%08lx upd=%lu vram=%lu cgram=%lu regs=%08lx"
+                printf(" | vma=%lu/%lu bad=%02lx vramat=%08lx upd=%lu vram=%lu cgram=%lu regs=%08lx"
                        " want=%lu rx=%lu/%lu zero=%lu over=%lu/%lu sram=%lu",
+                       (unsigned long)slave_ppu_vma_ok_n,
+                       (unsigned long)slave_ppu_vma_bad_n,
+                       (unsigned long)slave_ppu_vma_bad,
                        (unsigned long)(uintptr_t)Memory.VRAM,
                        (unsigned long)slave_ppu_upd_calls,
                        (unsigned long)slave_ppu_vram_w,
@@ -1272,6 +1284,24 @@ int main(void)
                   for (uint32_t q = 0; q < LINK_PPU_VRAMPEEK_BYTES; q++)
                       printf(" %02x", slave_ppu_got_peek[q]);
                   slave_ppu_peek_valid = 0;
+              } }
+            { extern volatile uint32_t slave_ppu_vma_latched,
+                       slave_ppu_vma_got0, slave_ppu_vma_got1,
+                       slave_ppu_vma_exp0, slave_ppu_vma_exp1;
+              if (slave_ppu_vma_latched) {
+                  printf("\n[slave] VMA master addr=%04lx inc=%lu high=%lu fgc=%lu shift=%lu"
+                         "\n[slave] VMA slave  addr=%04lx inc=%lu high=%lu fgc=%lu shift=%lu\n",
+                     (unsigned long)(slave_ppu_vma_exp0 & 0xffff),
+                     (unsigned long)((slave_ppu_vma_exp0 >> 16) & 0xff),
+                     (unsigned long)((slave_ppu_vma_exp0 >> 24) & 1),
+                     (unsigned long)(slave_ppu_vma_exp1 & 0xffff),
+                     (unsigned long)((slave_ppu_vma_exp1 >> 16) & 0xff),
+                     (unsigned long)(slave_ppu_vma_got0 & 0xffff),
+                     (unsigned long)((slave_ppu_vma_got0 >> 16) & 0xff),
+                     (unsigned long)((slave_ppu_vma_got0 >> 24) & 1),
+                     (unsigned long)(slave_ppu_vma_got1 & 0xffff),
+                     (unsigned long)((slave_ppu_vma_got1 >> 16) & 0xff));
+                  slave_ppu_vma_latched = 0;
               } }
             if (g_ppu_head_valid) {
                 printf("\n[slave] sent:");
