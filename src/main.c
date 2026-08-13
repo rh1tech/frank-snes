@@ -289,6 +289,9 @@ static void screen16_to_indexed(uint8_t *dst)
 
 // Current display buffer (double buffering) - accessed by HDMI driver
 volatile uint32_t current_buffer = 0;
+/* Master-only display self-test - see the render-flip site. Default ON for
+   the isolation run; live-patchable over SWD. */
+volatile uint32_t g_master_test_pattern = 0;
 
 #ifdef FRANK_SNES_PPU_CAPTURE
 /* PSRAM landing area for the slave's picture - see the staging call. */
@@ -726,6 +729,11 @@ typedef struct {
        forced blank; this says whether that is a faithful replay of the
        master's PPU or a slave that has lost the register. */
     uint32_t master_regs;
+    /* Non-zero VRAM bytes, sampled every 8th, computed by this chip's own CPU.
+       The slave computes the identical figure, so the two are directly
+       comparable - which a debug-probe read of PSRAM is not, because the
+       cache holds what the CPU wrote and the AP sees the backing store. */
+    uint32_t master_vramnz;
     /* HDMI health. Counting interrupts alone once "proved" the generator
        healthy on a display that had no signal; the GAP is what decides it. */
     uint32_t hdmi_irqs, hdmi_gap_max, hdmi_late;
@@ -2132,7 +2140,44 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
          * exchange actually received, so a frame the slave did not send (or a
          * failed exchange) leaves the current picture up rather than flipping
          * to a stale buffer. */
-        if (link_master_ppu_got()) {
+        /* Draw a picture with NO SLAVE INVOLVED.
+         *
+         * Every "the picture works" check so far has run the whole chain -
+         * capture, link, slave renderer, framebuffer bulk, palette bulk - and
+         * a failure anywhere in it looks identical from the screen. This
+         * writes eight bars straight into the buffer HDMI is about to show,
+         * on this chip, in the offload build, and pushes its own palette. If
+         * these bars appear, the master's display path is sound in this
+         * configuration and everything that follows is about the slave; if
+         * they do not, nothing the slave sends could ever have been seen.
+         *
+         * Live-patchable so it can be switched on and off over SWD without
+         * reflashing. */
+        if (g_master_test_pattern) {
+            uint8_t *fb = SCREEN[current_buffer];
+            for (uint32_t y = 0; y < SNES_HEIGHT; y++) {
+                uint8_t *row = fb + y * SNES_WIDTH;
+                for (uint32_t x = 0; x < SNES_WIDTH; x++)
+                    row[x] = (uint8_t)(1u + (x >> 5));   /* 8 vertical bars */
+            }
+            /* A block that moves, so a frozen frame is distinguishable from a
+               live one that happens to be static. */
+            { static uint32_t t; t++;
+              for (uint32_t y = 8; y < 24u; y++)
+                  for (uint32_t x = 0; x < 16u; x++)
+                      fb[y * SNES_WIDTH + (((t >> 3) + x) & 0xffu)] = 8u; }
+            static const uint32_t bars[8] = {
+                0xff0000u, 0x00ff00u, 0x0000ffu, 0xffff00u,
+                0xff00ffu, 0x00ffffu, 0xffffffu, 0x808080u
+            };
+            /* Pushed every frame, after the emulator's own palette work, so
+               the game's CGRAM cannot quietly repaint these eight entries. */
+            graphics_set_palette(0, 0x000000u);
+            for (uint32_t i = 0; i < 8u; i++)
+                graphics_set_palette((uint8_t)(1u + i), bars[i]);
+            current_buffer = !current_buffer;
+            GFX.Screen = SCREEN[current_buffer];
+        } else if (link_master_ppu_got()) {
             current_buffer = !current_buffer;
             GFX.Screen = SCREEN[current_buffer];
         }
@@ -2648,6 +2693,12 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_hdmi_irqs = 0;
                       frank_hdmi_gap_max = 0;
                       frank_hdmi_late = 0; }
+                    if (Memory.VRAM) {
+                        uint32_t n = 0;
+                        for (uint32_t i = 0; i < 0x10000u; i += 8u)
+                            if (Memory.VRAM[i]) n++;
+                        frank_telemetry.master_vramnz = n;
+                    }
                     if (Memory.FillRAM)
                       frank_telemetry.master_regs =
                             (uint32_t)Memory.FillRAM[0x2100]

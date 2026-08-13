@@ -222,6 +222,10 @@ volatile uint32_t g_render_disable = 0;
 /* Draw a synthetic test pattern instead of replaying the stream - see the
    note at the render call. Isolates delivery from content. */
 volatile uint32_t g_ppu_test_pattern = 0;
+/* Render a self-built PPU state instead of the stream - the question is
+   whether this renderer can draw at all on this chip. */
+volatile uint32_t g_ppu_selftest = 0;
+volatile uint32_t g_dbg_selftest_nz;
 /* What the master said it sent, and what actually landed, for the SAME frame.
    Printed side by side when the checksums disagree. */
 volatile uint8_t  g_ppu_exp_head[LINK_PPU_HEAD_BYTES];
@@ -230,6 +234,8 @@ volatile uint32_t g_ppu_head_valid;
 volatile uint8_t  g_dbg_head[8];
 volatile uint32_t g_dbg_len, g_dbg_sram;
 volatile uint32_t g_dbg_nz_drawn, g_dbg_nz_sent;
+/* Pixels the renderer actually WROTE, sentinel-based - see the render call. */
+volatile uint32_t g_dbg_touched;
 /* Did core 1 reach its loop, see a request, and start a render? Separates
    "core 1 never ran" from "core 1 ran and died inside the replay". */
 static volatile uint32_t g_render_alive, g_render_spins, g_render_starts;
@@ -751,8 +757,18 @@ static void slave_render_core(void)
             for (uint32_t i = 0; i < 8u; i++) slave_palette[1u + i] = bars[i];
             slave_palette[0] = 0x000000u;
         } else {
+            /* Sentinel fill: "wrote zeros" and "wrote nothing" are the same
+               picture but completely different bugs, and counting non-zero
+               pixels cannot tell them apart. Anything the renderer touches
+               stops being 0xAA. */
+            memset(slave_ppu_screen, 0xAA, 256u * 224u);
             slave_ppu_arm_frame();
             slave_ppu_replay(g_render_buf, g_render_len);
+            { uint32_t touched = 0;
+              const uint8_t *fb = slave_ppu_screen;
+              for (uint32_t q = 0; q < 256u * 224u; q += 37)
+                  if (fb[q] != 0xAAu) touched++;
+              g_dbg_touched = touched; }
         }
 
         /* Did the renderer actually put pixels in the buffer, and is it the
@@ -1033,6 +1049,34 @@ int main(void)
 
         if (now - last_report >= 1000000u) {
             last_report = now;
+#ifdef FRANK_SNES_PPU_SLAVE
+            /* Driven from HERE, not from the render core: the render core only
+               runs when the master kicks it, and the whole point of the
+               self-test is to answer "can this renderer draw?" without the
+               master in the picture at all. Once a second is plenty to read a
+               counter, and it still reaches the screen if a master IS
+               attached. */
+            if (g_ppu_selftest) {
+                extern void slave_ppu_selftest_build(void);
+                extern void slave_ppu_selftest_frame(void);
+                extern uint8_t *slave_ppu_screen;
+                static bool st_built;
+                if (!st_built) { st_built = true; slave_ppu_selftest_build(); }
+                slave_ppu_screen = g_ppu_fb[g_ppu_slot];
+                memset(slave_ppu_screen, 0xAA, 256u * 224u);
+                slave_ppu_selftest_frame();
+                { uint32_t nz = 0, touched = 0;
+                  const uint8_t *fb = slave_ppu_screen;
+                  for (uint32_t q = 0; q < 256u * 224u; q += 37) {
+                      if (fb[q] != 0xAAu) touched++;
+                      if (fb[q] && fb[q] != 0xAAu) nz++;
+                  }
+                  g_dbg_touched = touched; g_dbg_selftest_nz = nz; }
+                g_ppu_fb_bytes = 256u * 224u;
+                g_ppu_slot ^= 1u;
+                g_ppu_fb_valid = true;
+            }
+#endif
             printf("[slave] up %lus %lu frames, %lu bad",
                    (unsigned long)(now / 1000000u),
                    (unsigned long)g_frames, (unsigned long)g_bad_frames);
@@ -1096,7 +1140,28 @@ int main(void)
                                          slave_ppu_r2100_last,
                                          slave_ppu_r2100_seen;
                 extern uint32_t slave_ppu_dbg_content(void);
+                extern void slave_ppu_dbg_render(uint32_t *);
+                extern volatile uint32_t frank_dbg_bg_calls, frank_dbg_obj_calls;
                 uint32_t ct = slave_ppu_dbg_content();
+                { uint32_t r[6];
+                  slave_ppu_dbg_render(r);
+                  printf(" | Y=%lu..%lu line=%lu/%lu mode=%lu tm=%02lx ts=%02lx"
+                         " clip=%lu/%lu/%lu tiles=%lu cached=%lu touched=%lu bg=%lu obj=%lu stnz=%lu",
+                         (unsigned long)(r[0] & 0xffff),
+                         (unsigned long)(r[0] >> 16),
+                         (unsigned long)(r[1] & 0xffff),
+                         (unsigned long)(r[1] >> 16),
+                         (unsigned long)(r[2] & 0xff),
+                         (unsigned long)((r[2] >> 8) & 0xff),
+                         (unsigned long)((r[2] >> 16) & 0xff),
+                         (unsigned long)(r[3] & 0xff),
+                         (unsigned long)((r[3] >> 8) & 0xff),
+                         (unsigned long)((r[3] >> 16) & 0xff),
+                         (unsigned long)r[4], (unsigned long)r[5],
+                         (unsigned long)g_dbg_touched,
+                         (unsigned long)frank_dbg_bg_calls,
+                         (unsigned long)frank_dbg_obj_calls,
+                         (unsigned long)g_dbg_selftest_nz); }
                 printf(" | r2100 n=%lu last=%02lx seen=%04lx vramnz=%lu palnz=%lu",
                        (unsigned long)slave_ppu_r2100_w,
                        (unsigned long)slave_ppu_r2100_last,

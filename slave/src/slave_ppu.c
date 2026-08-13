@@ -202,7 +202,19 @@ bool slave_ppu_init(void)
    GFX.SubScreen  = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
    GFX.ZBuffer    = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
    GFX.SubZBuffer = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
-   if (GFX.SubScreen) memset(GFX.SubScreen, 0, SNES_WIDTH * SNES_HEIGHT);
+   /* All three, not just the sub-screen.
+    *
+    * psram_malloc does not zero, and the Z buffers are COMPARED before they
+    * are written: tile.c only draws a pixel where Z1 > Depth[x]. Left as
+    * whatever the PSRAM happened to hold, a large stale depth rejects every
+    * pixel of every tile for as long as that line is never cleared - and the
+    * per-line clear in S9xUpdateScreen is itself skipped while ForcedBlanking
+    * is set. The result is a renderer that runs in full, calls DrawBackground
+    * and DrawOBJS, writes every byte of the framebuffer, and writes the
+    * backdrop colour to all of it. */
+   if (GFX.SubScreen)  memset(GFX.SubScreen,  0, SNES_WIDTH * SNES_HEIGHT);
+   if (GFX.ZBuffer)    memset(GFX.ZBuffer,    0, SNES_WIDTH * SNES_HEIGHT);
+   if (GFX.SubZBuffer) memset(GFX.SubZBuffer, 0, SNES_WIDTH * SNES_HEIGHT);
 
    /* These go to PSRAM, not the SRAM bump heap. S9xInitGFX allocates GFX.ZERO
       with a PLAIN malloc of 128 KB, which must come from the newlib heap
@@ -225,8 +237,29 @@ bool slave_ppu_init(void)
    IPPU.ScreenColors = (uint16_t *) psram_malloc(256 * 9 * sizeof(uint16_t));
    if (Memory.VRAM)      memset(Memory.VRAM, 0, VRAM_SIZE);
    if (Memory.FillRAM)   memset(Memory.FillRAM, 0, 0x8000);
-   if (IPPU.ScreenColors) memset(IPPU.ScreenColors, 0, 256 * 9 * sizeof(uint16_t));
    IPPU.DirectColors = IPPU.ScreenColors + 256;
+
+   /* The IDENTITY mapping, not zeros.
+    *
+    * The framebuffer is 8-bit paletted, so tile.c writes ScreenColors[pixel]
+    * straight into it and ScreenColors is index-to-index: S9xResetPPU sets
+    * ScreenColors[c] = c and DirectColors[c] = c & 0xff, and nothing ever
+    * changes them again - the actual colours live in the palette the master
+    * pushes to HDMI. The slave does not call S9xResetPPU (it is a
+    * whole-machine reset that reaches into CPU-era state the slave does not
+    * have, and it took the link down at handshake), so these were left as the
+    * memset's zeros and EVERY drawn pixel came out as index 0.
+    *
+    * That is what a fully working offload looked like: stream byte-exact,
+    * 808 records replayed, VRAM at 3,388 non-zero bytes, 191 palette entries,
+    * ForcedBlanking clear, S9xUpdateScreen running once a frame - and
+    * nzdrawn 0, frame after frame. */
+   if (IPPU.ScreenColors) {
+      for (uint32_t c = 0; c < 256u; c++)
+         IPPU.ScreenColors[c] = (uint16_t) c;
+      for (uint32_t c = 0; c < 256u * 8u; c++)
+         IPPU.DirectColors[c] = (uint16_t)(c & 0xffu);
+   }
    PSTAGE("vram %p fill %p colors %p sub %p zb %p szb %p",
           Memory.VRAM, Memory.FillRAM, IPPU.ScreenColors,
           GFX.SubScreen, GFX.ZBuffer, GFX.SubZBuffer);
@@ -293,6 +326,108 @@ bool slave_ppu_init(void)
    PPU.ScreenHeight     = SNES_HEIGHT;
    PSTAGE("init complete");
    return true;
+}
+
+/* Can this renderer draw AT ALL?
+ *
+ * The earlier test pattern wrote the framebuffer directly, which proved the
+ * link, the framebuffer bulk, the palette bulk and HDMI - and proved nothing
+ * whatever about the renderer, because it never ran it. This builds a minimal
+ * but complete PPU state on the slave itself, entirely through the same
+ * S9xSetPPU the replay uses, and then renders it exactly as a replayed frame
+ * is rendered. No master, no stream, no capture.
+ *
+ *   pixels appear -> the renderer is correctly set up here, and the fault is
+ *     in the state the stream delivers
+ *   nothing appears -> the renderer itself is mis-initialised on this chip,
+ *     and no amount of work on the stream will ever show a picture
+ *
+ * One BG1 tilemap of a single solid 4bpp tile, one palette entry, full
+ * brightness, BG1 on the main screen. If that cannot put colour on the
+ * screen, nothing can. */
+volatile uint32_t slave_ppu_selftest_via_regs = 0;
+
+void slave_ppu_selftest_build(void)
+{
+   if (!Memory.VRAM) return;
+
+   /* VRAM through the REGISTER path, exactly as a replayed stream does it.
+    *
+    * The first version of this wrote Memory.VRAM directly and the renderer
+    * painted the whole screen - which proved the renderer and left the
+    * address path untested. The streamed case replays 788,318 writes to
+    * $2118/$2119 and ends up with VRAM 97% empty, so the suspect is
+    * PPU.VMA: its address, increment and full-graphic mode are set up by
+    * S9xResetPPU, which this chip never calls. If VRAM is still empty after
+    * this, the fault is in the register path and not in the stream. */
+   if (slave_ppu_selftest_via_regs) {
+      S9xSetPPU(0x80, 0x2115);            /* VMAIN: +1 word, inc on $2119  */
+      S9xSetPPU(0x00, 0x2116);            /* VRAM word address 0x1000      */
+      S9xSetPPU(0x10, 0x2117);
+      for (uint32_t r = 0; r < 8u; r++) { /* planes 0/1, 8 rows            */
+         S9xSetPPU(0xff, 0x2118);
+         S9xSetPPU(0xff, 0x2119);
+      }
+      for (uint32_t r = 0; r < 8u; r++) { /* planes 2/3, 8 rows            */
+         S9xSetPPU(0xff, 0x2118);
+         S9xSetPPU(0xff, 0x2119);
+      }
+      S9xSetPPU(0x00, 0x2116);            /* tilemap at word 0             */
+      S9xSetPPU(0x00, 0x2117);
+      for (uint32_t i = 0; i < 32u * 32u; i++) {
+         S9xSetPPU(0x00, 0x2118);
+         S9xSetPPU(0x00, 0x2119);
+      }
+   } else {
+      /* Tile data at VRAM word 0x1000 (byte 0x2000): one solid 8x8 tile whose
+         every pixel is colour 15 - all four bitplanes set. 4bpp is planes 0/1
+         interleaved for 8 rows, then planes 2/3. */
+      for (uint32_t r = 0; r < 8u; r++) {
+         Memory.VRAM[0x2000u + r * 2u + 0u] = 0xff;
+         Memory.VRAM[0x2000u + r * 2u + 1u] = 0xff;
+         Memory.VRAM[0x2000u + 16u + r * 2u + 0u] = 0xff;
+         Memory.VRAM[0x2000u + 16u + r * 2u + 1u] = 0xff;
+      }
+      for (uint32_t i = 0; i < 32u * 32u; i++) {
+         Memory.VRAM[i * 2u + 0u] = 0x00;
+         Memory.VRAM[i * 2u + 1u] = 0x00;
+      }
+   }
+
+   /* Registers, through the replay's own path so nothing is bypassed. */
+   S9xSetPPU(0x80, 0x2100);   /* forced blank while we set up            */
+   S9xSetPPU(0x01, 0x2105);   /* BG mode 1                                */
+   S9xSetPPU(0x00, 0x2107);   /* BG1 tilemap at word 0, 32x32             */
+   S9xSetPPU(0x01, 0x210b);   /* BG1 tile data at word 0x1000             */
+   S9xSetPPU(0x00, 0x210d);   /* BG1 H scroll = 0 (two writes)            */
+   S9xSetPPU(0x00, 0x210d);
+   S9xSetPPU(0x00, 0x210e);   /* BG1 V scroll = 0                         */
+   S9xSetPPU(0x00, 0x210e);
+   S9xSetPPU(0x01, 0x212c);   /* BG1 on the main screen                   */
+   S9xSetPPU(0x00, 0x212d);   /* nothing on the sub screen                */
+   S9xSetPPU(0x00, 0x2130);   /* no colour window                         */
+   S9xSetPPU(0x00, 0x2131);   /* no colour math                           */
+
+   /* Palette entry 15 = white, entry 0 = dark blue so a backdrop-only frame
+      is distinguishable from a drawn one. */
+   S9xSetPPU(0x00, 0x2121);
+   S9xSetPPU(0x00, 0x2122);  S9xSetPPU(0x40, 0x2122);   /* colour 0 */
+   S9xSetPPU(0x1e, 0x2121);                             /* CGRAM addr 15 */
+   S9xSetPPU(0xff, 0x2122);  S9xSetPPU(0x7f, 0x2122);   /* colour 15 = white */
+
+   S9xSetPPU(0x0f, 0x2100);   /* full brightness, blank off               */
+}
+
+/* Render that state the same way a replayed frame is rendered. */
+void slave_ppu_arm_frame(void);
+void slave_ppu_selftest_frame(void)
+{
+   GFX.Screen = slave_ppu_screen;
+   slave_ppu_arm_frame();
+   S9xStartScreenRefresh();
+   for (uint32_t line = 0; line < SNES_HEIGHT; line++)
+      RenderLine((uint8_t) line);
+   S9xEndScreenRefresh();
 }
 
 /* Replay one frame's worth of records. Returns when the end-of-frame record
@@ -548,6 +683,34 @@ uint32_t slave_ppu_dbg_content(void)
    for (uint32_t i = 0; i < 256; i++)
       if (slave_palette[i]) c++;
    return (v & 0xffffu) | (c << 16);
+}
+
+/* The renderer's own state, sampled after a frame.
+ *
+ * Everything upstream now measures correct - stream byte-exact, 808 records,
+ * VRAM and palette populated, ForcedBlanking clear, S9xUpdateScreen running -
+ * and not one pixel is drawn. These are the values the draw loops actually
+ * iterate over, so one of them is zero when it should not be. */
+void slave_ppu_dbg_render(uint32_t *out)
+{
+   out[0] = ((uint32_t)GFX.StartY) | ((uint32_t)GFX.EndY << 16);
+   out[1] = ((uint32_t)IPPU.PreviousLine) | ((uint32_t)IPPU.CurrentLine << 16);
+   out[2] = ((uint32_t)PPU.BGMode) | ((uint32_t)GFX.r212c << 8)
+          | ((uint32_t)GFX.r212d << 16) | ((uint32_t)GFX.r2131 << 24);
+   out[3] = ((uint32_t)IPPU.Clip[0].Count[0])
+          | ((uint32_t)IPPU.Clip[0].Count[5] << 8)
+          | ((uint32_t)IPPU.Clip[1].Count[0] << 16);
+   /* Has ConvertTile produced anything? An empty cache draws nothing however
+      correct everything else is. Sampled, not summed. */
+   { uint32_t n = 0;
+     const uint8_t *c = IPPU.TileCache[TILE_4BIT];
+     if (c) for (uint32_t i = 0; i < MAX_4BIT_TILES * 64u; i += 64u)
+                if (c[i]) n++;
+     out[4] = n; }
+   { uint32_t n = 0;
+     const uint8_t *f = IPPU.TileCached[TILE_4BIT];
+     if (f) for (uint32_t i = 0; i < MAX_4BIT_TILES; i++) if (f[i]) n++;
+     out[5] = n; }
 }
 
 uint32_t slave_ppu_dbg_flags(void)

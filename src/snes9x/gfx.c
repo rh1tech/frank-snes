@@ -829,8 +829,16 @@ GFX_HOT void S9xSetupOBJ(void)
    IPPU.OBJChanged = false;
 }
 
+/* Layer-draw call counts. The slave replays a byte-exact stream, runs the
+   whole renderer, writes every pixel of the framebuffer - and writes zero to
+   all of them, so the backdrop is landing and no layer is. These say which
+   of "never called" and "called and drew nothing" is true. Free on the
+   master, which never renders. */
+volatile uint32_t frank_dbg_obj_calls, frank_dbg_bg_calls, frank_dbg_bg_lines;
+
 GFX_HOT static void DrawOBJS(bool OnMain, uint8_t D)
 {
+   frank_dbg_obj_calls++;
    struct
    {
       uint16_t Pos;
@@ -1803,6 +1811,7 @@ GFX_HOT static void DrawBackgroundMode5(uint32_t bg, uint8_t Z1, uint8_t Z2)
 
 GFX_HOT static void DrawBackground(uint32_t BGMode, uint32_t bg, uint8_t Z1, uint8_t Z2)
 {
+   frank_dbg_bg_calls++;
    uint32_t Tile;
    uint16_t* SC0;
    uint16_t* SC1;

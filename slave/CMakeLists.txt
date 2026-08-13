@@ -163,4 +163,29 @@ if(FRANK_SNES_PPU_SLAVE)
     # shared gfx.c/ppu.c/dma.c, which is the MASTER's role. The slave links the
     # same files to REPLAY, and must not capture what it renders.
     target_compile_definitions(frank-snes-slave PRIVATE FRANK_SNES_PPU_SLAVE=1)
+
+    # The three flags that change what the RENDERER does. They are set on the
+    # master (see the root CMakeLists) and were not set here, so the two halves
+    # were compiling the same gfx.c/tile.c/clip.c into different renderers -
+    # exactly what slave_ppu.c's note about g_settings warns against, but in
+    # the build system where no comment was watching.
+    #
+    # NO_WINDOW_CLIPPING is the one that blanks the picture. Without it the
+    # slave calls ComputeClipWindows() every frame; with it, the master never
+    # calls it at all for a non-SuperFX game. IPPU.Clip drives the draw loops,
+    # so the two builds disagree about which pixels exist.
+    #
+    # NO_ZERO_LUT also frees the slave's 128 KB GFX.ZERO allocation, and
+    # SIMPLE_COLOR_MATH takes the same colour-math path the master takes.
+    #
+    # Found by diffing the two builds' flags.make rather than by reading the
+    # renderer, which is the only way this class of mismatch shows up:
+    # FRANK_SNES_FAST_MODE alone changes the BG cache, the tile-dirty
+    # tracking, the colour-math path, the backdrop fill and whether
+    # FLUSH_REDRAW_EFFECT does anything at all.
+    target_compile_definitions(frank-snes-slave PRIVATE
+        NO_WINDOW_CLIPPING=1
+        SIMPLE_COLOR_MATH=1
+        NO_ZERO_LUT=1
+        FRANK_SNES_FAST_MODE=1)
 endif()
