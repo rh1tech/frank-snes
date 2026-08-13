@@ -230,6 +230,9 @@ static __attribute__((aligned(8))) uint32_t g_render_stack[16u * 1024u / 4u];
    Non-zero means the render is overrunning the frame and the link is paying
    for it again; zero means the handoff is free. */
 static volatile uint32_t g_render_waits, g_render_wait_us;
+/* Set when core 0 found core 1 still busy: replay the next stream without
+   drawing it, so core 1 catches up instead of throttling the master. */
+static volatile uint32_t g_render_skip;
 /* Which PSRAM staging buffer core 0 will fill next, and which one core 1 is
    replaying. Core 0 only has to wait when those are the same. */
 static volatile uint32_t g_ppu_stage_slot, g_render_stage_slot = 0xffffffffu;
@@ -759,7 +762,29 @@ static void handle_frame(void)
              * with only two SRAM landing slots behind a four-deep queue the
              * stream buffers were reused underneath core 1 and 1,015 streams
              * in 30 s failed their checksum. */
-            while (g_render_req) tight_loop_contents();
+            { uint32_t w0 = time_us_32();
+              while (g_render_req) tight_loop_contents();
+              g_render_wait_us = time_us_32() - w0;
+              if (g_render_wait_us > 2000u) {
+                  /* Behind. Replay the next stream but do NOT draw it.
+                   *
+                   * Blocking here alone made the master's frame time follow
+                   * the slave's render, so the rate lurched between 51 fps on
+                   * light scenes and 34 on heavy ones - and heavy scenes are
+                   * exactly when the sprites are busiest. That lurch is what
+                   * "shaking" is.
+                   *
+                   * The stream must always be replayed or VRAM diverges
+                   * permanently; the DRAW is what can be dropped, which is
+                   * precisely what the master's own frame skipper does. A
+                   * replay without drawing costs no tile conversion and no
+                   * pixel loops, so core 1 catches up within a frame. */
+                  g_render_waits++;
+                  g_render_skip = 1;
+              } else {
+                  g_render_skip = 0;
+              }
+            }
             __dmb();
 
             g_render_buf        = g_ppu_stream;
@@ -832,8 +857,10 @@ static void slave_render_core(void)
         extern void slave_ppu_replay(const uint8_t *rec, uint32_t len);
         extern uint8_t *slave_ppu_screen;
         extern void slave_ppu_arm_frame(void);
+        extern void slave_ppu_set_render(bool);
 
         slave_ppu_screen = g_ppu_fb[g_ppu_slot];
+        const bool skip_draw = (g_render_skip != 0u);
 
         /* Synthetic picture: prove the DELIVERY path on its own.
          *
@@ -880,8 +907,8 @@ static void slave_render_core(void)
                picture but completely different bugs, and counting non-zero
                pixels cannot tell them apart. Anything the renderer touches
                stops being 0xAA. */
-            memset(slave_ppu_screen, 0xAA, 256u * 224u);
             slave_ppu_arm_frame();
+            if (skip_draw) slave_ppu_set_render(false);   /* replay only */
             slave_ppu_replay(g_render_buf, g_render_len);
             { uint32_t touched = 0;
               const uint8_t *fb = slave_ppu_screen;
@@ -913,8 +940,12 @@ static void slave_render_core(void)
         /* The flip is the publish: everything above must be visible to core 0
            before the slot moves, and the slot before the request clears. */
         __dmb();
-        g_ppu_slot ^= 1u;
-        g_ppu_fb_valid = true;
+        if (!skip_draw) {
+            /* Only a frame that was actually DRAWN may be published, or the
+               master would be shipped a buffer holding the frame before last. */
+            g_ppu_slot ^= 1u;
+            g_ppu_fb_valid = true;
+        }
         g_render_dones++;
         __dmb();
         g_render_req = false;

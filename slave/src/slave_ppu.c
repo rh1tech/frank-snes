@@ -809,6 +809,13 @@ uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max)
  * survive. */
 volatile uint32_t slave_ppu_force_reconvert = 0;
 
+/* Replay a stream without drawing it: VRAM still updates, the renderer does
+   not run. Used to catch up instead of throttling the master. */
+void slave_ppu_set_render(bool on)
+{
+   IPPU.RenderThisFrame = on;
+}
+
 void slave_ppu_arm_frame(void)
 {
    if (slave_ppu_force_reconvert == 1u) {

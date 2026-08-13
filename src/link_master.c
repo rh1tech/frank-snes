@@ -619,7 +619,23 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
              measured 100% of frames divergent, with the resync replaying
              417,000 extra VRAM records over 20 s and never converging.
              sum_bad is a real fault; vram_diff is not, while a sweep runs. */
-          if (now_bad > prev_bad) ppucap_request_resync();
+          /* NOT armed on sum_bad. The resync was the corruption.
+           *
+           * It reconstructs VRAM from a snapshot taken when each chunk was
+           * generated and delivers it a frame later, at the HEAD of the next
+           * frame's stream. Over a region the game is actively rewriting -
+           * which is exactly the sprite tiles during animation - that stamps
+           * a stale copy over live data, and it stays stale until the game
+           * happens to rewrite those bytes again. Fighters' heads rendered as
+           * garbled blocks for as long as a sweep kept being re-armed, and
+           * link failures re-armed it constantly.
+           *
+           * A resync is only correct when the slave genuinely has NO state to
+           * lose: at link-up and after a recovery, which link_master_init and
+           * link_master_reprobe still do. Using it as a repair for a single
+           * corrupt stream trades one damaged frame for a sweep that damages
+           * every frame it touches. */
+          (void)now_bad; (void)prev_bad;
           (void)now_vdiff;
           prev_bad = now_bad; prev_vdiff = now_vdiff; }
 
