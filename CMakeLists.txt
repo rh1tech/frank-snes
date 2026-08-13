@@ -567,7 +567,8 @@ endif()
 
 if(C2_SOUND_LINK)
     target_compile_definitions(frank-snes PRIVATE C2_SOUND_LINK=1)
-    target_link_libraries(frank-snes link)
+    target_link_libraries(frank-snes link
+    hardware_xip_cache)
     message(STATUS "C2: sound offloaded to the slave (build slave/ too)")
 elseif(BOARD_VARIANT STREQUAL "C2")
     message(STATUS "C2: C2_LOCAL_SOUND — sound stays on the master")

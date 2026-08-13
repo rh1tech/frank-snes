@@ -230,6 +230,7 @@ static inline uint32_t audio_frame_samples(void)
 
 // Screen buffers - 256x224 8-bit palette-indexed (HDMI driver maps index to color)
 uint8_t __attribute__((aligned(4))) SCREEN[2][SNES_WIDTH * SNES_HEIGHT];
+
 #ifdef FRANK_SNES_CPU_CORE_S9X16
 /* The 1.6x core allocates its own depth buffers in S9xGraphicsInit. */
 #else
@@ -698,9 +699,33 @@ typedef struct {
     uint32_t ph_sound, ph_ppu_tx, ph_ack, ph_fb, ph_ev, ph_aram;
     uint32_t slave_want;
     uint32_t ppu_fb_got;   /* framebuffer bytes the master actually received */
+    uint32_t slave_pitch_h, slave_flags;
     uint32_t fb_hash;      /* FNV of the received picture: 0 or constant = blank */
     uint32_t fb_nonzero;   /* how many pixels are not colour 0 */
     uint32_t pal0, pal1;   /* two palette entries, to see if colours arrived */
+    /* The truncation check. ship_cap_sum is over the bytes this chip handed
+       to the link; slave_stream_* is what the other chip actually replayed
+       from. See link_ppu_stat_t for how the pair is read. */
+    uint32_t ship_cap_sum;
+    uint32_t slave_stream_len, slave_stream_sum;
+    uint32_t slave_stop_off, slave_stop_ctx, slave_stop_why;
+    /* The slave's own verdict on the delivery, made inside one exchange
+       against the checksum this chip put in the control frame. sum_bad > 0
+       means the wire changed the bytes. */
+    uint32_t ppu_sum_ok, ppu_sum_bad, ppu_exp_sum;
+    /* The master's telemetry says one stream size and the slave receives
+       another, on a link that now checksums clean. These say whether that is
+       a selection effect (the sample lands on a big frame, the slave sees the
+       small ones) or the send path dropping frames: min/max of the captured
+       length over the sample window, what the last exchange actually put on
+       the wire, and how many takes there were per send. */
+    uint32_t cap_min, cap_max, ppu_sent_len, ppu_takes, ppu_sends;
+    uint32_t cap_vram_w, cap_cgram_w, cap_oam_w;
+    /* The master's own $2100/$2105/$212c/$212d, packed exactly as the slave
+       packs its mirror. The slave renders an all-black frame and reports
+       forced blank; this says whether that is a faithful replay of the
+       master's PPU or a slave that has lost the register. */
+    uint32_t master_regs;
 } frank_telemetry_t;
 /* 0 upd 1 rs 2 obj 3 bg0 4 bg1 5 bg2 6 bg3 7 mode7 8 zclear 9 sub 10 main
    11 colormath 12 backdrop 13 scale 14 tileconv */
@@ -1426,6 +1451,21 @@ static inline int16_t soft_limit16(int32_t v) {
     return clamp16(v);
 }
 
+/* Set by core 0 once it has given up the HDMI scanline interrupt; core 1 then
+   takes it. See graphics_hdmi_irq_take_this_core() for why the display cannot
+   stay on core 0 once the PPU offload is blocking it. */
+/* Diagnostic: skip pushing the slave's palette into the HDMI driver.
+   graphics_set_palette_hdmi() encodes straight into the LIVE conv_color TMDS
+   table, and its own comment claims that is safe "because
+   S9xFixColourBrightness is called between frames" - which was true when the
+   renderer drove it and is not true now. Set to 1 to take the palette out of
+   the picture entirely while testing whether the display holds lock. */
+volatile uint32_t g_pal_push_disable = 0;
+volatile bool g_hdmi_irq_core1_ready;   /* core 1 is at its service loop */
+volatile bool g_hdmi_irq_released;      /* core 0 has given the IRQ up */
+extern void graphics_hdmi_irq_take_this_core(void);
+extern void graphics_hdmi_irq_release_this_core(void);
+
 void __time_critical_func(render_core)(void) {
     // Pre-generate test tone - 440Hz square wave
     for (int i = 0; i < 256; i++) {
@@ -1438,6 +1478,7 @@ void __time_critical_func(render_core)(void) {
 #if APU_ON_CORE1
     apu_core1_init();
 #endif
+
 
 #ifdef FRANK_SNES_HDMI_ALT
     // HDMI_ALT path: Core 1 is the libdvi worker.  Audio rides HDMI
@@ -1461,6 +1502,26 @@ void __time_critical_func(render_core)(void) {
     // HDMI is already initialized on Core 0
     // Signal ready with memory barrier
     __dmb();
+    /* Take the HDMI scanline interrupt over from core 0.
+     *
+     * graphics_init() runs on core 0 before this core exists (main.c: "on Core
+     * 0 ... critical for the ROM selector"), so despite its name
+     * irq_set_exclusive_handler_DMA_core1() leaves the interrupt enabled on
+     * CORE 0. That is fatal once the C2 PPU offload is on: core 0 then also
+     * absorbs a 57 KB framebuffer DMA every frame and blocks in the link, so
+     * the scanline interrupt misses its deadline and the sink drops lock - the
+     * display reads NO SIGNAL while the emulator runs at 51 fps and the slave
+     * renders happily. Measured: with the slave rendering, HDMI never locked;
+     * with the slave idle, it was rock solid.
+     *
+     * Ordering: core 0 waits for this flag, disables on itself, then releases;
+     * this core enables only afterwards. Enabled on both at once would let two
+     * handlers race the same DMA pointer state. */
+    g_hdmi_irq_core1_ready = true;
+    __dmb();
+    while (!g_hdmi_irq_released) tight_loop_contents();
+    graphics_hdmi_irq_take_this_core();
+
     core1_ready = true;
     __dmb();
 
@@ -1980,10 +2041,15 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         {
             uint32_t cap_len = 0;
             const uint8_t *cap = ppucap_take(&cap_len);
-            /* Stage into PSRAM, not straight into SCREEN[]: the link's RX DMA
-               would otherwise write the very buffer the HDMI scanout is
-               reading, live, every frame. The copy below is ~57 KB of CPU
-               work against a frame with ~10 ms of slack. */
+            /* Straight into SCREEN[current_buffer], which is the buffer the
+               display is NOT scanning out (see the double-buffer note above:
+               the renderer writes one while HDMI shows the other), so the
+               link's RX DMA never touches the live picture.
+               Two alternatives were tried and are worse. PSRAM: the RX DMA
+               cannot sustain 57 KB into the XIP window and the bulk times out
+               - the link went offline with "ppu framebuffer bulk failed" 12
+               times in 16 seconds. A separate SRAM buffer: 57 KB does not
+               fit, the link script overflows RAM by 9 KB. */
             link_master_ppu_stage(cap, cap_len, SCREEN[current_buffer],
                                   SNES_WIDTH * SNES_HEIGHT);
         }
@@ -1994,9 +2060,41 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         /* Push the slave's palette into the HDMI driver. Without this the
            master has no palette at all: it stopped rendering, and rendering
            is what used to call graphics_set_palette. */
-        if (g_ppu_pal_valid) {
-            for (int pi = 0; pi < 256; pi++)
+        if (g_ppu_pal_valid && !g_pal_push_disable) {
+            /* 0..BASE_HDMI_CTRL_INX-1 only. 251-254 are the HDMI driver's
+               RESERVED control indices: it refuses to write them to the
+               hardware palette and maintains a substitution map so that no
+               pixel is ever emitted as a TMDS control symbol. Pushing the
+               slave's palette over all 256 entries overwrote those reserved
+               entries and recomputed the substitute map every frame, and a
+               corrupted control symbol does not show a wrong colour - it
+               breaks sync, which is why the display reported NO SIGNAL while
+               the emulator ran at 51 fps and delivered full framebuffers.
+               Measured: identical build with the offload disabled shows the
+               picture, so the fault was on this path and not in the board,
+               the cable or the power. */
+            /* Only entries that actually CHANGED.
+             *
+             * graphics_set_palette_hdmi encodes straight into the live
+             * conv_color TMDS table, and its own comment says that is safe
+             * "because S9xFixColourBrightness is called between frames". That
+             * was true when the RENDERER drove the palette; the offload calls
+             * it from a different point in the main loop, so 251 unconditional
+             * writes/frame land in the table while the scanline DMA is reading
+             * it. The display was seen losing and regaining lock several times
+             * a second with the picture otherwise healthy.
+             *
+             * A SNES palette changes a handful of entries per frame, so this
+             * turns ~251 writes/frame into approximately none. */
+            static uint32_t last_pal[251];
+            static bool last_pal_valid;
+            for (int pi = 0; pi < 251; pi++) {
+                if (last_pal_valid && last_pal[pi] == g_ppu_palette[pi])
+                    continue;
+                last_pal[pi] = g_ppu_palette[pi];
                 graphics_set_palette((uint8_t)pi, g_ppu_palette[pi]);
+            }
+            last_pal_valid = true;
             { extern void graphics_request_palette_update(void);
               graphics_request_palette_update(); }
             g_ppu_pal_valid = false;
@@ -2009,6 +2107,7 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         // so the S9xMixSamples* calls below have something to hand out.
         // Must come after the emulated frame and before the first mix.
         s9x_link_frame();
+
 #endif
 
         // Mix audio on Core 0 (always, even when skipping render), then apply
@@ -2482,9 +2581,36 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                   { extern volatile uint32_t frank_norender;
                     frank_telemetry.ship_norender = frank_norender; }
 #ifdef FRANK_SNES_PPU_CAPTURE
-                  { extern volatile uint32_t frank_cap_bytes, frank_cap_on;
+                  { extern volatile uint32_t frank_cap_bytes, frank_cap_on,
+                                             frank_cap_sum, frank_cap_min,
+                                             frank_cap_max, frank_cap_takes;
+                    extern volatile uint32_t g_ppu_sent_len, g_ppu_sends;
                     frank_telemetry.ship_cap_bytes = frank_cap_bytes;
-                    frank_telemetry.ship_cap_on    = frank_cap_on; }
+                    frank_telemetry.ship_cap_on    = frank_cap_on;
+                    frank_telemetry.ship_cap_sum   = frank_cap_sum;
+                    frank_telemetry.cap_min      = frank_cap_min;
+                    frank_telemetry.cap_max      = frank_cap_max;
+                    frank_telemetry.ppu_takes    = frank_cap_takes;
+                    frank_telemetry.ppu_sends    = g_ppu_sends;
+                    frank_telemetry.ppu_sent_len = g_ppu_sent_len;
+                    /* Per sample window, not cumulative: a lifetime min/max
+                       stops moving and stops being evidence. */
+                    frank_cap_min   = 0xffffffffu;
+                    frank_cap_max   = 0;
+                    frank_cap_takes = 0;
+                    g_ppu_sends     = 0;
+                    { extern volatile uint32_t frank_cap_vram_w,
+                                               frank_cap_cgram_w,
+                                               frank_cap_oam_w;
+                      frank_telemetry.cap_vram_w  = frank_cap_vram_w;
+                      frank_telemetry.cap_cgram_w = frank_cap_cgram_w;
+                      frank_telemetry.cap_oam_w   = frank_cap_oam_w; }
+                    if (Memory.FillRAM)
+                      frank_telemetry.master_regs =
+                            (uint32_t)Memory.FillRAM[0x2100]
+                          | ((uint32_t)Memory.FillRAM[0x2105] << 8)
+                          | ((uint32_t)Memory.FillRAM[0x212c] << 16)
+                          | ((uint32_t)Memory.FillRAM[0x212d] << 24); }
                   { uint32_t ex = 0, fa = 0, lu = 0;
                     link_master_get_stats(&ex, &fa, &lu);
                     frank_telemetry.ship_link_us   = lu;
@@ -2498,6 +2624,16 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.slave_psram_ok   = g_ppu_stat.psram_ok;
                       frank_telemetry.slave_impossible = g_ppu_stat.impossible;
                       frank_telemetry.slave_want = g_ppu_stat.want;
+                      frank_telemetry.slave_pitch_h = g_ppu_stat.dbg_pitch_h;
+                      frank_telemetry.slave_flags = g_ppu_stat.dbg_flags;
+                      frank_telemetry.slave_stream_len = g_ppu_stat.stream_len;
+                      frank_telemetry.slave_stream_sum = g_ppu_stat.stream_sum;
+                      frank_telemetry.slave_stop_off   = g_ppu_stat.stop_off;
+                      frank_telemetry.slave_stop_ctx   = g_ppu_stat.stop_ctx;
+                      frank_telemetry.slave_stop_why   = g_ppu_stat.stop_why;
+                      frank_telemetry.ppu_sum_ok  = g_ppu_stat.sum_ok;
+                      frank_telemetry.ppu_sum_bad = g_ppu_stat.sum_bad;
+                      frank_telemetry.ppu_exp_sum = g_ppu_stat.exp_sum;
                       frank_telemetry.ppu_fb_got = link_master_ppu_got();
                       { /* Is the picture actually a picture? A correct-sized
                            buffer of zeros looks identical to success in every
@@ -2890,6 +3026,15 @@ int main(void) {
     // Launch Core 1 (Audio + APU)
     LOG("Starting render core (Audio)...\n");
     multicore_launch_core1(render_core);
+
+#ifndef FRANK_SNES_HDMI_ALT
+    /* Hand the scanline interrupt to core 1 - see the note there. */
+    while (!g_hdmi_irq_core1_ready) tight_loop_contents();
+    graphics_hdmi_irq_release_this_core();
+    __dmb();
+    g_hdmi_irq_released = true;
+#endif
+
 
     // Wait for Core 1 to initialize HDMI and audio
     LOG("[Core0] Waiting for Core 1 to initialize...\n");

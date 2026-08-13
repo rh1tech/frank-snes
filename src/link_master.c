@@ -303,6 +303,11 @@ void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
 
 uint32_t link_master_ppu_got(void) { return g_ppu_fb_got; }
 
+/* What the last exchange actually put on the wire, and how many exchanges
+   have carried a stream. Paired with frank_cap_takes this says whether the
+   capture and the send run at the same rate. */
+volatile uint32_t g_ppu_sent_len, g_ppu_sends;
+
 /* The slave's per-frame diagnostics, published so a probe on the MASTER can
    see inside the slave - there is no console or probe on that chip. */
 volatile link_ppu_stat_t g_ppu_stat;
@@ -317,6 +322,7 @@ volatile uint32_t g_ph_sound, g_ph_ev, g_ph_aram, g_ph_ppu_tx, g_ph_ack, g_ph_fb
    the HDMI driver; it no longer computes one itself. */
 uint32_t g_ppu_palette[256];
 volatile bool g_ppu_pal_valid;
+
 #endif
 
 bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
@@ -342,16 +348,35 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
         uint32_t rt = n_runs * sizeof(link_aram_run_t);
         memset(pl, 0, sizeof(pl));
         memcpy(pl, runs, rt);
+        /* The PPU length only exists in an offload build; without it the
+           payload is just the run table. Guarding the USES as well as the
+           declarations is what lets the non-offload configuration build at
+           all - it had stopped, which meant the one experiment that isolates
+           the renderer from everything else could not be run. */
+#ifdef FRANK_SNES_PPU_CAPTURE
         memcpy(pl + LINK_PPU_LEN_OFFSET, &g_ppu_len, sizeof(uint32_t));
+        { extern volatile uint32_t frank_cap_sum;
+          uint32_t s = frank_cap_sum;
+          memcpy(pl + LINK_PPU_SUM_OFFSET, &s, sizeof(uint32_t)); }
+        if (g_ppu_stream && g_ppu_len)
+            memcpy(pl + LINK_PPU_HEAD_OFFSET, g_ppu_stream,
+                   g_ppu_len < LINK_PPU_HEAD_BYTES ? g_ppu_len
+                                                   : LINK_PPU_HEAD_BYTES);
+        const uint32_t pl_bytes = LINK_PPU_HEAD_OFFSET + LINK_PPU_HEAD_BYTES;
+#else
+        const uint32_t pl_bytes = rt;
+#endif
         if (!link_m_send_ctrl(&g_sess, LINK_OP_FRAME, n_events,
                               LINK_FRAME_ARG1(n_runs, chunks),
-                              pl, LINK_PPU_LEN_OFFSET + sizeof(uint32_t))) {
+                              pl, pl_bytes)) {
             go_offline("frame header failed");
             return false;
         }
     }
 
+#ifdef FRANK_SNES_PPU_CAPTURE
     g_ph_sound = time_us_32() - t0;
+#endif
     if (n_events) {
         if (!link_m_bulk_send(&g_sess, events,
                               n_events * sizeof(link_event_t))) {
@@ -360,7 +385,9 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
         }
     }
 
+#ifdef FRANK_SNES_PPU_CAPTURE
     g_ph_ev = time_us_32() - t0;
+#endif
     if (n_runs) {
         for (uint32_t i = 0; i < n_runs; i++) {
             const uint8_t *src = aram +
@@ -377,7 +404,9 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
 #ifdef FRANK_SNES_PPU_CAPTURE
     /* The PPU command stream rides here: after the sound payloads, before
        the reply, so it costs no extra doorbell phase. */
+#ifdef FRANK_SNES_PPU_CAPTURE
     g_ph_aram = time_us_32() - t0;
+#endif
 
     /* No control frame of its own: the length was in the FRAME payload. */
     g_ppu_fb_got = 0;
@@ -386,6 +415,8 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
        for the padding bytes that were never sent - it times out and the
        sender stalls. Measured: 10.2 ms of a 10.4 ms exchange, for three
        missing bytes. */
+    g_ppu_sent_len = g_ppu_len;
+    if (g_ppu_len) g_ppu_sends++;
     if (g_ppu_len && !link_m_bulk_send(&g_sess, g_ppu_stream,
                                        LINK_ALIGN4(g_ppu_len))) {
         go_offline("ppu stream bulk failed");
@@ -393,7 +424,9 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
     }
 #endif
 
+#ifdef FRANK_SNES_PPU_CAPTURE
     g_ph_ppu_tx = time_us_32() - t0;
+#endif
 
     /* --- the reply --- */
     if (!link_m_recv_ctrl(&g_sess)) {
@@ -416,7 +449,9 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
      * and receiving fewer would leave the surplus in flight and
      * desynchronise every exchange after it. Dropping the link is
      * recoverable; a desynchronised wire is not. */
+#ifdef FRANK_SNES_PPU_CAPTURE
     g_ph_ack = time_us_32() - t0;
+#endif
     uint32_t got = reply->samples;
     if (got > n_samples) {
         go_offline("slave returned more samples than requested");

@@ -499,6 +499,34 @@ static inline void irq_set_exclusive_handler_DMA_core1() {
     irq_set_enabled(VIDEO_DMA_IRQ, true);
 }
 
+
+/* Move the scanline DMA interrupt between cores.
+ *
+ * irq_set_enabled() acts on the CALLING core's NVIC, while the handler itself
+ * lives in the shared vector table - so "which core services HDMI" is decided
+ * by which core last enabled it, not by any name.
+ *
+ * This matters because graphics_init() runs on core 0 before core 1 is
+ * launched (main.c: "Initialize HDMI on Core 0 ... critical for the ROM
+ * selector"), so despite being called irq_set_exclusive_handler_DMA_core1(),
+ * the interrupt ends up on CORE 0. That was survivable until the C2 PPU
+ * offload, which parks core 0 for ~10 ms of every 20 ms frame waiting on the
+ * slave. Miss enough scanline interrupts and the TMDS output underruns; the
+ * sink drops lock and reports NO SIGNAL several times a second while the
+ * emulator itself runs perfectly.
+ *
+ * Handing it to core 1 decouples the display from whatever core 0 is blocked
+ * on. Release before take, never the reverse: enabling on both cores at once
+ * would let two handlers race on the same DMA pointer state. */
+void graphics_hdmi_irq_release_this_core(void) {
+    irq_set_enabled(VIDEO_DMA_IRQ, false);
+}
+
+void graphics_hdmi_irq_take_this_core(void) {
+    irq_set_priority(VIDEO_DMA_IRQ, 0);   /* per-core; set it here too */
+    irq_set_enabled(VIDEO_DMA_IRQ, true);
+}
+
 void graphics_set_palette_hdmi(const uint8_t i, const uint32_t color888);
 
 //деинициализация - инициализация ресурсов
@@ -633,6 +661,13 @@ static inline bool hdmi_init() {
     dma_channel_config cfg_dma = dma_channel_get_default_config(dma_chan);
     channel_config_set_transfer_data_size(&cfg_dma, DMA_SIZE_8);
     channel_config_set_chain_to(&cfg_dma, dma_chan_ctrl); // chain to other channel
+    /* Beat every other master to the bus. This channel feeds the TMDS
+       serialiser and has a hard per-scanline deadline; the C2 link's bulk
+       DMA moves 57 KB of framebuffer plus the PPU stream every frame at
+       default priority, and losing arbitration to it underruns the
+       serialiser. An underrun is not a glitchy pixel - it breaks the signal,
+       and the sink reports NO SIGNAL while the emulator runs normally. */
+    channel_config_set_high_priority(&cfg_dma, true);
 
     channel_config_set_read_increment(&cfg_dma, true);
     channel_config_set_write_increment(&cfg_dma, false);
@@ -656,6 +691,13 @@ static inline bool hdmi_init() {
     cfg_dma = dma_channel_get_default_config(dma_chan_ctrl);
     channel_config_set_transfer_data_size(&cfg_dma, DMA_SIZE_32);
     channel_config_set_chain_to(&cfg_dma, dma_chan); // chain to other channel
+    /* Beat every other master to the bus. This channel feeds the TMDS
+       serialiser and has a hard per-scanline deadline; the C2 link's bulk
+       DMA moves 57 KB of framebuffer plus the PPU stream every frame at
+       default priority, and losing arbitration to it underruns the
+       serialiser. An underrun is not a glitchy pixel - it breaks the signal,
+       and the sink reports NO SIGNAL while the emulator runs normally. */
+    channel_config_set_high_priority(&cfg_dma, true);
 
     channel_config_set_read_increment(&cfg_dma, false);
     channel_config_set_write_increment(&cfg_dma, false);

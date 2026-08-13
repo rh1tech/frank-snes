@@ -148,8 +148,22 @@ static void S9xAPUSetByte(uint8_t byte, uint32_t Address)
 static uint16_t pc_trace[PC_TRACE_SIZE];
 static uint32_t pc_trace_idx = 0;
 
+/* Rate-limited. This fires on every SLEEP/STOP opcode, and a sound driver
+   parked in SLEEP hits it thousands of times a second: measured on the C2's
+   UART, 174 KB in 15 s - enough to saturate 115200 on its own. Every printf
+   here blocks the emulation loop, so the cost is not just noise, it is frame
+   rate. The first few dumps carry all the diagnostic value; after that it is
+   the same trace repeating. */
+#define SPC_DUMP_LIMIT 4
+
 static void spc_dump_trace(const char *reason, uint16_t crash_pc)
 {
+   static uint32_t dumps;
+   if (dumps >= SPC_DUMP_LIMIT) return;
+   if (++dumps == SPC_DUMP_LIMIT) {
+      extern int printf(const char*, ...);
+      printf("[SPC] (further %s dumps suppressed)\n", reason);
+   }
    extern int printf(const char*, ...);
    printf("\n[SPC] === %s at PC=%04X ===\n", reason, crash_pc);
    printf("[SPC] A=%02X X=%02X Y=%02X SP=%02X PSW=%02X\n",

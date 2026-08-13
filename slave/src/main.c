@@ -20,11 +20,14 @@
 
 #include "pico/stdlib.h"
 #include "pico/runtime_init.h"
+#include "pico/multicore.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/vreg.h"
 #include "hardware/structs/qmi.h"
 #include "hardware/structs/sysinfo.h"
+#include "hardware/watchdog.h"
+#include "pico/bootrom.h"
 
 #include "link_bus.h"
 #include "link_pins.h"
@@ -156,12 +159,70 @@ static uint32_t g_frames, g_bad_frames;
    caches (448 KB of 8 MB). */
 #define SLAVE_PPU_STREAM_BYTES (256u * 1024u)
 static uint8_t *g_ppu_stream;
+
+/* The SRAM landing zone is back, and this time there are numbers for it.
+ *
+ * The link's RX DMA cannot land a bulk of any size into the XIP window at the
+ * wire rate. Measured with the stream going to PSRAM: 4 receives succeeded and
+ * 1,083 failed, the four successes being the only 450-byte frames; every
+ * 1,332-byte frame failed. The master meanwhile reported 48 sends a second and
+ * spent 10,090 us of each frame in the stream phase against a ~26 us transfer.
+ * The same failure is already recorded from the other direction in src/main.c:
+ * the framebuffer bulk into PSRAM took the link offline 12 times in 16 seconds.
+ * So the slave received essentially no PPU stream at all, which is why it held
+ * no VRAM, no CGRAM and no palette and drew an empty frame - while the master
+ * had captured 782,322 VRAM writes.
+ *
+ * It was removed once before as "redundant". It was not: it was masking the
+ * cache bug in slave_ppu_replay, which is now fixed independently, and the
+ * replay hang that got it reverted has to be re-tested against a picture
+ * rather than against another blank screen.
+ *
+ * 64 KB covers every frame observed in play (450 B - 2.2 KB) and the 41,760 B
+ * attract uploads. A frame bigger than this still falls back to PSRAM and will
+ * still mostly fail; g_ppu_oversize_sram counts those so it cannot be mistaken
+ * for success. */
+#define SLAVE_PPU_SRAM_BYTES (64u * 1024u)
+static uint8_t g_ppu_stream_sram[SLAVE_PPU_SRAM_BYTES] __attribute__((aligned(4)));
+static uint32_t g_ppu_oversize_sram;
 static uint8_t  g_ppu_fb[2][LINK_PPU_MAX_BYTES];
 static uint32_t g_ppu_fb_bytes;
 static uint32_t g_ppu_slot;
 static bool     g_ppu_fb_valid;
 volatile uint32_t g_ppu_oversize;
+/* Core 0 -> core 1 render handoff. */
+static volatile bool     g_render_req;
+static volatile uint32_t g_render_len;
+/* The buffer core 1 must replay, snapshotted at handoff.
+   Core 1 must NOT read g_ppu_stream: core 0 rewrites that to the PSRAM buffer
+   at the top of every frame, so core 1 raced it and ended up replaying - and
+   cache-invalidating - the wrong buffer. */
+static uint8_t * volatile g_render_buf;
+/* Liveness for the core 0 -> core 1 handoff: how many renders were asked for
+   and how many core 1 finished. Equal and climbing = healthy; kicks climbing
+   with dones stuck = core 1 never ran or died on its first frame. */
+static volatile uint32_t g_render_kicks, g_render_dones;
+/* Diagnostic: receive the stream but skip the replay, to tell a bad RECEIVE
+   from a bad REPLAY. Flipped over the wire is not possible here, so it is a
+   build-time default that can be patched live via the debugger on the master
+   side of the link only - set to 1 to isolate. */
+volatile uint32_t g_render_disable = 0;
+/* What the master said it sent, and what actually landed, for the SAME frame.
+   Printed side by side when the checksums disagree. */
+volatile uint8_t  g_ppu_exp_head[LINK_PPU_HEAD_BYTES];
+volatile uint8_t  g_ppu_got_head[LINK_PPU_HEAD_BYTES];
+volatile uint32_t g_ppu_head_valid;
+volatile uint8_t  g_dbg_head[8];
+volatile uint32_t g_dbg_len, g_dbg_sram;
+volatile uint32_t g_dbg_nz_drawn, g_dbg_nz_sent;
+/* Did core 1 reach its loop, see a request, and start a render? Separates
+   "core 1 never ran" from "core 1 ran and died inside the replay". */
+static volatile uint32_t g_render_alive, g_render_spins, g_render_starts;
 static uint32_t g_ppu_last_want;   /* frames too big for the buffer */
+/* Did the stream bulk actually land? The master reports 48 sends a second of
+   2,205 bytes each while the slave's replay counters sit frozen on a 540-byte
+   frame, so the receive is the only step left between them. */
+static uint32_t g_ppu_recv_ok, g_ppu_recv_fail, g_ppu_want_zero;
 #endif
 
 /* Boot progress marker.
@@ -285,9 +346,17 @@ static void handle_frame(void)
     /* Same rule as the run table: the PPU stream length rides in this
        payload and MUST be copied out before the first bulk arms, or
        g_ctrl_rx is overwritten underneath it. */
-    uint32_t ppu_want = 0;
+    uint32_t ppu_want = 0, ppu_exp_sum = 0;
     memcpy(&ppu_want, g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_LEN_OFFSET,
            sizeof(ppu_want));
+    /* The master's checksum of the very stream this frame is about to carry,
+       and its first bytes. Same rule, same reason: out of the payload before
+       any bulk arms. */
+    memcpy(&ppu_exp_sum, g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_SUM_OFFSET,
+           sizeof(ppu_exp_sum));
+    memcpy((void *)g_ppu_exp_head,
+           g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_HEAD_OFFSET,
+           LINK_PPU_HEAD_BYTES);
 #endif
 
     if (n_events) {
@@ -382,9 +451,31 @@ static void handle_frame(void)
             if (link_s_bulk_recv(&g_sess, g_ppu_stream,
                                  LINK_ALIGN4(SLAVE_PPU_STREAM_BYTES)))
                 ppu_len = 0;          /* drained what we could; frame is lost */
-        } else if (want) {
-            if (link_s_bulk_recv(&g_sess, g_ppu_stream, LINK_ALIGN4(want)))
+        } else if (!want) {
+            g_ppu_want_zero++;
+        } else {
+            /* SRAM when it fits, PSRAM only when it cannot - see the note on
+               g_ppu_stream_sram for the measurement that decides this. */
+            uint8_t *dst;
+            if (want <= SLAVE_PPU_SRAM_BYTES) {
+                dst = g_ppu_stream_sram;
+            } else {
+                dst = g_ppu_stream;
+                g_ppu_oversize_sram++;
+            }
+            if (!link_s_bulk_recv(&g_sess, dst, LINK_ALIGN4(want))) {
+                g_ppu_recv_fail++;
+            } else {
+                g_ppu_recv_ok++;
                 ppu_len = want;
+                g_ppu_stream = dst;    /* the renderer replays from here */
+                /* Checked inside slave_ppu_replay, which is where the cache
+                   invalidate happens - summing before it would compare the
+                   master against stale lines and blame the wire for the
+                   cache. */
+                extern volatile uint32_t slave_ppu_exp_sum;
+                slave_ppu_exp_sum = ppu_exp_sum;
+            }
         }
     }
 #endif
@@ -409,6 +500,22 @@ static void handle_frame(void)
                                                   (slave_ppu_alloc_fail << 8);
             g_pending_reply.ppu_stat.impossible = slave_ppu_impossible;
             g_pending_reply.ppu_stat.want       = g_ppu_last_want;
+            { extern uint32_t slave_ppu_dbg_pitch_h(void), slave_ppu_dbg_flags(void);
+              g_pending_reply.ppu_stat.dbg_pitch_h = slave_ppu_dbg_pitch_h();
+              g_pending_reply.ppu_stat.dbg_flags   = slave_ppu_dbg_flags(); }
+            { extern volatile uint32_t slave_ppu_stream_len, slave_ppu_stream_sum,
+                                       slave_ppu_exp_sum, slave_ppu_sum_ok,
+                                       slave_ppu_sum_bad,
+                                       slave_ppu_stop_off, slave_ppu_stop_ctx,
+                                       slave_ppu_stop_why;
+              g_pending_reply.ppu_stat.stream_len = slave_ppu_stream_len;
+              g_pending_reply.ppu_stat.stream_sum = slave_ppu_stream_sum;
+              g_pending_reply.ppu_stat.exp_sum    = slave_ppu_exp_sum;
+              g_pending_reply.ppu_stat.sum_ok     = slave_ppu_sum_ok;
+              g_pending_reply.ppu_stat.sum_bad    = slave_ppu_sum_bad;
+              g_pending_reply.ppu_stat.stop_off   = slave_ppu_stop_off;
+              g_pending_reply.ppu_stat.stop_ctx   = slave_ppu_stop_ctx;
+              g_pending_reply.ppu_stat.stop_why   = slave_ppu_stop_why; }
         }
 #endif
         link_s_send_ctrl(&g_sess, LINK_OP_FRAME_ACK, 0, 0,
@@ -458,17 +565,75 @@ static void handle_frame(void)
                       &g_pending_reply);
 
 #ifdef FRANK_SNES_PPU_SLAVE
-    /* Wire idle, master away: render this frame's stream for next time. */
+    /* Hand the render to CORE 1 and return to the wire immediately.
+     *
+     * Rendering here, on core 0, is what makes the master wait: the master's
+     * next stream bulk cannot complete until this loop comes back round and
+     * arms its receive, so the whole render lands inside the master's
+     * exchange. Measured on the master: the stream-send phase costs 10,021 us
+     * against a ~26 us transfer, and that block starves the master's HDMI
+     * scanline interrupt until the display drops lock.
+     *
+     * Core 1 is idle - core 0 owns the S-DSP and the link - so the render
+     * overlaps the master's next frame instead of blocking it, which is what
+     * the two-chip design was for. The double buffer already separates the
+     * picture being sent from the one being drawn. */
+    /* Render here, on core 0.
+     *
+     * The renderer was moved to core 1 to keep it off the link loop, and core
+     * 1 could not be made to run it: it entered the replay and never returned,
+     * on both the PSRAM and the SRAM buffer, leaving the picture dead for the
+     * whole session. That is an optimisation, and it is not worth a black
+     * screen - the block it was meant to remove turned out to be the link's
+     * RX DMA writing into PSRAM, which is fixed independently (see
+     * g_ppu_stream_sram) and took the master's exchange from 10,842 us to
+     * ~335 us on its own.
+     *
+     * So the render costs the master its ~5 ms again, and everything works.
+     * Revisit core 1 from here, with a picture on the screen to regress
+     * against, rather than blind. */
     if (ppu_len) {
         extern void slave_ppu_replay(const uint8_t *rec, uint32_t len);
-        extern uint32_t slave_ppu_copy_frame(uint8_t *dst, uint32_t max);
-        /* Draw straight into the buffer that goes on the wire: GFX.Screen is
-           pointed at it, so there is no copy and no second screen buffer. */
         extern uint8_t *slave_ppu_screen;
+        extern void slave_ppu_arm_frame(void);
+
         slave_ppu_screen = g_ppu_fb[g_ppu_slot];
-        { extern void slave_ppu_arm_frame(void); slave_ppu_arm_frame(); }
-        slave_ppu_replay(g_ppu_stream, ppu_len);
+        slave_ppu_arm_frame();
+        /* What actually landed in the buffer? A stream that arrives as zeros
+           and one that never arrives are indistinguishable from the counters,
+           and the replay's behaviour on garbage is what hangs the slave. */
+        g_dbg_len = ppu_len;
+        g_dbg_sram = ((uintptr_t)g_ppu_stream == (uintptr_t)g_ppu_stream_sram);
+        memcpy((void *)g_dbg_head, g_ppu_stream, 8);
+        if (!g_render_disable)
+            slave_ppu_replay(g_ppu_stream, ppu_len);
+        /* AFTER the replay, which is where the cache invalidate happens, so
+           this is the same view of the buffer the replay parsed. Latched only
+           on a disagreement, and only until the heartbeat has printed it. */
+        { extern volatile uint32_t slave_ppu_stream_sum;
+          if (!g_ppu_head_valid && slave_ppu_stream_sum != ppu_exp_sum) {
+              uint32_t n = ppu_len < LINK_PPU_HEAD_BYTES ? ppu_len
+                                                         : LINK_PPU_HEAD_BYTES;
+              for (uint32_t q = 0; q < n; q++)
+                  g_ppu_got_head[q] = g_ppu_stream[q];
+              g_ppu_head_valid = 1;
+          } }
         g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
+
+        /* Did the renderer actually put pixels in the buffer, and is it the
+           buffer we ship? The master receives 57,344 bytes of zeros every
+           frame while the slave reports a healthy render, so one of those two
+           things is false and the counters so far cannot say which. */
+        { const uint8_t *drawn = g_ppu_fb[g_ppu_slot];
+          const uint8_t *sent  = g_ppu_fb[g_ppu_slot ^ 1u];
+          uint32_t nzd = 0, nzs = 0;
+          for (uint32_t q = 0; q < 256u * 224u; q += 37) {
+              if (drawn[q]) nzd++;
+              if (sent[q])  nzs++;
+          }
+          g_dbg_nz_drawn = nzd;
+          g_dbg_nz_sent  = nzs; }
+
         g_ppu_slot ^= 1u;
         g_ppu_fb_valid = true;
     }
@@ -480,12 +645,96 @@ static void handle_frame(void)
     g_frames++;
 }
 
+#ifdef FRANK_SNES_PPU_SLAVE
+/* Core 1: the renderer.
+ *
+ * Nothing here touches the link. Core 0 publishes a stream length, core 1
+ * replays it into the back buffer and flips; core 0 ships whatever is finished
+ * on the next exchange. A frame that is still rendering when the master asks
+ * simply is not sent that frame - one frame of latency, which the design
+ * already accepted - rather than stalling the wire. */
+static void slave_render_core(void)
+{
+    /* Per-core, and core 1 has had neither.
+     *
+     * CP0 (the GPIO coprocessor) and CP10/CP11 (VFP) are enabled through
+     * CPACR, which is banked per core - core 0 doing it at boot buys core 1
+     * nothing. The renderer reaches VFP quickly, so without this core 1 took
+     * exactly one render request and never returned from it: alive=1,
+     * start=1, done=0, while core 0 went on kicking 51 requests a second into
+     * a core that was already dead. The main() comment above says the same
+     * thing about core 0 - "coprocessors first, before anything else". */
+    runtime_init_per_core_enable_coprocessors();
+    cpacr_ensure();
+
+    g_render_alive = 1;          /* core 1 reached its loop at all */
+    for (;;) {
+        while (!g_render_req) { g_render_spins++; __wfe(); }
+        __dmb();
+        g_render_starts++;
+
+        extern void slave_ppu_replay(const uint8_t *rec, uint32_t len);
+        extern uint8_t *slave_ppu_screen;
+        extern void slave_ppu_arm_frame(void);
+
+        slave_ppu_screen = g_ppu_fb[g_ppu_slot];
+        slave_ppu_arm_frame();
+        slave_ppu_replay(g_render_buf, g_render_len);
+
+        g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
+        g_ppu_slot ^= 1u;
+        g_ppu_fb_valid = true;
+        g_render_dones++;
+        __dmb();
+        g_render_req = false;
+    }
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Boot                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Automatic BOOTSEL after repeated boot failures.
+ *
+ * This board has no working SWD and no working UART on the slave, so a
+ * firmware that hangs before its main loop is unrecoverable except by a human
+ * holding a button. That makes every experiment cost a person, which is a poor
+ * property for a chip meant to be iterated on.
+ *
+ * So: a watchdog reboots a hung boot, a counter in the watchdog's scratch
+ * registers survives that reboot, and the third consecutive failure drops the
+ * chip into BOOTSEL by itself - where picotool can reach it and flash
+ * something that works. The counter is cleared once the main loop has been
+ * healthy for a while, so a normal boot never accumulates toward it.
+ *
+ * The magic word distinguishes a real count from whatever the scratch
+ * registers hold at power-on, when they are undefined. */
+#define SLAVE_BOOT_MAGIC   0x5A1E0000u
+#define SLAVE_BOOT_MAGIC_MASK 0xffff0000u
+#define SLAVE_BOOT_FAIL_LIMIT 3u
+/* Generous: the main loop blocks up to 1 s in link_s_wait_ctrl, and a frame's
+   render is a few ms. This is here to catch a HANG, not to police latency. */
+#define SLAVE_WATCHDOG_MS  8000u
+/* How long the main loop must run before a boot counts as good. */
+#define SLAVE_BOOT_OK_US   10000000u
+
 int main(void)
 {
+    {
+        uint32_t sc = watchdog_hw->scratch[0];
+        uint32_t fails = ((sc & SLAVE_BOOT_MAGIC_MASK) == SLAVE_BOOT_MAGIC)
+                       ? (sc & 0xffffu) : 0u;
+
+        fails = watchdog_caused_reboot() ? fails + 1u : 0u;
+
+        if (fails >= SLAVE_BOOT_FAIL_LIMIT) {
+            /* Clear first: this must not loop if BOOTSEL is itself escaped. */
+            watchdog_hw->scratch[0] = SLAVE_BOOT_MAGIC;
+            reset_usb_boot(0, 0);
+        }
+        watchdog_hw->scratch[0] = SLAVE_BOOT_MAGIC | fails;
+    }
     /* Both halves must run at the same clock: the receiving PIO program
      * has to finish its loop inside the transmitter's byte period, and
      * each side derives that from its own system clock. The master
@@ -532,7 +781,33 @@ int main(void)
     cpacr_ensure();
 
     stdio_init_all();
-    sleep_ms(50);
+
+    /* Wait for the host to attach the USB-CDC console BEFORE anything that
+     * can fault.
+     *
+     * This chip's UART and SWD are both dead at the wire on this board, so
+     * CDC is the only channel - and CDC is useless until the host has
+     * enumerated and opened it. Everything printed in the first ~2 s goes
+     * nowhere. Worse, enumeration is IRQ-driven while delivery runs from
+     * tud_task in the main loop, so a hang here leaves the host holding an
+     * open port that never produces a byte: present, silent, and easily
+     * mistaken for dead hardware. Three seconds of boot latency is a small
+     * price for a console that outlives the failure it is meant to explain. */
+    sleep_ms(3000);
+
+    /* Armed HERE, before the risky init - not after it.
+     *
+     * It was originally armed once the main loop was reached, on the reasoning
+     * that init is legitimately slow (PSRAM bring-up, 448 KB of tile caches, a
+     * 128 KB LUT) and should not be policed. That protected exactly the wrong
+     * window: slave_ppu_init is where this firmware actually hangs, and a
+     * watchdog that starts afterwards can never fire for it. The point of the
+     * thing is recovering a chip whose SWD and UART are both dead, so it has
+     * to cover the code most likely to kill it.
+     *
+     * Generous enough that a slow-but-working init is never mistaken for a
+     * hung one, and every stage marker pets it. */
+    watchdog_enable(SLAVE_WATCHDOG_MS, 1);
 
     printf("\n[slave] frank-snes C2 sound slave, fw %u.%02u\n",
            SLAVE_FW_VERSION >> 8, SLAVE_FW_VERSION & 0xff);
@@ -544,7 +819,12 @@ int main(void)
     gpio_put(PICO_DEFAULT_LED_PIN, 1);
     STAGE(4);
 
+    printf("[slave] sound init: entering (heap %u used)\n",
+           (unsigned)slave_heap_bytes_used());
+    sleep_ms(40);
     slave_sound_init();
+    printf("[slave] sound init: returned\n");
+    sleep_ms(40);
     STAGE(5);
     printf("[slave] mixer up, heap %u bytes\n",
            (unsigned)slave_heap_bytes_used());
@@ -552,12 +832,32 @@ int main(void)
     /* PPU offload: the renderer lives here now. Core 0 keeps the S-DSP, the
        renderer runs on core 1. Measured on the master: handing the renderer
        over frees 7,642 us/frame and takes it from 46 to 50 fps. */
+    /* Wait for USB-CDC to enumerate BEFORE touching the renderer.
+     *
+     * A fault inside slave_ppu_init takes the USB device down with it, and
+     * the host then sees no port at all - which is indistinguishable from a
+     * board that lost power, and says nothing about where it died. Everything
+     * printed before this point is lost for the same reason: the host is not
+     * attached yet. Three seconds of dead time at boot buys a console that
+     * survives the failure, on a chip whose UART and SWD are both dead at the
+     * wire. */
+    printf("[slave] ppu init: entering (heap %u bytes used)\n",
+           (unsigned)slave_heap_bytes_used());
+
     { extern bool slave_ppu_init(void);
       if (!slave_ppu_init())
           printf("[slave] FATAL: slave_ppu_init failed (out of memory)\n");
-      else
+      else {
           printf("[slave] renderer up, heap %u bytes\n",
-                 (unsigned)slave_heap_bytes_used()); }
+                 (unsigned)slave_heap_bytes_used());
+          /* Only after init: core 1 dereferences everything it allocates.
+             With an EXPLICIT 16 KB stack: the SDK's default core 1 stack is a
+             couple of KB, and the tile renderer recurses through the draw
+             paths far past that. Launched with the default, core 1 accepted
+             1,745 render requests and completed none - it died on its first
+             frame, silently, while the link stayed perfectly healthy. */
+          /* Core 1 is NOT launched: see the note at the render call. */
+      } }
 
     STAGE(6);
     link_init(&g_link, LINK_PIO_SLAVE,
@@ -579,6 +879,7 @@ int main(void)
 
     STAGE(8);
     uint32_t last_report = 0;
+    bool boot_confirmed = false;
 
     for (;;) {
         /* A timeout is not an error: the master is simply idle, or
@@ -607,15 +908,129 @@ int main(void)
         }
 
         /* Once a second, say what is happening. The slave has no screen
-         * and no other way to be observed short of a debug probe. */
+         * and no other way to be observed short of a debug probe.
+         *
+         * UNCONDITIONALLY - the `if (g_frames || g_bad_frames)` guard this
+         * replaces made silence ambiguous, and that ambiguity cost real
+         * debugging time: with the link down the slave printed nothing, which
+         * is indistinguishable from a hung slave, a dead UART and a slave that
+         * never booted. It was in fact healthy and idle every time. A line
+         * with zeroes in it is worth far more than no line, and once a second
+         * is nowhere near enough output to perturb anything.
+         *
+         * The uptime is what makes it diagnostic: a counter that stops moving
+         * says "hung after boot", which no snapshot of state can tell you. */
+        watchdog_update();
+
         uint32_t now = time_us_32();
+        if (!boot_confirmed && now >= SLAVE_BOOT_OK_US) {
+            /* Ten seconds of serving the loop: this image boots. Forget the
+               failure history so it cannot accumulate across power cycles. */
+            watchdog_hw->scratch[0] = SLAVE_BOOT_MAGIC;
+            boot_confirmed = true;
+        }
+
         if (now - last_report >= 1000000u) {
             last_report = now;
-            if (g_frames || g_bad_frames) {
-                printf("[slave] %lu frames, %lu bad\n",
-                       (unsigned long)g_frames, (unsigned long)g_bad_frames);
-                g_frames = g_bad_frames = 0;
+            printf("[slave] up %lus %lu frames, %lu bad",
+                   (unsigned long)(now / 1000000u),
+                   (unsigned long)g_frames, (unsigned long)g_bad_frames);
+#ifdef FRANK_SNES_PPU_SLAVE
+            /* The renderer's own verdict, on the same line: it has been
+               replaying records and drawing nothing, and these are the exact
+               values the draw path gates on. */
+            { extern volatile uint32_t slave_ppu_render_us, slave_ppu_records,
+                                       slave_ppu_psram_ok, slave_ppu_impossible,
+                                       slave_ppu_alloc_fail, slave_ppu_heap_max_kb,
+                                       slave_ppu_alloc_probe, slave_ppu_stage,
+                                       slave_ppu_live_recs, slave_ppu_last_tag;
+              (void)slave_ppu_alloc_probe;
+              extern uint32_t slave_ppu_dbg_pitch_h(void), slave_ppu_dbg_flags(void);
+              uint32_t ph = slave_ppu_dbg_pitch_h();
+              printf(" | ppu %luus %lurec psram=%lu imp=%lu pitch=%lu h=%lu"
+                     " flags=%08lx len=%lu nzdrawn=%lu nzsent=%lu slot=%lu",
+                     (unsigned long)slave_ppu_render_us,
+                     (unsigned long)slave_ppu_records,
+                     (unsigned long)slave_ppu_psram_ok,
+                     (unsigned long)slave_ppu_impossible,
+                     (unsigned long)(ph & 0xffffu),
+                     (unsigned long)(ph >> 16),
+                     (unsigned long)slave_ppu_dbg_flags(),
+                     (unsigned long)g_dbg_len,
+                     (unsigned long)g_dbg_nz_drawn,
+                     (unsigned long)g_dbg_nz_sent,
+                     (unsigned long)g_ppu_slot);
+              extern volatile uint32_t frank_gfx_fail,
+                                       frank_gfx_localstate_bytes,
+                                       frank_gfx_zero_bytes;
+              printf(" gfxfail=%lu ls=%lu zero=%lu probe=%lu",
+                     (unsigned long)frank_gfx_fail,
+                     (unsigned long)frank_gfx_localstate_bytes,
+                     (unsigned long)frank_gfx_zero_bytes,
+                     (unsigned long)slave_ppu_alloc_probe);
+              /* The truncation, in full: where the replay stopped, why, the
+                 bytes there, and a checksum of what it replayed from. The
+                 master prints the same checksum over what it SENT. */
+              { extern volatile uint32_t slave_ppu_stream_len,
+                                         slave_ppu_stream_sum,
+                                         slave_ppu_stop_off,
+                                         slave_ppu_stop_ctx,
+                                         slave_ppu_stop_why,
+                                         slave_ppu_bad_lines;
+                extern volatile uint32_t slave_ppu_exp_sum, slave_ppu_sum_ok,
+                                         slave_ppu_sum_bad;
+                printf(" | slen=%lu sum=%08lx exp=%08lx ok=%lu bad=%lu"
+                       " stop=%lu why=%lu ctx=%08lx badln=%lu",
+                       (unsigned long)slave_ppu_stream_len,
+                       (unsigned long)slave_ppu_stream_sum,
+                       (unsigned long)slave_ppu_exp_sum,
+                       (unsigned long)slave_ppu_sum_ok,
+                       (unsigned long)slave_ppu_sum_bad,
+                       (unsigned long)slave_ppu_stop_off,
+                       (unsigned long)slave_ppu_stop_why,
+                       (unsigned long)slave_ppu_stop_ctx,
+                       (unsigned long)slave_ppu_bad_lines);
+                extern volatile uint32_t slave_ppu_upd_calls, slave_ppu_vram_w,
+                                         slave_ppu_cgram_w, slave_ppu_r2100_w,
+                                         slave_ppu_r2100_last,
+                                         slave_ppu_r2100_seen;
+                extern uint32_t slave_ppu_dbg_content(void);
+                uint32_t ct = slave_ppu_dbg_content();
+                printf(" | r2100 n=%lu last=%02lx seen=%04lx vramnz=%lu palnz=%lu",
+                       (unsigned long)slave_ppu_r2100_w,
+                       (unsigned long)slave_ppu_r2100_last,
+                       (unsigned long)slave_ppu_r2100_seen,
+                       (unsigned long)(ct & 0xffffu),
+                       (unsigned long)(ct >> 16));
+                extern uint32_t slave_ppu_dbg_regs(void);
+                printf(" | upd=%lu vram=%lu cgram=%lu regs=%08lx"
+                       " want=%lu rx=%lu/%lu zero=%lu over=%lu/%lu sram=%lu",
+                       (unsigned long)slave_ppu_upd_calls,
+                       (unsigned long)slave_ppu_vram_w,
+                       (unsigned long)slave_ppu_cgram_w,
+                       (unsigned long)slave_ppu_dbg_regs(),
+                       (unsigned long)g_ppu_last_want,
+                       (unsigned long)g_ppu_recv_ok,
+                       (unsigned long)g_ppu_recv_fail,
+                       (unsigned long)g_ppu_want_zero,
+                       (unsigned long)g_ppu_oversize,
+                       (unsigned long)g_ppu_oversize_sram,
+                       (unsigned long)g_dbg_sram); } }
+            /* The two heads, same frame, whenever one has been latched. This
+               is the whole point: a checksum says the delivery is wrong, these
+               say what it actually is. */
+            if (g_ppu_head_valid) {
+                printf("\n[slave] sent:");
+                for (uint32_t q = 0; q < LINK_PPU_HEAD_BYTES; q++)
+                    printf(" %02x", g_ppu_exp_head[q]);
+                printf("\n[slave] got :");
+                for (uint32_t q = 0; q < LINK_PPU_HEAD_BYTES; q++)
+                    printf(" %02x", g_ppu_got_head[q]);
+                g_ppu_head_valid = 0;
             }
+#endif
+            printf("\n");
+            g_frames = g_bad_frames = 0;
         }
     }
 }

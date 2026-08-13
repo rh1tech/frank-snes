@@ -129,6 +129,8 @@ target_compile_options(frank-snes-slave PRIVATE
 
 target_link_libraries(frank-snes-slave
     pico_stdlib
+    # The renderer runs on core 1 so the link loop never blocks on it.
+    pico_multicore
     hardware_clocks
     hardware_dma
     hardware_gpio
@@ -136,12 +138,23 @@ target_link_libraries(frank-snes-slave
     hardware_sync
     hardware_vreg
     link
-)
 
-# Console on UART1 via the J4 header — the slave's USB-C port stays free
-# for BOOTSEL, and SWD on J3 is the primary debug route anyway.
+    hardware_xip_cache)
+
+# Console on BOTH UART1 (J4 header) and USB-CDC.
+#
+# The USB half is not a convenience. Measured on this board: SWD on J3 cannot
+# read IDR even with the target sitting in BOOTSEL running the bootrom, and a
+# beacon firmware printing unconditionally to UART1 delivered 0 bytes to the
+# host — so both of the "primary" debug routes are dead at the wire, and the
+# slave has no screen. USB-CDC is the one channel proven to work: the same
+# beacon came through on it immediately.
+#
+# It also buys remote recovery. `picotool reboot -u -f` over this interface
+# puts the slave back in BOOTSEL without anyone touching the board, which is
+# what makes flashing it unattended possible at all.
 pico_enable_stdio_uart(frank-snes-slave 1)
-pico_enable_stdio_usb(frank-snes-slave 0)
+pico_enable_stdio_usb(frank-snes-slave 1)
 
 pico_add_extra_outputs(frank-snes-slave)
 

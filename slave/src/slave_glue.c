@@ -34,7 +34,20 @@
    Undersizing this does not fail loudly: snes_calloc returns NULL, the
    renderer initialises with no state, and the screen is simply black. */
 #ifdef FRANK_SNES_PPU_SLAVE
-#define SLAVE_HEAP_BYTES (120u * 1024u)
+/* 40 KB. Sized against what the slave ACTUALLY allocates:
+     gfx.c's LocalState        22,972 B  (LineData/OBJLines, read per pixel)
+     IPPU.TileCached            7,168 B
+     Memory.VRAM               65,536 B  (read PER PIXEL - must be SRAM)
+     slack                       ~8 KB
+   Only GFX.ZERO (128 KB) crosses SLAVE_PSRAM_ALLOC_THRESHOLD and is served
+   from PSRAM instead.
+
+   This was 136 KB, sized to hold soundux.c's 96 KB echo buffer - which the
+   slave never allocates: it links spc_dsp.c, not soundux.c, and spc_dsp owns
+   its state on a static array. That reclaims ~96 KB of SRAM, which is what
+   lets the PPU stream land in SRAM in every case (see
+   SLAVE_PPU_STREAM_SRAM_BYTES) instead of PSRAM. */
+#define SLAVE_HEAP_BYTES (112u * 1024u)
 #else
 #define SLAVE_HEAP_BYTES (8u * 1024u)
 #endif

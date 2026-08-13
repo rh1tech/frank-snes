@@ -36,6 +36,17 @@
 #define PPUCAP_LINE  0x05   /* scanline8 — slave runs RenderLine() */
 #define PPUCAP_ENDF  0x06   /* end of frame — slave flushes and starts anew */
 
+/* The SAME function on both chips, so the two sums are comparable. It lives
+ * in the shared header for exactly that reason: two hand-written copies of a
+ * checksum that must agree is a bug waiting to be mistaken for a transport
+ * fault. FNV-1a, one pass, no table. */
+static inline uint32_t ppucap_sum(const uint8_t *p, uint32_t n)
+{
+   uint32_t h = 2166136261u;
+   for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+   return h;
+}
+
 #ifdef FRANK_SNES_PPU_CAPTURE
 
 bool ppucap_init(void);                       /* allocates the PSRAM store */
@@ -50,6 +61,15 @@ void ppucap_endframe(void);
 extern volatile uint32_t frank_cap_bytes;
 extern volatile uint32_t frank_cap_overflow;
 extern volatile uint32_t frank_cap_on;
+/* Checksum of the stream ppucap_take() last handed to the link, over exactly
+   frank_cap_bytes. The slave returns the same sum over what it received; the
+   pair says whether the wire or the capture is at fault. */
+extern volatile uint32_t frank_cap_sum;
+/* Reset by the reader; see ppu_capture.c. */
+extern volatile uint32_t frank_cap_min, frank_cap_max, frank_cap_takes;
+/* Captured writes by destination, cumulative. Compared against the slave's
+   own counts for the same three registers. */
+extern volatile uint32_t frank_cap_vram_w, frank_cap_cgram_w, frank_cap_oam_w;
 
 #define PPUCAP_WRITE_HOOK(addr, val) \
    do { if (frank_cap_on && ((addr) & 0xffc0) == 0x2100) ppucap_write((addr), (val)); } while (0)

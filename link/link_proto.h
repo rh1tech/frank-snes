@@ -154,6 +154,30 @@ typedef struct __attribute__((packed)) {
     uint32_t psram_ok;       /* 1 if the PSRAM tile caches allocated         */
     uint32_t impossible;     /* CPU-side registers the stream should not carry */
     uint32_t want;           /* the stream length the slave READ from the payload */
+    uint32_t dbg_pitch_h;    /* GFX.Pitch | PPU.ScreenHeight << 16          */
+    uint32_t dbg_flags;      /* b0 ForcedBlanking, b1 RenderThisFrame,
+                                b2 SubScreen!=0, b8.. S9xUpdateScreen calls  */
+
+    /* The replay truncates: it consumes a fraction of the stream, hits a tag
+     * that is not one of the three, and drops the rest of the frame. Every
+     * other counter on both chips reports success, so these five exist to
+     * split the three possible causes apart in ONE run:
+     *
+     *   sum_bad > 0                   -> the bytes changed in transit
+     *   sum_bad == 0 and stop_why != 0 -> the master CAPTURED a bad stream
+     *
+     * The comparison is made on the SLAVE, against the checksum the master
+     * put in the same control frame, so the reply's one-frame pipeline lag
+     * cannot be mistaken for corruption. stop_ctx carries the four bytes at
+     * the stop, so a corrupt tag is read rather than guessed at. */
+    uint32_t stream_len;     /* bytes the slave replayed FROM                */
+    uint32_t stream_sum;     /* checksum the slave computed over them        */
+    uint32_t exp_sum;        /* checksum the master said it sent             */
+    uint32_t sum_ok;         /* deliveries whose checksum agreed             */
+    uint32_t sum_bad;        /* deliveries whose checksum did not            */
+    uint32_t stop_off;       /* byte offset the replay stopped at            */
+    uint32_t stop_ctx;       /* the 4 bytes at stop_off, little-endian       */
+    uint32_t stop_why;       /* 1 = bad tag, 2 = truncated record, 0 = clean */
 } link_ppu_stat_t;
 
 /* ---- Frame header (24 bytes), followed by payload, zero-padded to
@@ -336,6 +360,23 @@ typedef struct __attribute__((packed)) {
  * slave read zero, never armed for the bulk, and the master spent 10.1 ms of
  * a 10.4 ms exchange waiting for it. */
 #define LINK_PPU_LEN_OFFSET (LINK_ARAM_MAX_RUNS * sizeof(link_aram_run_t))
+/* The checksum of that stream, immediately after it.
+ *
+ * It rides in the SAME control frame as the stream it describes so the slave
+ * can check the delivery itself, inside one exchange. Comparing across the
+ * reply instead does not work: the reply is pipelined a frame behind, so a
+ * healthy system mismatches on almost every frame and the check is worthless
+ * - which is exactly what the first attempt measured (25 agreements against
+ * 620 disagreements, on a link with linkfail=0). */
+#define LINK_PPU_SUM_OFFSET (LINK_PPU_LEN_OFFSET + sizeof(uint32_t))
+/* And the first bytes of that stream, verbatim.
+ *
+ * A checksum says the delivery is wrong; it cannot say HOW. These let the
+ * slave print what the master sent beside what it received, for the same
+ * frame, on one console - which is the difference between "corrupted" and
+ * "this is a different frame's stream". 32 bytes of a 232-byte payload. */
+#define LINK_PPU_HEAD_BYTES  32u
+#define LINK_PPU_HEAD_OFFSET (LINK_PPU_SUM_OFFSET + sizeof(uint32_t))
 
 #define LINK_ARAM_BITMAP_BYTES (LINK_ARAM_PAGES / 8u)         /* 32  */
 

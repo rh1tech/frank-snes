@@ -251,11 +251,48 @@ void DrawLargePixel16Add1_2(uint32_t Tile, int32_t Offset, uint32_t StartPixel, 
 void DrawLargePixel16Sub(uint32_t Tile, int32_t Offset, uint32_t StartPixel, uint32_t Pixels, uint32_t StartLine, uint32_t LineCount);
 void DrawLargePixel16Sub1_2(uint32_t Tile, int32_t Offset, uint32_t StartPixel, uint32_t Pixels, uint32_t StartLine, uint32_t LineCount);
 
+/* Which of this function's two allocations failed, and how big they are.
+   Both failure paths return a bare false, so from the caller they are the same
+   event - and on the C2 slave, where this runs headless, that ambiguity is the
+   whole difference between "the heap is too small" and "the heap is fine but
+   LocalState ate it". Cost is three words of .bss. */
+/* Stage trace through S9xInitGFX, slave-only.
+ *
+ * Everything in this function after the LocalState calloc had NEVER executed
+ * on the C2 slave: that calloc failed on every build until the heap was sized
+ * for it, so the function always returned early. The first build that got past
+ * it hung the chip before its main loop, taking USB down with it. "Hangs
+ * somewhere in S9xInitGFX" is not a location, hence these.
+ *
+ * Only the slave defines FRANK_SNES_PPU_SLAVE, so the master and the offline
+ * harness compile this away entirely. */
+#ifdef FRANK_SNES_PPU_SLAVE
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "hardware/watchdog.h"
+#define GFXSTAGE(s) do { printf("[gfx] " s "\n"); sleep_ms(30); \
+                         watchdog_update(); } while (0)
+#else
+#define GFXSTAGE(s) ((void)0)
+#endif
+
+volatile uint32_t frank_gfx_fail;            /* 1 = LocalState, 2 = GFX.ZERO */
+volatile uint32_t frank_gfx_localstate_bytes;
+volatile uint32_t frank_gfx_zero_bytes;
+
 bool S9xInitGFX(void)
 {
+   frank_gfx_localstate_bytes = (uint32_t) sizeof(*LocalState);
+   frank_gfx_zero_bytes       = (uint32_t) (sizeof(uint16_t) * 0x10000);
+
+   GFXSTAGE("enter");
    LocalState = calloc(1, sizeof(*LocalState));
    if (!LocalState)
+   {
+      frank_gfx_fail = 1;
       return false;
+   }
+   GFXSTAGE("LocalState ok");
 
 #if defined(FRANK_SNES_FAST_MODE) && BG_CACHE_ENABLED
    /* Use SubZBuffer as Z-cache - only safe when subscreen/transparency is disabled */
@@ -281,11 +318,17 @@ bool S9xInitGFX(void)
    DrawHiResClippedTilePtr = DrawClippedTile16;
    GFX.PPL = GFX.Pitch;  // 8-bit pixels: PPL == Pitch
    GFX.PPLx2 = GFX.Pitch * 2;
+   GFXSTAGE("pre FixColourBrightness");
    S9xFixColourBrightness();
+   GFXSTAGE("post FixColourBrightness");
 
 #ifndef NO_ZERO_LUT
    if (!(GFX.ZERO = (uint16_t*) malloc(sizeof(uint16_t) * 0x10000)))
+   {
+      frank_gfx_fail = 2;
       return false;
+   }
+   GFXSTAGE("ZERO allocated");
 
    /* Build a lookup table that if the top bit of the color value is zero
     * then the value is zero, otherwise its just the value. */
@@ -318,6 +361,7 @@ bool S9xInitGFX(void)
       }
    }
 #endif
+   GFXSTAGE("returning true");
    return true;
 }
 
