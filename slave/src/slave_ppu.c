@@ -130,6 +130,7 @@ volatile uint32_t slave_ppu_stop_why;   /* 1 bad tag, 2 truncated, 0 clean */
  * gap rather than a bug in the transport. */
 volatile uint32_t slave_ppu_upd_calls;  /* S9xUpdateScreen calls, cumulative */
 volatile uint32_t slave_ppu_vram_w;     /* $2118/$2119 writes, cumulative    */
+volatile uint32_t slave_ppu_wseq;       /* hash of the write SEQUENCE replayed */
 volatile uint32_t slave_ppu_cgram_w;    /* $2122 writes, cumulative          */
 volatile uint32_t slave_ppu_r2100_w;    /* $2100 writes, cumulative          */
 volatile uint32_t slave_ppu_r2100_last; /* the value of the last one         */
@@ -604,8 +605,13 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
       case PPUCAP_WRITE:
          if (i + 2 >= len) { slave_ppu_stop_why = 2; goto done; }
          slave_ppu_stage = 20;
-         if ((rec[i + 1] & 0x3f) == 0x18 || (rec[i + 1] & 0x3f) == 0x19)
+         if ((rec[i + 1] & 0x3f) == 0x18 || (rec[i + 1] & 0x3f) == 0x19) {
             slave_ppu_vram_w++;
+            uint32_t h = slave_ppu_wseq;
+            h ^= (rec[i + 1] & 0x3f); h *= 16777619u;
+            h ^= rec[i + 2];          h *= 16777619u;
+            slave_ppu_wseq = h;
+         }
          else if ((rec[i + 1] & 0x3f) == 0x22)
             slave_ppu_cgram_w++;
          else if ((rec[i + 1] & 0x3f) == 0x00) {
@@ -646,6 +652,31 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
          }
          i += 2;
          break;
+
+      case PPUCAP_VPAGE: {
+         /* A page of VRAM content, not a command. Copy it in and invalidate
+            exactly the tiles it covers, at every depth - the same three
+            arrays REGISTER_2118 used to clear one byte at a time. */
+         if (i + 1u + PPUCAP_PAGE_BYTES >= len) {
+            slave_ppu_stop_why = 2; goto done;
+         }
+         { uint32_t page = rec[i + 1];
+           uint32_t base = page * PPUCAP_PAGE_BYTES;
+           if (Memory.VRAM && base + PPUCAP_PAGE_BYTES <= VRAM_SIZE) {
+              memcpy(Memory.VRAM + base, &rec[i + 2], PPUCAP_PAGE_BYTES);
+              if (IPPU.TileCached[TILE_2BIT])
+                 memset(IPPU.TileCached[TILE_2BIT] + (base >> 4), 0,
+                        PPUCAP_PAGE_BYTES >> 4);
+              if (IPPU.TileCached[TILE_4BIT])
+                 memset(IPPU.TileCached[TILE_4BIT] + (base >> 5), 0,
+                        PPUCAP_PAGE_BYTES >> 5);
+              if (IPPU.TileCached[TILE_8BIT])
+                 memset(IPPU.TileCached[TILE_8BIT] + (base >> 6), 0,
+                        PPUCAP_PAGE_BYTES >> 6);
+              slave_ppu_vram_w++;
+           } }
+         i += 2u + PPUCAP_PAGE_BYTES;
+         break; }
 
       case PPUCAP_ENDF:
          if (i + 1 >= len) { slave_ppu_stop_why = 2; goto done; }

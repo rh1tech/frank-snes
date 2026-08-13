@@ -35,6 +35,19 @@
 #define PPUCAP_WRITE 0x01   /* reg8 (low byte of $21xx), value8 */
 #define PPUCAP_LINE  0x05   /* scanline8 — slave runs RenderLine() */
 #define PPUCAP_ENDF  0x06   /* end of frame — slave flushes and starts anew */
+/* page8, then PPUCAP_PAGE_BYTES of VRAM. The master owns VRAM; the slave is
+ * given its CONTENT, not the commands that produced it.
+ *
+ * Replaying $2118/$2119 requires the slave to reproduce PPU.VMA exactly -
+ * address, increment, the high-byte flag, the full-graphic remapping - and
+ * to invalidate the same tile-cache entries in the same order. Every one of
+ * those was a separate bug, and after each was fixed the mirror still
+ * diverged on most frames. Sending the bytes removes the entire class: there
+ * is nothing to reproduce, and a page that differs is simply resent. */
+#define PPUCAP_VPAGE 0x08
+#define PPUCAP_PAGE_BITS  9u
+#define PPUCAP_PAGE_BYTES (1u << PPUCAP_PAGE_BITS)          /* 512 */
+#define PPUCAP_PAGES      (0x10000u / PPUCAP_PAGE_BYTES)    /* 128 */
 
 /* The SAME function on both chips, so the two sums are comparable. It lives
  * in the shared header for exactly that reason: two hand-written copies of a
@@ -79,9 +92,14 @@ extern volatile uint32_t frank_cap_vram_w, frank_cap_cgram_w, frank_cap_oam_w;
 #define PPUCAP_VRAM_BLOCKS 32u
 extern volatile uint32_t frank_cap_vram_block[PPUCAP_VRAM_BLOCKS];
 
+/* $2118/$2119 are NOT captured: VRAM travels as pages of content. Everything
+   else still travels as a write, because those registers ARE the state. */
+#define PPUCAP_IS_VRAM(a) (((a) & 0x3f) == 0x18 || ((a) & 0x3f) == 0x19)
 #define PPUCAP_WRITE_HOOK(addr, val) \
-   do { if (frank_cap_on && ((addr) & 0xffc0) == 0x2100) ppucap_write((addr), (val)); } while (0)
-#define PPUCAP_PORT_HOOK(port, val)  do { if (frank_cap_on) ppucap_write((port), (val)); } while (0)
+   do { if (frank_cap_on && ((addr) & 0xffc0) == 0x2100 && !PPUCAP_IS_VRAM(addr)) \
+           ppucap_write((addr), (val)); } while (0)
+#define PPUCAP_PORT_HOOK(port, val)  \
+   do { if (frank_cap_on && !PPUCAP_IS_VRAM(port)) ppucap_write((port), (val)); } while (0)
 #define PPUCAP_LINE_HOOK(c)          do { if (frank_cap_on) ppucap_line((c)); } while (0)
 #define PPUCAP_ENDF_HOOK()           ppucap_endframe()
 

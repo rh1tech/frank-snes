@@ -78,6 +78,17 @@ volatile uint32_t frank_cap_vma_fix;   /* address corrections emitted */
    replays them; the two must be equal, and if they are the divergence is
    about WHERE the writes land rather than whether they arrive. */
 volatile uint32_t frank_cap_vram_rec;
+/* Running hash of the VRAM write SEQUENCE this chip emits - register and
+   value, in order. The slave hashes the same over what it replays. Equal
+   sequences with unequal VRAM would mean the master's VRAM is being changed
+   by something that is not a $2118/$2119 write at all. */
+volatile uint32_t frank_cap_wseq;
+/* What the slave's VRAM holds, as far as this chip knows: updated only when a
+   page is actually put on the wire. Comparing live VRAM against it is what
+   decides which pages to send, so a page that fails to arrive is simply sent
+   again next frame - the mechanism is self-correcting by construction. */
+static uint8_t *vram_shadow;
+volatile uint32_t frank_cap_pages_sent;
 volatile uint32_t frank_cap_vram_hash;
 volatile uint32_t frank_cap_vram_block[PPUCAP_VRAM_BLOCKS];
 volatile uint32_t frank_cap_hash_on = 1;
@@ -95,6 +106,12 @@ bool ppucap_init(void)
 
    uint8_t *q = (uint8_t *) psram_malloc(PPUCAP_BUF_BYTES);
    if (!q) return false;
+
+   vram_shadow = (uint8_t *) psram_malloc(0x10000u);
+   if (!vram_shadow) return false;
+   /* Deliberately NOT cleared to match VRAM: leaving it different forces
+      every page to be sent on the first frame, which is the initial sync. */
+   memset(vram_shadow, 0xff, 0x10000u);
 
    ppucap_bufs[0] = p;
    ppucap_bufs[1] = q;
@@ -229,7 +246,12 @@ void ppucap_write(uint16_t address, uint8_t value)
       need completely different fixes. The slave counts the same three; the
       pair of numbers decides it. */
    switch (r[1]) {
-   case 0x18: case 0x19: frank_cap_vram_w++; frank_cap_vram_rec++; break;
+   case 0x18: case 0x19: {
+      frank_cap_vram_w++; frank_cap_vram_rec++;
+      uint32_t h = frank_cap_wseq;
+      h ^= r[1]; h *= 16777619u; h ^= r[2]; h *= 16777619u;
+      frank_cap_wseq = h;
+      break; }
    case 0x22:            frank_cap_cgram_w++; break;
    case 0x04:            frank_cap_oam_w++;   break;
    default: break;
@@ -237,8 +259,27 @@ void ppucap_write(uint16_t address, uint8_t value)
    ppucap_put(r, 3);
 }
 
+/* Emitted at the START of the visible frame - after the VBlank uploads that
+ * produced them, before anything is rendered - which is where a game's VRAM
+ * changes actually take effect. */
+static void ppucap_emit_vram_pages(void)
+{
+   if (!vram_shadow || !Memory.VRAM) return;
+   for (uint32_t p = 0; p < PPUCAP_PAGES; p++) {
+      uint8_t *live = Memory.VRAM   + p * PPUCAP_PAGE_BYTES;
+      uint8_t *shad = vram_shadow   + p * PPUCAP_PAGE_BYTES;
+      if (!memcmp(live, shad, PPUCAP_PAGE_BYTES)) continue;
+      uint8_t hdr[2] = { PPUCAP_VPAGE, (uint8_t) p };
+      ppucap_put(hdr, 2);
+      ppucap_put(live, PPUCAP_PAGE_BYTES);
+      memcpy(shad, live, PPUCAP_PAGE_BYTES);
+      frank_cap_pages_sent++;
+   }
+}
+
 void ppucap_line(uint8_t line)
 {
+   if (line == 0) ppucap_emit_vram_pages();
    uint8_t r[2];
    r[0] = PPUCAP_LINE;
    r[1] = line;
@@ -308,7 +349,12 @@ static void ppucap_emit(uint16_t addr, uint8_t val)
    r[0] = PPUCAP_WRITE;
    r[1] = (uint8_t)(addr & 0x3f);
    r[2] = val;
-   if (r[1] == 0x18 || r[1] == 0x19) frank_cap_vram_rec++;
+   if (r[1] == 0x18 || r[1] == 0x19) {
+      frank_cap_vram_rec++;
+      uint32_t h = frank_cap_wseq;
+      h ^= r[1]; h *= 16777619u; h ^= r[2]; h *= 16777619u;
+      frank_cap_wseq = h;
+   }
    ppucap_put(r, 3);
 }
 

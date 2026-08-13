@@ -648,6 +648,8 @@ static void handle_frame(void)
                 g_pending_reply.ppu_stat.vram_hash = slave_ppu_blk_bitmap; }
               g_pending_reply.ppu_stat.vram_match = slave_ppu_vram_match;
               g_pending_reply.ppu_stat.vram_diff  = slave_ppu_vram_diff; }
+            { extern volatile uint32_t slave_ppu_wseq;
+              g_pending_reply.ppu_stat.impossible = slave_ppu_wseq; }
         }
 #endif
         link_s_send_ctrl(&g_sess, LINK_OP_FRAME_ACK, 0, 0,
