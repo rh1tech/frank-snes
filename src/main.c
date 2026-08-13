@@ -2111,6 +2111,33 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
         // Must come after the emulated frame and before the first mix.
         s9x_link_frame();
 
+#ifdef FRANK_SNES_PPU_CAPTURE
+        /* Show the picture that just arrived.
+         *
+         * The display flip lives at the bottom of this loop, inside
+         * `if (!skip_render)` - it belongs to the MASTER's renderer, and in an
+         * offload build the master never renders. rend_fps was 0 in every
+         * sample taken, so current_buffer never moved: the slave's frame
+         * landed in SCREEN[current_buffer] and HDMI went on scanning out
+         * SCREEN[!current_buffer], which nothing ever writes. fb_nonzero
+         * counted 5,193 real pixels in a buffer that could not reach the
+         * screen.
+         *
+         * The frame skipper is what makes this permanent rather than
+         * occasional: it drops a render whenever emulation is behind or the
+         * audio queue is low, and with the renderer offloaded that saves the
+         * master nothing, so it skips indefinitely.
+         *
+         * Flip on ARRIVAL instead. link_master_ppu_got() is the byte count the
+         * exchange actually received, so a frame the slave did not send (or a
+         * failed exchange) leaves the current picture up rather than flipping
+         * to a stale buffer. */
+        if (link_master_ppu_got()) {
+            current_buffer = !current_buffer;
+            GFX.Screen = SCREEN[current_buffer];
+        }
+#endif
+
 #endif
 
         // Mix audio on Core 0 (always, even when skipping render), then apply
@@ -2391,7 +2418,11 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
             consecutive_skipped_frames = 0;
 
             // Swap display buffers only when we rendered
-#ifdef FRANK_SNES_CPU_CORE_S9X16
+#if defined(FRANK_SNES_PPU_CAPTURE)
+            /* Not here in an offload build: the flip happens when the slave's
+               picture ARRIVES, just after s9x_link_frame() above. Doing both
+               would flip twice on any frame the master also rendered. */
+#elif defined(FRANK_SNES_CPU_CORE_S9X16)
             /* The core drew into Screen16; narrow it into the buffer the
              * driver is about to start showing, then flip. Same ordering as
              * the 1.43 path - the freshly filled buffer is the one that
