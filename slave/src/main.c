@@ -206,7 +206,7 @@ static volatile uint32_t g_ppu_sram_slot;      /* core 0 fills this one   */
 static volatile uint32_t g_render_sram_slot = 0xffffffffu; /* core 1 reads */
 static volatile uint32_t g_ppu_sram_direct;    /* replayed from SRAM      */
 static uint32_t g_ppu_oversize_sram;
-/* ONE framebuffer, and the Z buffer that the second slot used to be.
+/* ONE framebuffer in SRAM, and the Z buffer that the second slot used to be.
  *
  * The renderer touches GFX.ZBuffer once per pixel per layer - tile.c only
  * draws where Z1 > Depth[x] - so it is swept five times a frame, 57 KB at a
@@ -229,6 +229,36 @@ static uint32_t g_ppu_oversize_sram;
 static uint8_t  g_ppu_fb[LINK_PPU_MAX_BYTES];
 static uint32_t g_ppu_fb_bytes;
 uint8_t         slave_zbuffer[LINK_PPU_MAX_BYTES];
+
+/* The two TRANSMIT buffers, in PSRAM. Core 1 copies each finished frame into
+ * one of these and core 0 ships the other.
+ *
+ * Sending straight out of g_ppu_fb does not work, and the way it fails is
+ * worth writing down: core 0's bulk send runs at the top of a frame while
+ * core 1 is still drawing INTO that buffer, so the master receives a splice
+ * of two frames. On a fight it is invisible; on the character-select screen,
+ * where the text is redrawn every frame, it is a screenful of garbled
+ * lettering.
+ *
+ * Waiting for core 1 before sending would fix it and cost more than it fixes:
+ * the wait already exists, but it currently happens AFTER the reply has gone
+ * out, so the master is off emulating the next frame while the slave catches
+ * up. Move it in front of the bulk and the master waits instead - the stall
+ * stops being free.
+ *
+ * So the copy is the answer, and PSRAM is where it goes: the slave has 8 MB
+ * of it and no SRAM at all (the 57 KB the second framebuffer used to occupy
+ * is now GFX.ZBuffer, which is worth 18 ms a frame and is not going back).
+ * One 57 KB sequential SRAM->PSRAM memcpy costs core 1 about 1-2 ms of the
+ * slack it has after a 13 ms render, and it is sequential streaming rather
+ * than the scattered per-pixel traffic that made PSBAM expensive for the Z
+ * buffer in the first place.
+ *
+ * No cache maintenance: core 1 writes these through the XIP cache and core
+ * 0's DMA reads the same window through the same cache. Maintenance is only
+ * needed when a DMA WRITES PSRAM behind the cache's back. */
+uint8_t         *slave_ppu_tx[2];
+static volatile uint32_t g_tx_slot;   /* core 1 writes here; core 0 ships ^1 */
 static bool     g_ppu_fb_valid;
 volatile uint32_t g_ppu_oversize;
 /* Core 0 -> core 1 render handoff. */
@@ -244,6 +274,7 @@ static volatile uint32_t g_render_exp_hash;
    and how many core 1 finished. Equal and climbing = healthy; kicks climbing
    with dones stuck = core 1 never ran or died on its first frame. */
 static volatile uint32_t g_render_kicks, g_render_dones;
+static volatile uint32_t g_tx_copy_us;   /* SRAM->PSRAM publish, microseconds */
 /* Core 1's stack, sized deliberately - see the launch site. */
 static __attribute__((aligned(8))) uint32_t g_render_stack[16u * 1024u / 4u];
 /* How often core 0 had to wait for core 1 to release the stream buffer.
@@ -696,7 +727,8 @@ static void handle_frame(void)
            only the bulks remain, and they need no handshake of their own. */
         uint32_t fb_bytes = g_have_pending ? g_pending_reply.ppu_fb_bytes : 0;
         if (fb_bytes)
-            link_s_bulk_send(&g_sess, g_ppu_fb, LINK_ALIGN4(fb_bytes));
+            link_s_bulk_send(&g_sess, slave_ppu_tx[g_tx_slot ^ 1u],
+                             LINK_ALIGN4(fb_bytes));
 
         /* The palette, every frame and unconditionally. The master no longer
            renders, so it never calls graphics_set_palette itself - without
@@ -955,12 +987,19 @@ static void slave_render_core(void)
           slave_ppu_hash_state(); }
 
         g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
+        if (!skip_draw && slave_ppu_tx[g_tx_slot]) {
+            /* Publish by COPY, into the slot core 0 is not shipping. */
+            uint32_t c0 = time_us_32();
+            memcpy(slave_ppu_tx[g_tx_slot], g_ppu_fb, 256u * 224u);
+            g_tx_copy_us = time_us_32() - c0;
+        }
         /* The flip is the publish: everything above must be visible to core 0
            before the slot moves, and the slot before the request clears. */
         __dmb();
         if (!skip_draw) {
             /* Only a frame that was actually DRAWN may be published, or the
                master would be shipped a buffer holding the frame before last. */
+            g_tx_slot ^= 1u;
             g_ppu_fb_valid = true;
         }
         g_render_dones++;
@@ -1246,6 +1285,13 @@ int main(void)
                   }
                   g_dbg_touched = touched; g_dbg_selftest_nz = nz; }
                 g_ppu_fb_bytes = 256u * 224u;
+                /* Self-test draws on core 0 straight into the SRAM buffer, so
+                   it has to publish the same way a real frame does. */
+                if (slave_ppu_tx[g_tx_slot]) {
+                    memcpy(slave_ppu_tx[g_tx_slot], g_ppu_fb, 256u * 224u);
+                    __dmb();
+                    g_tx_slot ^= 1u;
+                }
                 g_ppu_fb_valid = true;
             }
 #endif
@@ -1290,6 +1336,7 @@ int main(void)
                        (unsigned long)slave_ppu_us_vpage,
                        (unsigned long)slave_ppu_n_vpage,
                        (unsigned long)slave_ppu_us_endf);
+                printf(" txcopy=%luus", (unsigned long)g_tx_copy_us);
                 printf(" write=%luus pre=%luus",
                        (unsigned long)slave_ppu_us_write,
                        (unsigned long)slave_ppu_us_pre); }

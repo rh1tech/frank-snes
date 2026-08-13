@@ -280,6 +280,15 @@ bool slave_ppu_init(void)
       slave_zbuffer in main.c for the measurement and for what paid for it. */
    { extern uint8_t slave_zbuffer[];
      GFX.ZBuffer = slave_zbuffer; }
+
+   /* The two transmit buffers core 1 publishes finished frames into. PSRAM,
+      written sequentially once a frame - see slave_ppu_tx in main.c. */
+   { extern uint8_t *slave_ppu_tx[2];
+     for (uint32_t t = 0; t < 2u; t++) {
+        slave_ppu_tx[t] = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
+        if (slave_ppu_tx[t])
+           memset(slave_ppu_tx[t], 0, SNES_WIDTH * SNES_HEIGHT);
+     } }
    GFX.SubZBuffer = (uint8_t *) psram_malloc(SNES_WIDTH * SNES_HEIGHT);
    /* All three, not just the sub-screen.
     *
