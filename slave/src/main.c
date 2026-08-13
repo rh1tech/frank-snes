@@ -200,6 +200,7 @@ static volatile uint32_t g_render_len;
    at the top of every frame, so core 1 raced it and ended up replaying - and
    cache-invalidating - the wrong buffer. */
 static uint8_t * volatile g_render_buf;
+static volatile uint32_t g_render_exp_hash;
 /* Liveness for the core 0 -> core 1 handoff: how many renders were asked for
    and how many core 1 finished. Equal and climbing = healthy; kicks climbing
    with dones stuck = core 1 never ran or died on its first frame. */
@@ -381,6 +382,17 @@ static void handle_frame(void)
     memcpy((void *)g_ppu_exp_head,
            g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_HEAD_OFFSET,
            LINK_PPU_HEAD_BYTES);
+    uint32_t ppu_exp_vram_hash = 0;
+    memcpy(&ppu_exp_vram_hash,
+           g_ctrl_rx + sizeof(link_hdr_t) + LINK_PPU_VRAMHASH_OFFSET,
+           sizeof(ppu_exp_vram_hash));
+    { extern volatile uint32_t slave_ppu_exp_block[];
+      for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++) {
+          uint32_t v;
+          memcpy(&v, g_ctrl_rx + sizeof(link_hdr_t)
+                     + LINK_PPU_VRAMBLK_OFFSET + b * 4u, sizeof(v));
+          slave_ppu_exp_block[b] = v;
+      } }
 #endif
 
     if (n_events) {
@@ -592,6 +604,13 @@ static void handle_frame(void)
               g_pending_reply.ppu_stat.stop_off   = slave_ppu_stop_off;
               g_pending_reply.ppu_stat.stop_ctx   = slave_ppu_stop_ctx;
               g_pending_reply.ppu_stat.stop_why   = slave_ppu_stop_why; }
+            { extern volatile uint32_t slave_ppu_vram_hash,
+                                       slave_ppu_cgram_hash, slave_ppu_oam_hash;
+              extern volatile uint32_t slave_ppu_vram_match, slave_ppu_vram_diff;
+              { extern volatile uint32_t slave_ppu_blk_bitmap;
+                g_pending_reply.ppu_stat.vram_hash = slave_ppu_blk_bitmap; }
+              g_pending_reply.ppu_stat.vram_match = slave_ppu_vram_match;
+              g_pending_reply.ppu_stat.vram_diff  = slave_ppu_vram_diff; }
         }
 #endif
         link_s_send_ctrl(&g_sess, LINK_OP_FRAME_ACK, 0, 0,
@@ -688,6 +707,11 @@ static void handle_frame(void)
             g_render_buf        = g_ppu_stream;
             g_render_len        = ppu_len;
             g_render_stage_slot = g_ppu_stage_slot;
+            /* Handed over WITH the request. Core 1 runs up to a frame behind
+               core 0, so a global that core 0 overwrites per frame would have
+               core 1 checking frame N-1's VRAM against frame N's hash and
+               reporting differences that are only the pipeline. */
+            g_render_exp_hash   = ppu_exp_vram_hash;
             g_render_kicks++;
             __dmb();
             g_render_req = true;
@@ -806,6 +830,12 @@ static void slave_render_core(void)
           }
           g_dbg_nz_drawn = nzd;
           g_dbg_nz_sent  = nzs; }
+
+        /* On this core, after the render - see slave_ppu_hash_state. */
+        { extern void slave_ppu_hash_state(void);
+          extern volatile uint32_t slave_ppu_exp_vram_hash;
+          slave_ppu_exp_vram_hash = g_render_exp_hash;
+          slave_ppu_hash_state(); }
 
         g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
         /* The flip is the publish: everything above must be visible to core 0

@@ -178,6 +178,16 @@ typedef struct __attribute__((packed)) {
     uint32_t stop_off;       /* byte offset the replay stopped at            */
     uint32_t stop_ctx;       /* the 4 bytes at stop_off, little-endian       */
     uint32_t stop_why;       /* 1 = bad tag, 2 = truncated record, 0 = clean */
+
+    /* The slave's own PPU memory, hashed. The master hashes the same three
+       the same way, so a difference says the mirror has diverged and which
+       of the three did it - without instrumenting a single write. The
+       remaining picture faults are old content left in place rather than
+       corrupted bytes, so what is needed is not "did this byte change" but
+       "is the whole mirror equal". */
+    uint32_t vram_hash;      /* bitmap of blocks that differed, this frame */
+    uint32_t vram_match;     /* frames whose VRAM matched the master's      */
+    uint32_t vram_diff;      /* frames whose VRAM did not                   */
 } link_ppu_stat_t;
 
 /* ---- Frame header (24 bytes), followed by payload, zero-padded to
@@ -397,6 +407,19 @@ typedef struct __attribute__((packed)) {
 
 #define LINK_PPU_HEAD_BYTES  32u
 #define LINK_PPU_HEAD_OFFSET (LINK_PPU_SUM_OFFSET + sizeof(uint32_t))
+/* The master's hash of its OWN VRAM as of the end of the stream in this
+ * frame - that is, the state the slave should hold once it has replayed it.
+ *
+ * Comparing the two chips' VRAM at whatever instant each happened to sample
+ * proves nothing: the game rewrites VRAM every frame, so the hashes differ
+ * even when the mirror is perfect. This makes the comparison frame-aligned -
+ * the slave checks it right after replaying the stream it belongs to, so a
+ * difference means the mirror really has diverged. */
+#define LINK_PPU_VRAMHASH_OFFSET (LINK_PPU_HEAD_OFFSET + LINK_PPU_HEAD_BYTES)
+/* Eight 8 KB block hashes, so a divergence can be located within VRAM
+   rather than merely counted. */
+#define LINK_PPU_VRAMBLK_OFFSET (LINK_PPU_VRAMHASH_OFFSET + sizeof(uint32_t))
+#define LINK_PPU_VRAM_BLOCKS 8u
 
 #define LINK_ARAM_BITMAP_BYTES (LINK_ARAM_PAGES / 8u)         /* 32  */
 

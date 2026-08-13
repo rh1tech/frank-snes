@@ -430,7 +430,16 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
             memcpy(pl + LINK_PPU_HEAD_OFFSET, g_ppu_stream,
                    g_ppu_len < LINK_PPU_HEAD_BYTES ? g_ppu_len
                                                    : LINK_PPU_HEAD_BYTES);
-        const uint32_t pl_bytes = LINK_PPU_HEAD_OFFSET + LINK_PPU_HEAD_BYTES;
+        { extern volatile uint32_t frank_cap_vram_hash;
+          extern volatile uint32_t frank_cap_vram_block[];
+          uint32_t vh = frank_cap_vram_hash;
+          memcpy(pl + LINK_PPU_VRAMHASH_OFFSET, &vh, sizeof(uint32_t));
+          for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++) {
+              uint32_t v = frank_cap_vram_block[b];
+              memcpy(pl + LINK_PPU_VRAMBLK_OFFSET + b * 4u, &v, sizeof(v));
+          } }
+        const uint32_t pl_bytes = LINK_PPU_VRAMBLK_OFFSET
+                                + LINK_PPU_VRAM_BLOCKS * sizeof(uint32_t);
 #else
         const uint32_t pl_bytes = rt;
 #endif

@@ -69,7 +69,16 @@ volatile uint32_t frank_cap_min = 0xffffffffu;
 volatile uint32_t frank_cap_max;
 volatile uint32_t frank_cap_takes;
 volatile uint32_t frank_cap_vram_w, frank_cap_cgram_w, frank_cap_oam_w;
-volatile uint32_t frank_vram_writes;   /* see ppu.h - every real VRAM write */
+volatile uint32_t frank_cap_vma_fix;   /* address corrections emitted */
+/* Hash of this chip's VRAM at the end of the frame just captured - what the
+   slave must hold once it has replayed that frame's stream. Diagnostic; it
+   costs a 64 KB pass per frame, so it is switchable. */
+volatile uint32_t frank_cap_vram_hash;
+volatile uint32_t frank_cap_vram_block[PPUCAP_VRAM_BLOCKS];
+volatile uint32_t frank_cap_hash_on = 1;
+/* What PPU.VMA.Address will be on the SLAVE - see ppucap_write. */
+static uint32_t cap_vma_shadow;
+static bool     cap_vma_valid;
 
 
 static uint32_t ppucap_total;      /* bytes the frame WOULD have produced */
@@ -150,12 +159,65 @@ static inline void ppucap_put(const uint8_t *b, uint32_t n)
    the same mistake that made the profiling build's event timers useless. The
    cost is measured by alternating capture on and off and comparing frame
    time, exactly as FRANK_SNES_NO_RENDER measures the renderer. */
+/* What PPU.VMA.Address will be on the SLAVE, given only the records it has
+ * been sent.
+ *
+ * The VRAM address is not set solely by writes. S9xGetPPU advances it on
+ * every read of $2139/$213A, and reads are not captured - nothing about a
+ * read is a PPU-visible write, so the stream has no reason to carry one.
+ * The master's address therefore runs ahead of the slave's, and from that
+ * moment every $2118/$2119 lands somewhere else: the bytes that should have
+ * overwritten the old tile never arrive, and the new ones land where they do
+ * not belong.
+ *
+ * That is exactly what the remaining picture faults were - a line of intro
+ * text still carrying "KOMBAT." from the previous screen, fighters built out
+ * of pieces of other sprite frames. Old content left in place, not corrupted
+ * bytes. And it is why hashing the three memories the same way on both chips
+ * found CGRAM and OAM identical and only VRAM different: those registers
+ * auto-increment too, but MK3 does not read them.
+ *
+ * Rather than capture reads, keep a shadow of what the slave believes and
+ * emit a $2116/$2117 pair whenever it has drifted. One comparison per VRAM
+ * write, and the correction costs two records only when it is actually
+ * needed. It also covers any OTHER way the address could diverge, which
+ * matters more than the read path alone: this is the third thing to have
+ * silently desynchronised the mirror. */
 void ppucap_write(uint16_t address, uint8_t value)
 {
    uint8_t r[3];
    r[0] = PPUCAP_WRITE;
    r[1] = (uint8_t)(address & 0x3f);
    r[2] = value;
+
+   switch (r[1]) {
+   case 0x16: case 0x17:
+      /* The game is setting the address itself; after this the two agree. */
+      cap_vma_shadow = PPU.VMA.Address;
+      cap_vma_valid  = true;
+      break;
+
+   case 0x18: case 0x19:
+      if (!cap_vma_valid || cap_vma_shadow != PPU.VMA.Address) {
+         uint8_t f[3];
+         f[0] = PPUCAP_WRITE; f[1] = 0x16;
+         f[2] = (uint8_t)(PPU.VMA.Address & 0xff);
+         ppucap_put(f, 3);
+         f[1] = 0x17;
+         f[2] = (uint8_t)((PPU.VMA.Address >> 8) & 0xff);
+         ppucap_put(f, 3);
+         cap_vma_shadow = PPU.VMA.Address;
+         cap_vma_valid  = true;
+         frank_cap_vma_fix++;
+      }
+      /* Then advance it exactly as the slave's helper will. */
+      if ((r[1] == 0x18) ? !PPU.VMA.High : !!PPU.VMA.High)
+         cap_vma_shadow += PPU.VMA.Increment;
+      break;
+
+   default: break;
+   }
+
    /* Counted by destination, cumulative. The slave renders a structurally
       correct but entirely empty frame, and the two explanations - "these
       writes are never captured" and "they are captured and lost on the way" -
@@ -216,12 +278,16 @@ void ppucap_line(uint8_t line)
  * happens on a link-up. */
 #define RESYNC_VRAM_CHUNK 512u
 
+
 static uint32_t resync_phase;   /* 0 idle, 1 registers+CGRAM, 2 VRAM, 3 OAM */
 static uint32_t resync_off;     /* byte offset within the VRAM sweep        */
 volatile uint32_t frank_cap_resyncs;
 
 void ppucap_request_resync(void)
 {
+   /* The resync drives $2116/$2117 itself, so whatever the shadow held is
+      no longer what the slave will believe. */
+   cap_vma_valid = false;
    resync_phase = 1;
    resync_off   = 0;
    frank_cap_resyncs++;
@@ -234,6 +300,30 @@ static void ppucap_emit(uint16_t addr, uint8_t val)
    r[1] = (uint8_t)(addr & 0x3f);
    r[2] = val;
    ppucap_put(r, 3);
+}
+
+/* Put the address registers back where the GAME had them.
+ *
+ * Every resync chunk drives $2115/$2116/$2117 (and phase 1 drives $2121 and
+ * $2102/$2103) to walk the memory it is reconstructing, and leaves them
+ * wherever it finished. The frame's own writes then follow in the same
+ * stream, assuming the address the game set - so they land at the resync's
+ * end address instead. That is a divergence introduced BY the repair, and it
+ * runs for as long as the sweep does.
+ *
+ * Restoring after every chunk, not just at the end of the sweep, is the
+ * whole point: there is a frame boundary between chunks, and the game writes
+ * VRAM in every one of them. The shadow is invalidated too, so the next real
+ * VRAM write re-emits its address rather than trusting a stale match. */
+static void ppucap_resync_restore_addr(void)
+{
+   ppucap_emit(0x2115, Memory.FillRAM[0x2115]);
+   ppucap_emit(0x2116, Memory.FillRAM[0x2116]);
+   ppucap_emit(0x2117, Memory.FillRAM[0x2117]);
+   ppucap_emit(0x2121, Memory.FillRAM[0x2121]);
+   ppucap_emit(0x2102, Memory.FillRAM[0x2102]);
+   ppucap_emit(0x2103, Memory.FillRAM[0x2103]);
+   cap_vma_valid = false;
 }
 
 /* Emitted at the HEAD of a frame's stream, so the reconstructed state is in
@@ -261,6 +351,7 @@ static void ppucap_emit_resync(void)
          ppucap_emit(0x2122, (uint8_t)(PPU.CGDATA[i] & 0xff));
          ppucap_emit(0x2122, (uint8_t)(PPU.CGDATA[i] >> 8));
       }
+      ppucap_resync_restore_addr();
       resync_phase = 2;
       resync_off   = 0;
       return;
@@ -279,6 +370,7 @@ static void ppucap_emit_resync(void)
          ppucap_emit(0x2119, Memory.VRAM[resync_off + i + 1u]);
       }
       resync_off += n;
+      ppucap_resync_restore_addr();
       if (resync_off >= VRAM_SIZE) { resync_phase = 3; resync_off = 0; }
       return;
    }
@@ -290,12 +382,7 @@ static void ppucap_emit_resync(void)
    for (uint32_t i = 0; i < 544u; i++)
       ppucap_emit(0x2104, PPU.OAMData[i]);
 
-   ppucap_emit(0x2115, Memory.FillRAM[0x2115]);
-   ppucap_emit(0x2116, Memory.FillRAM[0x2116]);
-   ppucap_emit(0x2117, Memory.FillRAM[0x2117]);
-   ppucap_emit(0x2121, Memory.FillRAM[0x2121]);
-   ppucap_emit(0x2102, Memory.FillRAM[0x2102]);
-   ppucap_emit(0x2103, Memory.FillRAM[0x2103]);
+   ppucap_resync_restore_addr();
    resync_phase = 0;
 }
 
@@ -305,6 +392,27 @@ void ppucap_endframe(void)
    r[0] = PPUCAP_ENDF;
    r[1] = 0;
    ppucap_put(r, 2);
+
+   /* Hashed HERE - after this frame's last record and before the next
+      frame's first - so it describes exactly the state replaying this
+      stream should leave the slave in. */
+   if (frank_cap_hash_on && Memory.VRAM) {
+      /* Per BLOCK, not just whole-VRAM. "70% of frames differ" says nothing
+         about what differs; eight 8 KB blocks say whether it is the tilemap,
+         the BG tiles or the sprite tiles, which is the difference between a
+         guess and a next step. */
+      uint32_t all = 2166136261u;
+      for (uint32_t b = 0; b < PPUCAP_VRAM_BLOCKS; b++) {
+         uint32_t h = 2166136261u;
+         const uint8_t *p = Memory.VRAM + b * (VRAM_SIZE / PPUCAP_VRAM_BLOCKS);
+         for (uint32_t i = 0; i < VRAM_SIZE / PPUCAP_VRAM_BLOCKS; i++) {
+            h ^= p[i]; h *= 16777619u;
+            all ^= p[i]; all *= 16777619u;
+         }
+         frank_cap_vram_block[b] = h;
+      }
+      frank_cap_vram_hash = all;
+   }
 
    /* Publish and reset. The link transport will take the buffer here. */
    frank_cap_bytes = ppucap_len;   /* what is actually IN the buffer */

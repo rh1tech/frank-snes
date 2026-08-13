@@ -97,6 +97,12 @@ volatile uint32_t slave_ppu_sum_bad;
 volatile uint32_t slave_ppu_bad_multi, slave_ppu_bad_single, slave_ppu_bad_maxlen;
 /* Sum of the stream as it came off the wire, before staging. */
 volatile uint32_t slave_ppu_rx_sum;
+volatile uint32_t slave_ppu_vram_hash, slave_ppu_cgram_hash, slave_ppu_oam_hash;
+volatile uint32_t slave_ppu_exp_vram_hash;   /* the master's, for this frame */
+volatile uint32_t slave_ppu_exp_block[LINK_PPU_VRAM_BLOCKS];
+volatile uint32_t slave_ppu_blk_diff[LINK_PPU_VRAM_BLOCKS];
+volatile uint32_t slave_ppu_blk_bitmap;
+volatile uint32_t slave_ppu_vram_match, slave_ppu_vram_diff;
 volatile uint32_t slave_ppu_bad_wire;    /* differed already on arrival     */
 volatile uint32_t slave_ppu_bad_stage;   /* arrived right, staged wrong     */
 volatile uint32_t slave_ppu_stop_off;
@@ -655,6 +661,51 @@ done:
    }
    slave_ppu_render_us = time_us_32() - t0;
    slave_ppu_records   = n;
+}
+
+/* Hash this chip's PPU memory so the master can compare it with its own.
+ *
+ * Called on CORE 1, right after a render, for the reason the heartbeat had
+ * to stop sweeping VRAM: a 64 KB pass on core 0 between exchanges is enough
+ * to make the master's control frame find nobody armed. Core 1 has ~11 ms of
+ * slack after an 8.8 ms render and touches nothing the link needs. */
+void slave_ppu_hash_state(void)
+{
+   uint32_t h = 2166136261u, bits = 0;
+   if (Memory.VRAM) {
+      const uint32_t BLK = VRAM_SIZE / LINK_PPU_VRAM_BLOCKS;
+      for (uint32_t b = 0; b < LINK_PPU_VRAM_BLOCKS; b++) {
+         uint32_t bh = 2166136261u;
+         const uint8_t *p = Memory.VRAM + b * BLK;
+         for (uint32_t i = 0; i < BLK; i++) {
+            bh ^= p[i]; bh *= 16777619u;
+            h  ^= p[i]; h  *= 16777619u;
+         }
+         if (slave_ppu_exp_vram_hash && bh != slave_ppu_exp_block[b]) {
+            bits |= 1u << b;
+            slave_ppu_blk_diff[b]++;
+         }
+      }
+   }
+   slave_ppu_blk_bitmap = bits;
+
+   h = 2166136261u;
+   for (uint32_t i = 0; i < 256u; i++) {
+      h ^= (uint8_t)(PPU.CGDATA[i] & 0xff);  h *= 16777619u;
+      h ^= (uint8_t)(PPU.CGDATA[i] >> 8);    h *= 16777619u;
+   }
+   slave_ppu_cgram_hash = h;
+
+   h = 2166136261u;
+   for (uint32_t i = 0; i < 544u; i++) { h ^= PPU.OAMData[i]; h *= 16777619u; }
+   slave_ppu_oam_hash = h;
+
+   /* Frame-aligned: the master's hash arrived in the same control frame as
+      the stream just replayed, so this compares like with like. */
+   if (slave_ppu_exp_vram_hash) {
+      if (h == slave_ppu_exp_vram_hash) slave_ppu_vram_match++;
+      else                              slave_ppu_vram_diff++;
+   }
 }
 
 /* Copy the finished picture out of GFX.Screen for transmission. The renderer

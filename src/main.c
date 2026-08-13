@@ -738,7 +738,10 @@ typedef struct {
     uint32_t ppu_reread_ok, ppu_reread_bad;
     /* Real VRAM writes vs captured ones. A gap means a write path is not
        hooked and the slave can never converge. */
-    uint32_t vram_writes_real;
+    /* This chip's PPU memory, hashed the same way the slave hashes its own. */
+    uint32_t cap_vma_fix;
+    uint32_t m_vram_hash, m_cgram_hash, m_oam_hash;
+    uint32_t s_vram_hash, s_cgram_hash, s_oam_hash;
     /* HDMI health. Counting interrupts alone once "proved" the generator
        healthy on a display that had no signal; the GAP is what decides it. */
     uint32_t hdmi_irqs, hdmi_gap_max, hdmi_late;
@@ -2689,6 +2692,8 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.cap_vram_w  = frank_cap_vram_w;
                       frank_telemetry.cap_cgram_w = frank_cap_cgram_w;
                       frank_telemetry.cap_oam_w   = frank_cap_oam_w; }
+                    { extern volatile uint32_t frank_cap_vma_fix;
+                      frank_telemetry.cap_vma_fix = frank_cap_vma_fix; }
 
                     { extern volatile uint32_t frank_hdmi_irqs,
                                                frank_hdmi_gap_max,
@@ -2703,10 +2708,28 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.ppu_reread_ok  = g_ppu_reread_ok;
                       frank_telemetry.ppu_reread_bad = g_ppu_reread_bad; }
                     if (Memory.VRAM) {
-                        uint32_t n = 0;
-                        for (uint32_t i = 0; i < 0x10000u; i += 8u)
-                            if (Memory.VRAM[i]) n++;
+                        uint32_t n = 0, h = 2166136261u;
+                        for (uint32_t i = 0; i < 0x10000u; i++) {
+                            if (!(i & 7u) && Memory.VRAM[i]) n++;
+                            h ^= Memory.VRAM[i]; h *= 16777619u;
+                        }
                         frank_telemetry.master_vramnz = n;
+                        frank_telemetry.m_vram_hash = h;
+                        h = 2166136261u;
+                        for (uint32_t i = 0; i < 256u; i++) {
+                            h ^= (uint8_t)(PPU.CGDATA[i] & 0xff); h *= 16777619u;
+                            h ^= (uint8_t)(PPU.CGDATA[i] >> 8);   h *= 16777619u;
+                        }
+                        frank_telemetry.m_cgram_hash = h;
+                        h = 2166136261u;
+                        for (uint32_t i = 0; i < 544u; i++) {
+                            h ^= PPU.OAMData[i]; h *= 16777619u;
+                        }
+                        frank_telemetry.m_oam_hash = h;
+                        { extern volatile link_ppu_stat_t g_ppu_stat;
+                          frank_telemetry.s_vram_hash  = g_ppu_stat.vram_hash;
+                          frank_telemetry.s_cgram_hash = g_ppu_stat.vram_match;
+                          frank_telemetry.s_oam_hash   = g_ppu_stat.vram_diff; }
                     }
                     if (Memory.FillRAM)
                       frank_telemetry.master_regs =
