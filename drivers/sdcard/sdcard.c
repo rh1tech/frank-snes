@@ -361,11 +361,37 @@ DSTATUS disk_initialize (
 	if (Stat & STA_NODISK) return Stat;	/* Is card existing in the soket? */
 
 	FCLK_SLOW();
+
+	/* The 80 dummy clocks go out with the card DESELECTED, which is what the
+	 * SD spec requires and what this did not do: it drove CS low first, so the
+	 * card never saw the deselected clocking that puts it into SPI mode.
+	 *
+	 * From a cold start that does not matter - the card is already idle. After
+	 * a WARM reset it does, and it fails every time: the card is left in the
+	 * middle of whatever transfer was in flight when the CPU was reset, it
+	 * holds MISO, and CMD0 is answered with garbage. The symptom is the master
+	 * parking in rom_selector_show_sd_error, which is a while(1), so every
+	 * warm reset needed a power cycle to undo.
+	 *
+	 * CMD0 is also retried. One attempt is not enough for a card that needs a
+	 * few frames to let go of the bus. */
+	CS_HIGH();
+	for (n = 10; n; n--) xchg_spi(0xFF);	/* 80 clocks, card deselected */
 	CS_LOW();
-	for (n = 10; n; n--) xchg_spi(0xFF);	/* Send 80 dummy clocks */
+	for (n = 10; n; n--) xchg_spi(0xFF);	/* and settle once selected */
 
 	ty = 0;
-	if (send_cmd(CMD0, 0) == 1) {			/* Put the card SPI/Idle state */
+	{ int cmd0_ok = 0;
+	  for (int tries = 0; tries < 16 && !cmd0_ok; tries++) {
+	     if (send_cmd(CMD0, 0) == 1) { cmd0_ok = 1; break; }
+	     CS_HIGH();
+	     for (n = 10; n; n--) xchg_spi(0xFF);
+	     CS_LOW();
+	     sleep_ms(2);
+	  }
+	  if (!cmd0_ok) { deselect(); Stat = STA_NOINIT; return Stat; }
+	}
+	if (1) {			                    /* card is in SPI/Idle state */
 		t = _millis();
 		if (send_cmd(CMD8, 0x1AA) == 1) {	/* SDv2? */
 			for (n = 0; n < 4; n++) ocr[n] = xchg_spi(0xFF);	/* Get 32 bit return value of R7 resp */

@@ -3189,7 +3189,18 @@ int main(void) {
 
     // Mount SD card (AFTER HDMI so we can show an error screen on failure).
     LOG("Mounting SD card...\n");
-    FRESULT res = f_mount(&fs, "", 1);
+    /* Retried, because a single attempt makes every warm reset fatal.
+       rom_selector_show_sd_error is a while(1), so a card that needs a moment
+       to let go of the bus after a reset costs a power cycle. The driver's own
+       CMD0 sequence was also wrong for the warm case - see disk_initialize. */
+    FRESULT res = FR_DISK_ERR;
+    for (int attempt = 0; attempt < 6; attempt++) {
+        res = f_mount(&fs, "", 1);
+        if (res == FR_OK) break;
+        LOG("SD mount attempt %d failed: %d\n", attempt + 1, res);
+        f_mount(NULL, "", 0);          /* drop the half-mounted volume */
+        sleep_ms(120 * (attempt + 1)); /* let the card settle, then retry */
+    }
     if (res != FR_OK) {
         LOG("Failed to mount SD card: %d\n", res);
         // Show a visible error screen and blink the LED while halted.

@@ -257,8 +257,8 @@ uint8_t         slave_zbuffer[LINK_PPU_MAX_BYTES];
  * No cache maintenance: core 1 writes these through the XIP cache and core
  * 0's DMA reads the same window through the same cache. Maintenance is only
  * needed when a DMA WRITES PSRAM behind the cache's back. */
-uint8_t         *slave_ppu_tx[2];
-static volatile uint32_t g_tx_slot;   /* core 1 writes here; core 0 ships ^1 */
+uint8_t         *slave_ppu_tx[2];      /* allocated, unused - see below */
+static volatile uint32_t g_tx_slot;
 static bool     g_ppu_fb_valid;
 volatile uint32_t g_ppu_oversize;
 /* Core 0 -> core 1 render handoff. */
@@ -274,7 +274,16 @@ static volatile uint32_t g_render_exp_hash;
    and how many core 1 finished. Equal and climbing = healthy; kicks climbing
    with dones stuck = core 1 never ran or died on its first frame. */
 static volatile uint32_t g_render_kicks, g_render_dones;
-static volatile uint32_t g_tx_copy_us;   /* SRAM->PSRAM publish, microseconds */
+static volatile uint32_t g_render_wait_giveup;
+static volatile uint32_t g_tx_wait_us;      /* wait for core 1 before the bulk */
+static volatile uint32_t g_tx_wait_timeouts;
+/* A bounded wait, because an unbounded one takes the whole chip down with it.
+   Core 0 also services USB and the watchdog, so `while (g_render_req)` with no
+   way out turns any core-1 stall into a slave that is off the bus entirely -
+   no console, and this board's slave SWD is dead at the wire, so that costs a
+   human with a BOOTSEL button. Two frames is far longer than any real render
+   and still recovers. */
+#define SLAVE_RENDER_WAIT_MAX_US 40000u
 /* Core 1's stack, sized deliberately - see the launch site. */
 static __attribute__((aligned(8))) uint32_t g_render_stack[16u * 1024u / 4u];
 /* How often core 0 had to wait for core 1 to release the stream buffer.
@@ -566,10 +575,14 @@ static void handle_frame(void)
         if (want && g_render_req &&
             (g_ppu_stage_slot == g_render_stage_slot ||
              g_ppu_sram_slot  == g_render_sram_slot)) {
-            uint32_t w0 = time_us_32();
+            uint32_t w0 = time_us_32(), spun = 0;
             g_render_waits++;
-            while (g_render_req) tight_loop_contents();
-            g_render_wait_us = time_us_32() - w0;
+            while (g_render_req && spun < SLAVE_RENDER_WAIT_MAX_US) {
+                tight_loop_contents();
+                spun = time_us_32() - w0;
+            }
+            g_render_wait_us = spun;
+            if (g_render_req) g_render_wait_giveup++;
         }
         __dmb();
 
@@ -727,8 +740,28 @@ static void handle_frame(void)
            only the bulks remain, and they need no handshake of their own. */
         uint32_t fb_bytes = g_have_pending ? g_pending_reply.ppu_fb_bytes : 0;
         if (fb_bytes)
-            link_s_bulk_send(&g_sess, slave_ppu_tx[g_tx_slot ^ 1u],
-                             LINK_ALIGN4(fb_bytes));
+            /* Core 1 must be finished with the framebuffer before it goes on
+               the wire; there is only one. The wait below is what guarantees
+               it - it is deliberately here, in front of the bulk, and not
+               after the reply where it used to be.
+        
+               The copy-to-PSRAM this replaces was correct but paid twice: 4 ms
+               of core 1, and 57 KB of core-1 PSRAM writes a frame on a chip
+               whose PSRAM writes are measurably lossy under two-core
+               contention (the stream staging needs a verify-and-retry loop for
+               exactly that reason). Measured, the wait costs 1-2 us: core 1 is
+               kicked at the end of the previous frame and finishes a 13 ms
+               render long before core 0 comes back round. */
+            { uint32_t w0 = time_us_32();
+              uint32_t spun = 0;
+              while (g_render_req && spun < SLAVE_RENDER_WAIT_MAX_US) {
+                  tight_loop_contents();
+                  spun = time_us_32() - w0;
+              }
+              g_tx_wait_us = spun;
+              if (g_render_req) g_tx_wait_timeouts++;   /* shipped mid-draw */
+            }
+            link_s_bulk_send(&g_sess, g_ppu_fb, LINK_ALIGN4(fb_bytes));
 
         /* The palette, every frame and unconditionally. The master no longer
            renders, so it never calls graphics_set_palette itself - without
@@ -815,9 +848,13 @@ static void handle_frame(void)
              * with only two SRAM landing slots behind a four-deep queue the
              * stream buffers were reused underneath core 1 and 1,015 streams
              * in 30 s failed their checksum. */
-            { uint32_t w0 = time_us_32();
-              while (g_render_req) tight_loop_contents();
-              g_render_wait_us = time_us_32() - w0;
+            { uint32_t w0 = time_us_32(), spun = 0;
+              while (g_render_req && spun < SLAVE_RENDER_WAIT_MAX_US) {
+                  tight_loop_contents();
+                  spun = time_us_32() - w0;
+              }
+              g_render_wait_us = spun;
+              if (g_render_req) g_render_wait_giveup++;
               if (g_render_wait_us > 2000u) {
                   /* Behind. Replay the next stream but do NOT draw it.
                    *
@@ -987,19 +1024,12 @@ static void slave_render_core(void)
           slave_ppu_hash_state(); }
 
         g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
-        if (!skip_draw && slave_ppu_tx[g_tx_slot]) {
-            /* Publish by COPY, into the slot core 0 is not shipping. */
-            uint32_t c0 = time_us_32();
-            memcpy(slave_ppu_tx[g_tx_slot], g_ppu_fb, 256u * 224u);
-            g_tx_copy_us = time_us_32() - c0;
-        }
         /* The flip is the publish: everything above must be visible to core 0
            before the slot moves, and the slot before the request clears. */
         __dmb();
         if (!skip_draw) {
             /* Only a frame that was actually DRAWN may be published, or the
                master would be shipped a buffer holding the frame before last. */
-            g_tx_slot ^= 1u;
             g_ppu_fb_valid = true;
         }
         g_render_dones++;
@@ -1126,7 +1156,15 @@ int main(void)
      *
      * Generous enough that a slow-but-working init is never mistaken for a
      * hung one, and every stage marker pets it. */
-    watchdog_enable(SLAVE_WATCHDOG_MS, 1);
+    /* pause_on_debug = 0, NOT 1.
+     *
+     * With it set, the watchdog stops whenever the debug block thinks a
+     * debugger is attached - and a probe is wired to this chip's SWD pins
+     * permanently, so merely running openocd against it can arm that state.
+     * The one situation the watchdog exists for is a slave that has gone off
+     * the USB bus with no working SWD, which is precisely when nobody is going
+     * to notice it has been quietly switched off. */
+    watchdog_enable(SLAVE_WATCHDOG_MS, 0);
 
     printf("\n[slave] frank-snes C2 sound slave, fw %u.%02u\n",
            SLAVE_FW_VERSION >> 8, SLAVE_FW_VERSION & 0xff);
@@ -1287,11 +1325,6 @@ int main(void)
                 g_ppu_fb_bytes = 256u * 224u;
                 /* Self-test draws on core 0 straight into the SRAM buffer, so
                    it has to publish the same way a real frame does. */
-                if (slave_ppu_tx[g_tx_slot]) {
-                    memcpy(slave_ppu_tx[g_tx_slot], g_ppu_fb, 256u * 224u);
-                    __dmb();
-                    g_tx_slot ^= 1u;
-                }
                 g_ppu_fb_valid = true;
             }
 #endif
@@ -1336,7 +1369,10 @@ int main(void)
                        (unsigned long)slave_ppu_us_vpage,
                        (unsigned long)slave_ppu_n_vpage,
                        (unsigned long)slave_ppu_us_endf);
-                printf(" txcopy=%luus", (unsigned long)g_tx_copy_us);
+                printf(" txwait=%luus/%lu giveup=%lu",
+                       (unsigned long)g_tx_wait_us,
+                       (unsigned long)g_tx_wait_timeouts,
+                       (unsigned long)g_render_wait_giveup);
                 printf(" write=%luus pre=%luus",
                        (unsigned long)slave_ppu_us_write,
                        (unsigned long)slave_ppu_us_pre); }
