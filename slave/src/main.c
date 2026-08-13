@@ -219,6 +219,9 @@ static uint8_t *g_ppu_stage[2];
    build-time default that can be patched live via the debugger on the master
    side of the link only - set to 1 to isolate. */
 volatile uint32_t g_render_disable = 0;
+/* Draw a synthetic test pattern instead of replaying the stream - see the
+   note at the render call. Isolates delivery from content. */
+volatile uint32_t g_ppu_test_pattern = 0;
 /* What the master said it sent, and what actually landed, for the SAME frame.
    Printed side by side when the checksums disagree. */
 volatile uint8_t  g_ppu_exp_head[LINK_PPU_HEAD_BYTES];
@@ -706,8 +709,51 @@ static void slave_render_core(void)
         extern void slave_ppu_arm_frame(void);
 
         slave_ppu_screen = g_ppu_fb[g_ppu_slot];
-        slave_ppu_arm_frame();
-        slave_ppu_replay(g_render_buf, g_render_len);
+
+        /* Synthetic picture: prove the DELIVERY path on its own.
+         *
+         * Everything from here to the screen is shared with the real thing -
+         * the same framebuffer, the same bulk, the same palette bulk, the
+         * same HDMI scanout - but the pixels come from eight lines of code
+         * instead of from the renderer, and the palette is eight known
+         * colours instead of whatever the game built. So:
+         *
+         *   pattern appears on HDMI -> transport and display are correct, and
+         *     the fault is in what the renderer produces (content), OR
+         *   pattern does not appear -> the fault is in the offload mechanism
+         *     itself and the renderer is irrelevant.
+         *
+         * Measured first: an identical master build with FRANK_SNES_PPU_CAPTURE
+         * off shows a picture on all 8 grabs (SIGNAL 218), so the board, the
+         * cable and the sink are not in question - only the offload path is.
+         *
+         * Indices 1..8 deliberately: 251-254 are the HDMI driver's sync
+         * control symbols, and putting those in the picture is a SEPARATE
+         * experiment, not a confound in this one. */
+        if (g_ppu_test_pattern) {
+            extern uint32_t slave_palette[256];
+            uint8_t *fb = slave_ppu_screen;
+            for (uint32_t y = 0; y < 224u; y++) {
+                uint8_t *row = fb + y * 256u;
+                for (uint32_t x = 0; x < 256u; x++)
+                    row[x] = (uint8_t)(1u + (x >> 5));   /* 8 vertical bars */
+            }
+            /* A moving marker, so a frozen picture is distinguishable from a
+               live one that happens to be static. */
+            { uint32_t t = (g_render_dones >> 3) & 0xffu;
+              for (uint32_t y = 8; y < 24u; y++)
+                  for (uint32_t x = 0; x < 16u; x++)
+                      fb[y * 256u + ((t + x) & 0xffu)] = 8u; }
+            static const uint32_t bars[8] = {
+                0xff0000u, 0x00ff00u, 0x0000ffu, 0xffff00u,
+                0xff00ffu, 0x00ffffu, 0xffffffu, 0x808080u
+            };
+            for (uint32_t i = 0; i < 8u; i++) slave_palette[1u + i] = bars[i];
+            slave_palette[0] = 0x000000u;
+        } else {
+            slave_ppu_arm_frame();
+            slave_ppu_replay(g_render_buf, g_render_len);
+        }
 
         /* Did the renderer actually put pixels in the buffer, and is it the
            buffer core 0 ships? Sampled here rather than on core 0 because

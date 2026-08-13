@@ -292,16 +292,72 @@ static uint8_t       *g_ppu_fb;
 static uint32_t       g_ppu_fb_max;
 static uint32_t       g_ppu_fb_got;
 
+/* The stream goes on the wire from SRAM, never from PSRAM.
+ *
+ * A bulk DMA reading the XIP window is what was killing HDMI. Bisected on
+ * hardware with two live switches, holding everything else constant and with
+ * the slave sending a synthetic test pattern so the renderer could not be the
+ * explanation:
+ *
+ *   capture off, nothing sent          -> SIGNAL on 6 of 6 grabs
+ *   capture ON, stream NOT sent        -> SIGNAL on 6 of 6 grabs
+ *   capture ON, stream sent from PSRAM -> NOSIG  on 4 of 5 grabs
+ *
+ * So the CPU writing ~800 records a frame into PSRAM is harmless, and
+ * xip_cache_clean_all() is harmless - both still happen in the working cases.
+ * It is specifically the DMA reading PSRAM: it holds the DMA block long
+ * enough on QMI latency that the scanline channel misses its slot and the
+ * TMDS serialiser underruns. The interrupt itself is never late (31,507/s,
+ * max gap 65 us in the broken case), which is why every timing-based theory
+ * came back clean. The same weakness is already recorded from the other
+ * direction in src/main.c: an RX DMA into PSRAM could not sustain the
+ * framebuffer and took the link offline 12 times in 16 seconds.
+ *
+ * 16 KB, because the master has little SRAM to spare - ~50 KB between .bss
+ * and the heap limit, out of which core 1's stack and the allocator still
+ * have to come, and a 16 KB static buffer here once left 7,128 bytes free.
+ * It covers the steady state completely: MK3 in play captures 2,199 bytes a
+ * frame and 12 KB in the busiest scenes. Only the rare VRAM-upload frames
+ * (41,760 bytes measured) exceed it, and those still go straight from PSRAM
+ * and still disturb the display - g_ppu_tx_psram counts them so that stays
+ * visible rather than becoming a mystery flicker. */
+#define PPU_TX_BOUNCE_BYTES (16u * 1024u)
+static uint8_t __attribute__((aligned(4))) g_ppu_tx_bounce[PPU_TX_BOUNCE_BYTES];
+volatile uint32_t g_ppu_tx_psram;   /* frames too big to bounce through SRAM */
+
 void link_master_ppu_stage(const uint8_t *ppu_stream, uint32_t ppu_len,
                            uint8_t *fb, uint32_t fb_max)
 {
-    g_ppu_stream = ppu_stream;
+    /* Copied here rather than inside the exchange: this is outside the
+       doorbell handshake, so it cannot add to the master's stall if it is
+       ever slow. Reading PSRAM with the CPU is fine - it is the DMA that
+       cannot. */
+    if (ppu_stream && ppu_len && ppu_len <= PPU_TX_BOUNCE_BYTES) {
+        memcpy(g_ppu_tx_bounce, ppu_stream, ppu_len);
+        g_ppu_stream = g_ppu_tx_bounce;
+    } else {
+        if (ppu_len > PPU_TX_BOUNCE_BYTES) g_ppu_tx_psram++;
+        g_ppu_stream = ppu_stream;
+    }
     g_ppu_len    = ppu_len;
     g_ppu_fb     = fb;
     g_ppu_fb_max = fb_max;
 }
 
 uint32_t link_master_ppu_got(void) { return g_ppu_fb_got; }
+
+/* Bisect switch: capture the stream but do not put it on the wire.
+ *
+ * With frank_cap_on=0 - no capture at all - HDMI locks on every grab; with it
+ * on, the display never locks, and the scanline interrupt's timing is
+ * perfect either way (31,507/s, max gap 65 us). So the capture path breaks
+ * the picture without disturbing the interrupt, and the two halves of it need
+ * separating: the CPU writing records into PSRAM, and the DMA reading that
+ * PSRAM to send it. This switch keeps the first and removes the second.
+ *
+ * Announcing a zero length is what makes it safe - the slave then never arms
+ * a receive, so the exchange stays in step. */
+volatile uint32_t g_ppu_tx_disable;
 
 /* What the last exchange actually put on the wire, and how many exchanges
    have carried a stream. Paired with frank_cap_takes this says whether the
@@ -334,6 +390,12 @@ bool link_master_frame_exchange(const link_event_t *events, uint32_t n_events,
     if (!g_online) return false;
 
     uint32_t t0 = time_us_32();
+
+#ifdef FRANK_SNES_PPU_CAPTURE
+    /* Applied here, once, so the length in the payload and the bulk that
+       follows it cannot disagree. */
+    if (g_ppu_tx_disable) g_ppu_len = 0;
+#endif
 
     /* --- header (carrying the run table), then this frame's payloads --- */
     if (n_runs > LINK_ARAM_MAX_RUNS) n_runs = LINK_ARAM_MAX_RUNS;
