@@ -805,10 +805,17 @@ volatile uint32_t slave_ppu_force_reconvert = 0;
 
 void slave_ppu_arm_frame(void)
 {
-   if (slave_ppu_force_reconvert) {
+   if (slave_ppu_force_reconvert == 1u) {
       if (IPPU.TileCached[TILE_2BIT]) memset(IPPU.TileCached[TILE_2BIT], 0, MAX_2BIT_TILES);
       if (IPPU.TileCached[TILE_4BIT]) memset(IPPU.TileCached[TILE_4BIT], 0, MAX_4BIT_TILES);
       if (IPPU.TileCached[TILE_8BIT]) memset(IPPU.TileCached[TILE_8BIT], 0, MAX_8BIT_TILES);
+   } else if (slave_ppu_force_reconvert == 2u) {
+      /* Control: clearing the cache also makes the render 2.7x slower, and a
+         slower render changes when everything on this core happens relative
+         to the link. Burn the same time WITHOUT touching the cache. If the
+         picture is clean anyway, the cache was never the cause. */
+      uint32_t t0 = time_us_32();
+      while (time_us_32() - t0 < 24000u) tight_loop_contents();
    }
    IPPU.RenderThisFrame = true;
 

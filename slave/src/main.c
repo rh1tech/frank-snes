@@ -738,6 +738,30 @@ static void handle_frame(void)
             g_ppu_fb_bytes = 256u * 224u;
             g_ppu_fb_valid = true;
         } else {
+            /* Wait for the previous render to release the handoff.
+             *
+             * g_render_buf/g_render_len are ONE slot while the buffers behind
+             * them are four, and nothing checked whether core 1 was still
+             * using them. Core 0 can be several frames ahead, so on any frame
+             * core 1 did not finish inside, core 0 overwrote the source
+             * pointer of a replay already in progress - core 1 carried on
+             * reading a different stream from where it had got to and VRAM
+             * received a splice of two frames. That is tile-granular
+             * corruption, worse the slower the render, which is exactly how
+             * it presented: fine on a thin spinning logo, shattered on a wide
+             * one.
+             *
+             * Proven by making the render slower WITHOUT touching the tile
+             * cache: 24 ms of spinning turned the title screen to garbage.
+             *
+             * It waits AFTER the reply has gone out, so the master already
+             * has this frame's data. A queue was tried instead and was worse:
+             * with only two SRAM landing slots behind a four-deep queue the
+             * stream buffers were reused underneath core 1 and 1,015 streams
+             * in 30 s failed their checksum. */
+            while (g_render_req) tight_loop_contents();
+            __dmb();
+
             g_render_buf        = g_ppu_stream;
             g_render_len        = ppu_len;
             g_render_stage_slot = g_ppu_stage_slot;
