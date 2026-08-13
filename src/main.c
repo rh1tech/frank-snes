@@ -726,6 +726,9 @@ typedef struct {
        forced blank; this says whether that is a faithful replay of the
        master's PPU or a slave that has lost the register. */
     uint32_t master_regs;
+    /* HDMI health. Counting interrupts alone once "proved" the generator
+       healthy on a display that had no signal; the GAP is what decides it. */
+    uint32_t hdmi_irqs, hdmi_gap_max, hdmi_late;
 } frank_telemetry_t;
 /* 0 upd 1 rs 2 obj 3 bg0 4 bg1 5 bg2 6 bg3 7 mode7 8 zclear 9 sub 10 main
    11 colormath 12 backdrop 13 scale 14 tileconv */
@@ -2605,6 +2608,15 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.cap_vram_w  = frank_cap_vram_w;
                       frank_telemetry.cap_cgram_w = frank_cap_cgram_w;
                       frank_telemetry.cap_oam_w   = frank_cap_oam_w; }
+                    { extern volatile uint32_t frank_hdmi_irqs,
+                                               frank_hdmi_gap_max,
+                                               frank_hdmi_late;
+                      frank_telemetry.hdmi_irqs    = frank_hdmi_irqs;
+                      frank_telemetry.hdmi_gap_max = frank_hdmi_gap_max;
+                      frank_telemetry.hdmi_late    = frank_hdmi_late;
+                      frank_hdmi_irqs = 0;
+                      frank_hdmi_gap_max = 0;
+                      frank_hdmi_late = 0; }
                     if (Memory.FillRAM)
                       frank_telemetry.master_regs =
                             (uint32_t)Memory.FillRAM[0x2100]

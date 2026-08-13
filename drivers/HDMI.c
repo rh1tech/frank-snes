@@ -206,6 +206,24 @@ alignas(4096) uint32_t conv_color[1224];
 //индекс, проверяющий зависание
 static uint32_t irq_inx = 0;
 
+/* Is the scanline interrupt meeting its deadline?
+ *
+ * The handler rewrites dma_lines[inx_buf_dma & 1], including the sync pulses,
+ * for the line the DMA is about to send. Arrive late and it writes over a
+ * buffer already being scanned out - the sync pattern is corrupted rather
+ * than merely the pixels, and the sink drops lock and reports NO SIGNAL
+ * while the emulator itself runs perfectly. That failure is indistinguishable
+ * from a dead video generator by counting interrupts alone, which is how
+ * "the HDMI generator is healthy, 31,471 IRQs/s" was recorded for a display
+ * that had no signal. The GAP is the measurement that separates them: it
+ * should be ~31.7 us, every time.
+ *
+ * Reset by the reader, so the max is per sample window rather than a
+ * high-water mark that stops moving. */
+volatile uint32_t frank_hdmi_irqs;      /* scanline interrupts serviced   */
+volatile uint32_t frank_hdmi_gap_max;   /* longest gap between them, us   */
+volatile uint32_t frank_hdmi_late;      /* gaps over twice the line time  */
+
 // External screen buffer and double-buffer index from main.c
 extern uint8_t SCREEN[2][256 * 224];
 extern volatile uint32_t current_buffer;
@@ -388,6 +406,18 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
     static uint32_t inx_buf_dma;
     static uint line = 0;
     irq_inx++;
+
+    /* One 32-bit read and a compare; the handler runs from SRAM (__scratch_y)
+       and this costs a fraction of the memsets below. A line is ~31.7 us. */
+    {
+        static uint32_t last_us;
+        uint32_t now = time_us_32();
+        uint32_t gap = now - last_us;
+        last_us = now;
+        frank_hdmi_irqs++;
+        if (gap > frank_hdmi_gap_max) frank_hdmi_gap_max = gap;
+        if (gap > 64u) frank_hdmi_late++;
+    }
 
     dma_hw->ints0 = 1u << dma_chan_ctrl;
     dma_channel_set_read_addr(dma_chan_ctrl, &DMA_BUF_ADDR[inx_buf_dma & 1], false);
