@@ -434,6 +434,22 @@ target_compile_definitions(frank-snes PRIVATE
     NO_WINDOW_CLIPPING=1
     SIMPLE_COLOR_MATH=1
     NO_ZERO_LUT=1
+
+    # 4 KB of stack for Core 0, not the SDK's default 2 KB.
+    #
+    # Core 0 runs the 65816, the PPU capture, FatFS and - on any diagnostic
+    # path - newlib printf, which alone can want more than a kilobyte. A
+    # master lockup was captured with CFSR 0x01010001 (IACCVIOL +
+    # UNDEFINSTR) and MMFAR/BFAR both 0x20081bdc, an address INSIDE the stack
+    # region: the core had tried to execute from the stack, i.e. a return
+    # address had been overwritten. That is what a stack that is slightly too
+    # small looks like from the outside, and it presents as the picture
+    # freezing forever while core 1 keeps scanning out the last frame.
+    #
+    # The scratch banks hold both stacks: core 1 takes 4 KB at 0x20080800 and
+    # this leaves core 0 3 KB below __stack at 0x20082000 - SCRATCH_Y already
+    # holds ~544 bytes of other data, so 4 KB does not fit.
+    PICO_STACK_SIZE=0xC00
 )
 
 if(SOUND_CORE STREQUAL "ACCURATE")
