@@ -418,11 +418,14 @@ void APUExecute(void/*int32_t target_cycles*/)
       uint16_t _trace_pc = (uint16_t)(IAPU.PC - IAPU.RAM);
       pc_trace[pc_trace_idx % PC_TRACE_SIZE] = _trace_pc;
       pc_trace_idx++;
-      /* Retired-instruction count, read over SWD. The SPC700 should retire
-         roughly a million instructions a second; a rate far below that means
-         it is being starved, which shows up as the sound running slow and the
-         driver handshake taking seconds instead of frames. */
+#ifdef FRANK_APU_DIAG
+      /* Retired-instruction count, read over SWD. Diagnostic only: this is a
+         volatile store on the hottest path in the emulator - roughly 264,000
+         a second - and it costs frames. It answered its question (the APU is
+         NOT starved during a stall) and is off by default now.
+         Build with -DFRANK_APU_DIAG=1 to bring it back. */
       frank_apu_instr++;
+#endif
 
       uint8_t opcode = *IAPU.PC;
 
