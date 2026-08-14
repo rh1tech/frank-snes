@@ -744,6 +744,8 @@ typedef struct {
     /* Was the $2118/$2119 write-SEQUENCE hash, which stopped existing when
        VRAM started travelling as content. Reused for what replaced it. */
     uint32_t cap_pages_sent;
+    /* Where the PREVIOUS boot hard-faulted, if it did. See fault_record.c. */
+    uint32_t fault_pc, fault_count;
     uint32_t m_vram_hash, m_cgram_hash, m_oam_hash;
     uint32_t s_vram_hash, s_cgram_hash, s_oam_hash;
     /* HDMI health. Counting interrupts alone once "proved" the generator
@@ -2712,6 +2714,9 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.cap_vram_rec = frank_cap_vram_rec; }
                     { extern volatile uint32_t frank_cap_pages_sent;
                       frank_telemetry.cap_pages_sent = frank_cap_pages_sent; }
+                    { extern volatile uint32_t frank_fault_pc, frank_fault_count;
+                      frank_telemetry.fault_pc    = frank_fault_pc;
+                      frank_telemetry.fault_count = frank_fault_count; }
 
                     { extern volatile uint32_t frank_hdmi_irqs,
                                                frank_hdmi_gap_max,
@@ -3104,6 +3109,12 @@ int main(void) {
     }
     
     stdio_init_all();
+
+    /* Before anything else can overwrite it: if the last boot ended in a hard
+       fault, say where. See src/fault_record.c - a lockup on this board looks
+       like a frozen picture, because core 1 keeps scanning out the last frame. */
+    { extern void frank_fault_report_previous(void);
+      frank_fault_report_previous(); }
 #if LIB_PICO_STDIO_USB
     // Give the host a moment to open the CDC port — long enough that
     // most of the boot log lands in the console when a terminal is

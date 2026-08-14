@@ -388,6 +388,7 @@ endif()
 
 add_executable(frank-snes
     src/main.c
+    src/fault_record.c
     src/frank_snes_profile.c
     ${SNES9X_SOURCES}
     ${ASM_OPT_SOURCES}
