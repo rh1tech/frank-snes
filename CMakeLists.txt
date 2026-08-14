@@ -601,7 +601,27 @@ endif()
 # — no way to see whether the sound slave answered, which is the one
 # thing worth watching on this board.
 if(BOARD_VARIANT STREQUAL "C2")
-    pico_enable_stdio_uart(frank-snes 1)
+    # UART stdio OFF, and this is a BOOT fix, not a tidy-up.
+    #
+    # stdio_uart_out_chars busy-waits on uart_is_writable with no timeout. On
+    # this board the transmitter stops draining - measured mid-boot: FR reads
+    # 0x12F, so TXFF set and BUSY set, while both PLLs are locked, clk_peri is
+    # enabled and selects pll_usb, UARTEN/TXE are set and IBRD/FBRD are the
+    # right 115200 divisors. The registers stay readable on the APB clock while
+    # the baud generator gets nothing, so the FIFO fills once and never empties.
+    #
+    # The result is that the FIRST printf carrying an argument never returns.
+    # Boot stops there permanently: core 1 is never launched, so HDMI is never
+    # brought up and the capture card reports no signal - which looks exactly
+    # like a dead board and was chased as a hard fault, an overclock and a
+    # flash-timing problem before the boot markers showed it stopped at a
+    # printf. Plain puts() survives because it fits in the 32-byte FIFO.
+    #
+    # Nothing is lost: the comment on frank_telemetry already records that this
+    # header "reads as garbage through the probe", so the console was never the
+    # channel. Numbers come off this chip over SWD. The slave disabled its UART
+    # stdio for the same class of bug - a blocking write stalling the loop.
+    pico_enable_stdio_uart(frank-snes 0)
     pico_enable_stdio_usb(frank-snes 0)
 else()
     pico_enable_stdio_uart(frank-snes 0)
