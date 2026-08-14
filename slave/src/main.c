@@ -275,8 +275,7 @@ static volatile uint32_t g_render_exp_hash;
    with dones stuck = core 1 never ran or died on its first frame. */
 static volatile uint32_t g_render_kicks, g_render_dones;
 static volatile uint32_t g_render_wait_giveup;
-static volatile uint32_t g_tx_wait_us;      /* wait for core 1 before the bulk */
-static volatile uint32_t g_tx_wait_timeouts;
+static volatile uint32_t g_tx_copy_us;      /* SRAM->PSRAM publish, microseconds */
 /* A bounded wait, because an unbounded one takes the whole chip down with it.
    Core 0 also services USB and the watchdog, so `while (g_render_req)` with no
    way out turns any core-1 stall into a slave that is off the bus entirely -
@@ -740,28 +739,16 @@ static void handle_frame(void)
            only the bulks remain, and they need no handshake of their own. */
         uint32_t fb_bytes = g_have_pending ? g_pending_reply.ppu_fb_bytes : 0;
         if (fb_bytes)
-            /* Core 1 must be finished with the framebuffer before it goes on
-               the wire; there is only one. The wait below is what guarantees
-               it - it is deliberately here, in front of the bulk, and not
-               after the reply where it used to be.
-        
-               The copy-to-PSRAM this replaces was correct but paid twice: 4 ms
-               of core 1, and 57 KB of core-1 PSRAM writes a frame on a chip
-               whose PSRAM writes are measurably lossy under two-core
-               contention (the stream staging needs a verify-and-retry loop for
-               exactly that reason). Measured, the wait costs 1-2 us: core 1 is
-               kicked at the end of the previous frame and finishes a 13 ms
-               render long before core 0 comes back round. */
-            { uint32_t w0 = time_us_32();
-              uint32_t spun = 0;
-              while (g_render_req && spun < SLAVE_RENDER_WAIT_MAX_US) {
-                  tight_loop_contents();
-                  spun = time_us_32() - w0;
-              }
-              g_tx_wait_us = spun;
-              if (g_render_req) g_tx_wait_timeouts++;   /* shipped mid-draw */
-            }
-            link_s_bulk_send(&g_sess, g_ppu_fb, LINK_ALIGN4(fb_bytes));
+            /* From the PSRAM copy core 1 published, never from g_ppu_fb.
+             *
+             * Waiting for core 1 here instead - which is what this briefly did
+             * - looks cheaper and is not: it delays the FRAME_ACK reply, the
+             * master times out, and the link collapses to about one frame a
+             * second with linkfail climbing steadily. Measured that way round
+             * before reverting to this. The copy costs core 1 about 4 ms of
+             * slack it has; the wait costs the master its frame. */
+            link_s_bulk_send(&g_sess, slave_ppu_tx[g_tx_slot ^ 1u],
+                             LINK_ALIGN4(fb_bytes));
 
         /* The palette, every frame and unconditionally. The master no longer
            renders, so it never calls graphics_set_palette itself - without
@@ -1024,10 +1011,16 @@ static void slave_render_core(void)
           slave_ppu_hash_state(); }
 
         g_ppu_fb_bytes = 256u * 224u;   /* SNES_WIDTH * SNES_HEIGHT */
+        if (!skip_draw && slave_ppu_tx[g_tx_slot]) {
+            uint32_t c0 = time_us_32();
+            memcpy(slave_ppu_tx[g_tx_slot], g_ppu_fb, 256u * 224u);
+            g_tx_copy_us = time_us_32() - c0;
+        }
         /* The flip is the publish: everything above must be visible to core 0
            before the slot moves, and the slot before the request clears. */
         __dmb();
         if (!skip_draw) {
+            g_tx_slot ^= 1u;
             /* Only a frame that was actually DRAWN may be published, or the
                master would be shipped a buffer holding the frame before last. */
             g_ppu_fb_valid = true;
@@ -1369,9 +1362,8 @@ int main(void)
                        (unsigned long)slave_ppu_us_vpage,
                        (unsigned long)slave_ppu_n_vpage,
                        (unsigned long)slave_ppu_us_endf);
-                printf(" txwait=%luus/%lu giveup=%lu",
-                       (unsigned long)g_tx_wait_us,
-                       (unsigned long)g_tx_wait_timeouts,
+                printf(" txcopy=%luus giveup=%lu",
+                       (unsigned long)g_tx_copy_us,
                        (unsigned long)g_render_wait_giveup);
                 printf(" write=%luus pre=%luus",
                        (unsigned long)slave_ppu_us_write,
