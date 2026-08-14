@@ -102,7 +102,10 @@ volatile uint32_t slave_ppu_us_endf;
 volatile uint32_t slave_ppu_n_draw;
 volatile uint32_t slave_ppu_n_vpage;
 volatile uint32_t slave_ppu_us_write;   /* S9xSetPPU, the register writes */
-volatile uint32_t slave_ppu_us_pre;     /* checksum + cache guard, before the loop */
+volatile uint32_t slave_ppu_us_pre;
+/* Carried from the master in the stream, printed on this chip's console. */
+volatile uint32_t slave_dbg_master_pc;
+volatile uint32_t slave_dbg_master_stall;     /* checksum + cache guard, before the loop */
 /* Where and why the replay stopped, and a checksum of what it replayed from.
    See link_ppu_stat_t: these three numbers plus the master's frank_cap_sum
    separate "the wire corrupted it" from "the capture produced it" from "the
@@ -718,6 +721,21 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
            us_vpage += time_us_32() - v0;
            n_vpage++; }
          i += 2u + PPUCAP_PAGE_BYTES;
+         break; }
+
+      case PPUCAP_DBG: {
+         /* Master-side diagnostics riding in the stream - see PPUCAP_DBG.
+            The master has no console and no USB, so when its SWD drops it is
+            otherwise completely unobservable while still running. */
+         if (i + 8u >= len) { slave_ppu_stop_why = 2; goto done; }
+         slave_dbg_master_pc = (uint32_t) rec[i + 1]
+                             | ((uint32_t) rec[i + 2] << 8)
+                             | ((uint32_t) rec[i + 3] << 16);
+         slave_dbg_master_stall = (uint32_t) rec[i + 4]
+                                | ((uint32_t) rec[i + 5] << 8)
+                                | ((uint32_t) rec[i + 6] << 16)
+                                | ((uint32_t) rec[i + 7] << 24);
+         i += 9u;
          break; }
 
       case PPUCAP_ENDF:
