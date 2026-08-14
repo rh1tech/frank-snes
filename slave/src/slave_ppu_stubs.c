@@ -47,3 +47,11 @@ bool S9xReadMousePosition(int32_t which, int32_t *x, int32_t *y, uint32_t *butto
    impossible();
    return false;
 }
+
+/* The master counts APU port reads in ppu.c to tell "the game stopped
+   advancing" from "the game is waiting on the sound driver". The slave links
+   the same ppu.c for its renderer but not ppu_capture.c, where the master
+   defines these - so they need a home here too. Nothing on this chip reads
+   them; they exist to satisfy the shared translation unit. */
+volatile uint32_t frank_dbg_apu_reads;
+volatile uint32_t frank_dbg_apu_last;

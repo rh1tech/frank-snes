@@ -10,6 +10,10 @@
 #include "cpuexec.h"
 #include "apu.h"
 
+/* How many times the SPC700 has stepped over a STOP opcode. Non-zero means
+   its PC desynchronised - see the 0xFF handler. */
+volatile uint32_t frank_apu_stop_hits;
+
 static uint8_t S9xAPUGetByteZ(uint8_t Address)
 {
    if (Address >= 0xf0 && IAPU.DirectPage == IAPU.RAM)
@@ -1866,7 +1870,33 @@ void APUExecute(void/*int32_t target_cycles*/)
             IAPU.PC += 2;
          break;
       case 0xFF: /* STOP */
+         /* Advance past it instead of parking on it forever.
+          *
+          * On real hardware STOP halts the SPC700 until reset, and leaving
+          * IAPU.PC alone models that faithfully. On this machine it is fatal:
+          * the SPC700 stops answering its ports, and a sound driver waiting
+          * on the handshake deadlocks the whole console. Measured on MK3 -
+          * the 65816 spinning at $83:BE74 (CMP $2142 / BNE) waiting for 0x05
+          * while APU.OutPorts[2] stayed 0x04, forever, at 9,200 polls a
+          * frame, with the picture frozen on screen.
+          *
+          * Reaching STOP at all means we are already executing garbage: the
+          * PC had desynchronised into the MIDDLE of an instruction - $13F7 is
+          * the last operand byte of the MOV !$FF04+Y,A at $13F5, and that
+          * operand happens to be 0xFF. No sound driver executes STOP on
+          * purpose. So the choice is between halting forever on a byte we
+          * should never have fetched, and stepping over it in the hope of
+          * falling back into valid code. The second cannot be worse.
+          *
+          * apu_core1.c already documents this intent - "SLEEP/STOP are
+          * treated as NOPs" - but that path is dead code here.
+          *
+          * SLEEP (0xEF) is deliberately NOT changed: drivers legitimately
+          * park in SLEEP waiting for a timer, and advancing past it would
+          * send them through garbage. */
+         frank_apu_stop_hits++;
          spc_dump_trace("STOP", _trace_pc);
+         IAPU.PC++;
          break;
       }
 }

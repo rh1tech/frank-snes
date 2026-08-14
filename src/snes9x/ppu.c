@@ -974,7 +974,15 @@ PPU_HOT uint8_t S9xGetPPU(uint16_t Address)
       case 0x217d:
       case 0x217e:
       case 0x217f:
-         return S9xAPUReadPort(Address);
+         /* Counted, because "the game stopped advancing" and "the game is
+            waiting on the sound driver" look identical from outside. If the
+            APU ports are being polled thousands of times a frame and always
+            answer the same byte, that is the answer. */
+         { uint8_t apu_v = S9xAPUReadPort(Address);
+           extern volatile uint32_t frank_dbg_apu_reads, frank_dbg_apu_last;
+           frank_dbg_apu_reads++;
+           frank_dbg_apu_last = ((uint32_t)(Address & 3u) << 8) | apu_v;
+           return apu_v; }
       case 0x2180: /* Read WRAM */
          byte = Memory.RAM [PPU.WRAM++];
          PPU.WRAM &= 0x1FFFF;

@@ -105,7 +105,9 @@ volatile uint32_t slave_ppu_us_write;   /* S9xSetPPU, the register writes */
 volatile uint32_t slave_ppu_us_pre;
 /* Carried from the master in the stream, printed on this chip's console. */
 volatile uint32_t slave_dbg_master_pc;
-volatile uint32_t slave_dbg_master_stall;     /* checksum + cache guard, before the loop */
+volatile uint32_t slave_dbg_master_stall;
+volatile uint32_t slave_dbg_apu_reads;
+volatile uint32_t slave_dbg_apu_last;     /* checksum + cache guard, before the loop */
 /* Where and why the replay stopped, and a checksum of what it replayed from.
    See link_ppu_stat_t: these three numbers plus the master's frank_cap_sum
    separate "the wire corrupted it" from "the capture produced it" from "the
@@ -727,15 +729,28 @@ void slave_ppu_replay(const uint8_t *rec, uint32_t len)
          /* Master-side diagnostics riding in the stream - see PPUCAP_DBG.
             The master has no console and no USB, so when its SWD drops it is
             otherwise completely unobservable while still running. */
-         if (i + 8u >= len) { slave_ppu_stop_why = 2; goto done; }
-         slave_dbg_master_pc = (uint32_t) rec[i + 1]
-                             | ((uint32_t) rec[i + 2] << 8)
-                             | ((uint32_t) rec[i + 3] << 16);
-         slave_dbg_master_stall = (uint32_t) rec[i + 4]
-                                | ((uint32_t) rec[i + 5] << 8)
-                                | ((uint32_t) rec[i + 6] << 16)
-                                | ((uint32_t) rec[i + 7] << 24);
-         i += 9u;
+         /* Length-prefixed: read what we understand, skip the rest, so the
+            master can add fields without desyncing this replay. */
+         if (i + 1u >= len) { slave_ppu_stop_why = 2; goto done; }
+         { uint32_t n = rec[i + 1];
+           if (i + 2u + n > len) { slave_ppu_stop_why = 2; goto done; }
+           if (n >= 7u) {
+              slave_dbg_master_pc = (uint32_t) rec[i + 2]
+                                  | ((uint32_t) rec[i + 3] << 8)
+                                  | ((uint32_t) rec[i + 4] << 16);
+              slave_dbg_master_stall = (uint32_t) rec[i + 5]
+                                     | ((uint32_t) rec[i + 6] << 8)
+                                     | ((uint32_t) rec[i + 7] << 16)
+                                     | ((uint32_t) rec[i + 8] << 24);
+           }
+           if (n >= 12u) {
+              slave_dbg_apu_reads = (uint32_t) rec[i + 9]
+                                  | ((uint32_t) rec[i + 10] << 8)
+                                  | ((uint32_t) rec[i + 11] << 16);
+              slave_dbg_apu_last  = (uint32_t) rec[i + 12]
+                                  | ((uint32_t) rec[i + 13] << 8);
+           }
+           i += 2u + n; }
          break; }
 
       case PPUCAP_ENDF:

@@ -472,10 +472,24 @@ static void ppucap_emit_resync(void)
 }
 
 volatile uint32_t frank_cap_stall_frames;
+volatile uint32_t frank_dbg_apu_reads;   /* APU port reads THIS frame */
+static uint32_t ppucap_frame_sum;        /* sum of the frame's REAL records */
+volatile uint32_t frank_dbg_apu_last;    /* (port&3)<<8 | last value read */
 
 void ppucap_endframe(void)
 {
    uint8_t r[2];
+
+   /* Sum the frame's real records HERE - before the diagnostics record and the
+      end-of-frame marker are appended.
+      
+      Doing it afterwards and trying to subtract a fixed number of trailing
+      bytes is what broke this: the diagnostics record carries counters that
+      change every frame, so once it grew from 9 bytes to 14 the stale
+      subtraction left part of it inside the sum, no two frames ever compared
+      equal, and the freeze detector read 0 through a freeze that was plainly
+      visible on the screen. */
+   ppucap_frame_sum = ppucap_sum(ppucap_buf, ppucap_len);
 
    /* A diagnostics record, emitted before the end-of-frame marker so it is
       always present even on a frame that draws nothing. See PPUCAP_DBG. */
@@ -483,17 +497,26 @@ void ppucap_endframe(void)
       extern SICPU ICPU;
       uint32_t pc = ((uint32_t) ICPU.Registers.PB << 16) |
                      (uint32_t) ICPU.Registers.PC;
-      uint8_t d[9];
-      d[0] = PPUCAP_DBG;
-      d[1] = (uint8_t)  pc;
-      d[2] = (uint8_t) (pc >> 8);
-      d[3] = (uint8_t) (pc >> 16);
-      d[4] = (uint8_t)  frank_cap_stall_frames;
-      d[5] = (uint8_t) (frank_cap_stall_frames >> 8);
-      d[6] = (uint8_t) (frank_cap_stall_frames >> 16);
-      d[7] = (uint8_t) (frank_cap_stall_frames >> 24);
-      d[8] = 0;
-      ppucap_put(d, 9);
+      /* Length-prefixed so this can grow without desyncing the slave: the
+         replay skips whatever it does not understand. */
+      uint8_t d[14];
+      uint32_t ar = frank_dbg_apu_reads;
+      d[0]  = PPUCAP_DBG;
+      d[1]  = 12;                       /* payload bytes that follow */
+      d[2]  = (uint8_t)  pc;
+      d[3]  = (uint8_t) (pc >> 8);
+      d[4]  = (uint8_t) (pc >> 16);
+      d[5]  = (uint8_t)  frank_cap_stall_frames;
+      d[6]  = (uint8_t) (frank_cap_stall_frames >> 8);
+      d[7]  = (uint8_t) (frank_cap_stall_frames >> 16);
+      d[8]  = (uint8_t) (frank_cap_stall_frames >> 24);
+      d[9]  = (uint8_t)  ar;
+      d[10] = (uint8_t) (ar >> 8);
+      d[11] = (uint8_t) (ar >> 16);
+      d[12] = (uint8_t)  frank_dbg_apu_last;
+      d[13] = (uint8_t) (frank_dbg_apu_last >> 8);
+      ppucap_put(d, 14);
+      frank_dbg_apu_reads = 0;          /* per frame, not cumulative */
    }
 
    r[0] = PPUCAP_ENDF;
@@ -532,9 +555,9 @@ void ppucap_endframe(void)
     * Measured during the real freeze: len=1212 sum=3d5ac615, unchanged for
     * as long as it was left. */
    { static uint32_t prev_sum; static uint32_t prev_len;
-     uint32_t n = ppucap_len > 11u ? ppucap_len - 11u : 0u;  /* drop DBG+ENDF */
-     uint32_t h = ppucap_sum(ppucap_buf, n);
-     if (n && h == prev_sum && ppucap_len == prev_len) {
+     uint32_t n = ppucap_frame_sum;   /* taken before DBG/ENDF were appended */
+     uint32_t h = n;
+     if (ppucap_len && h == prev_sum && ppucap_len == prev_len) {
         if (frank_cap_stall_frames < 0xffffffffu) frank_cap_stall_frames++;
      } else {
         frank_cap_stall_frames = 0;

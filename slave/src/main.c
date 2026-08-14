@@ -1363,9 +1363,12 @@ int main(void)
                        (unsigned long)slave_ppu_n_vpage,
                        (unsigned long)slave_ppu_us_endf);
                 { extern volatile uint32_t slave_dbg_master_pc, slave_dbg_master_stall;
-                  printf(" | MASTER pc=%06lx stall=%lu",
+                  extern volatile uint32_t slave_dbg_apu_reads, slave_dbg_apu_last;
+                  printf(" | MASTER pc=%06lx stall=%lu apurd=%lu apulast=%lx",
                          (unsigned long) slave_dbg_master_pc,
-                         (unsigned long) slave_dbg_master_stall); }
+                         (unsigned long) slave_dbg_master_stall,
+                         (unsigned long) slave_dbg_apu_reads,
+                         (unsigned long) slave_dbg_apu_last); }
                 printf(" txcopy=%luus giveup=%lu",
                        (unsigned long)g_tx_copy_us,
                        (unsigned long)g_render_wait_giveup);
