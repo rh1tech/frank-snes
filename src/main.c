@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #include "pico/stdlib.h"
+#include "pico/runtime_init.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
 #include "hardware/vreg.h"
@@ -1502,7 +1503,16 @@ volatile bool g_hdmi_irq_released;      /* core 0 has given the IRQ up */
 extern void graphics_hdmi_irq_take_this_core(void);
 extern void graphics_hdmi_irq_release_this_core(void);
 
+/* Forward: CPACR is banked per core, so core 1 must enable its own. */
+static inline void cpacr_ensure(void);
+
 void __time_critical_func(render_core)(void) {
+    /* Before anything else on this core, and for the same reason main does
+       it: HDMI and audio both touch GPIO, which is a CP0 instruction on
+       RP2350, and a core that reaches here with CPACR unset takes a NOCP
+       UsageFault and locks up - taking the display with it. */
+    cpacr_ensure();
+
     // Pre-generate test tone - 440Hz square wave
     for (int i = 0; i < 256; i++) {
         int16_t sample = ((i / 25) & 1) ? 8000 : -8000;
@@ -3094,7 +3104,42 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 // Main Entry Point
 //=============================================================================
 
+/* CP0 (the GPIO coprocessor) plus CP10/CP11 (VFP). */
+#define CPACR_NEEDED 0x00F00000u
+
+static inline void cpacr_ensure(void)
+{
+    volatile uint32_t *cpacr = (volatile uint32_t *) 0xE000ED88u;
+    if ((*cpacr & CPACR_NEEDED) != CPACR_NEEDED) {
+        *cpacr |= CPACR_NEEDED;
+        __asm volatile ("dsb; isb" ::: "memory");
+    }
+}
+
 int main(void) {
+    /* Coprocessors FIRST, before a single other instruction runs.
+     *
+     * The SDK enables CP0/CP10/CP11 from its per-core preinit array, and on
+     * some reset paths main is reached with CPACR still 0x0000C000. On
+     * RP2350 that is fatal rather than slow: gpio_put() compiles to a CP0
+     * instruction and pico_time's 64-bit maths is VFP, so the first of either
+     * takes a UsageFault with CFSR NOCP set. It escalates to HardFault, and
+     * the HardFault handler is itself in flash reached through the same
+     * broken state, so the core goes straight to LOCKUP at 0xEFFFFFFE.
+     *
+     * The slave has carried this same guard, and the same comment, since it
+     * cost most of a debugging session there; the master never had it, so it
+     * is added for symmetry and because the failure mode is silent.
+     *
+     * Honesty about what this did NOT fix: it was added while chasing a
+     * master that would not boot, and it is not the cause of that. Read at a
+     * breakpoint on main, CPACR is already 0x00F0C303 - the SDK's per-core
+     * preinit does run. The NOCP bit seen in CFSR came from a sticky register
+     * read across several boots, not from this. Keep the guard, do not credit
+     * it. */
+    runtime_init_per_core_enable_coprocessors();
+    cpacr_ensure();
+
     // Overclock support
 #if CPU_CLOCK_MHZ > 252
     vreg_disable_voltage_limit();
