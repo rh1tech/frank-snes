@@ -55,6 +55,12 @@
 
 static volatile
 DSTATUS Stat = STA_NOINIT;	/* Physical drive status */
+/* Which CMD0 clocking sequence the card accepted - see disk_initialize.
+   0 = none, 1 = 80 clocks deselected (spec), 2 = the legacy CS-low form. */
+volatile uint32_t frank_sd_cmd0_mode;
+volatile uint32_t frank_sd_cmd0_tries;
+/* How often a single SPI byte exchange timed out - see xchg_spi. */
+volatile uint32_t frank_sd_spi_timeouts;
 
 static
 BYTE CardType;			/* Card type flags */
@@ -185,7 +191,30 @@ BYTE xchg_spi (
 {
 	uint8_t *buff = (uint8_t *) &dat;
 #ifndef SDCARD_PIO
-	spi_write_read_blocking(SDCARD_SPI_BUS, buff, buff, 1);
+	/* Bounded, because spi_write_read_blocking is not.
+	 *
+	 * Measured on this board: SPI0 completes eight transfers of the CMD0
+	 * sequence and then stops - the ninth never returns, and the whole boot
+	 * stops with it, because the mount is on the critical path before the
+	 * display comes up. The same happens to UART0, which is the other
+	 * clk_peri peripheral, so the stall is not the card.
+	 *
+	 * A timeout cannot make the card work, but it turns "the machine is dead
+	 * and shows nothing" into "the SD failed, here is the error screen", which
+	 * is the difference between a board someone can diagnose and one they
+	 * cannot. 20 ms is enormous for a byte at 400 kHz. */
+	{
+		spi_inst_t *spi = SDCARD_SPI_BUS;
+		absolute_time_t deadline = make_timeout_time_ms(20);
+		while (!spi_is_writable(spi)) {
+			if (time_reached(deadline)) { frank_sd_spi_timeouts++; return 0xFF; }
+		}
+		spi_get_hw(spi)->dr = (uint32_t) *buff;
+		while (!spi_is_readable(spi)) {
+			if (time_reached(deadline)) { frank_sd_spi_timeouts++; return 0xFF; }
+		}
+		*buff = (uint8_t) spi_get_hw(spi)->dr;
+	}
 #else
 	pio_spi_write8_read8_blocking(&pio_spi, buff, buff, 1);
 #endif
@@ -381,15 +410,39 @@ DSTATUS disk_initialize (
 	for (n = 10; n; n--) xchg_spi(0xFF);	/* and settle once selected */
 
 	ty = 0;
+	/* Try BOTH clocking sequences before giving up.
+	 *
+	 * The spec-correct one (80 clocks with the card deselected) is what fixes
+	 * a warm reset. But this driver shipped for a long time doing it with CS
+	 * held LOW, and some cards only answer that way - so a card that has
+	 * always worked here must not be broken by the correction. Alternate
+	 * between them; whichever the card likes, CMD0 answers 1.
+	 *
+	 * frank_sd_cmd0_mode records which one won, for reading over SWD:
+	 * 0 = never answered, 1 = deselected clocks, 2 = the legacy CS-low form. */
 	{ int cmd0_ok = 0;
 	  for (int tries = 0; tries < 16 && !cmd0_ok; tries++) {
-	     if (send_cmd(CMD0, 0) == 1) { cmd0_ok = 1; break; }
-	     CS_HIGH();
-	     for (n = 10; n; n--) xchg_spi(0xFF);
-	     CS_LOW();
+	     const int legacy = (tries & 1);
+	     if (legacy) {
+	        CS_LOW();
+	        for (n = 10; n; n--) xchg_spi(0xFF);   /* the old sequence */
+	     } else {
+	        CS_HIGH();
+	        for (n = 10; n; n--) xchg_spi(0xFF);   /* the spec sequence */
+	        CS_LOW();
+	     }
+	     frank_sd_cmd0_tries = (uint32_t) tries + 1u;
+	     if (send_cmd(CMD0, 0) == 1) {
+	        cmd0_ok = 1;
+	        frank_sd_cmd0_mode = legacy ? 2u : 1u;
+	        break;
+	     }
 	     sleep_ms(2);
 	  }
-	  if (!cmd0_ok) { deselect(); Stat = STA_NOINIT; return Stat; }
+	  if (!cmd0_ok) {
+	     frank_sd_cmd0_mode = 0u;
+	     deselect(); Stat = STA_NOINIT; return Stat;
+	  }
 	}
 	if (1) {			                    /* card is in SPI/Idle state */
 		t = _millis();
