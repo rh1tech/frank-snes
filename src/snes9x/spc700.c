@@ -13,6 +13,7 @@
 /* How many times the SPC700 has stepped over a STOP opcode. Non-zero means
    its PC desynchronised - see the 0xFF handler. */
 volatile uint32_t frank_apu_stop_hits;
+volatile uint32_t frank_apu_instr;
 
 static uint8_t S9xAPUGetByteZ(uint8_t Address)
 {
@@ -413,6 +414,11 @@ void APUExecute(void/*int32_t target_cycles*/)
       uint16_t _trace_pc = (uint16_t)(IAPU.PC - IAPU.RAM);
       pc_trace[pc_trace_idx % PC_TRACE_SIZE] = _trace_pc;
       pc_trace_idx++;
+      /* Retired-instruction count, read over SWD. The SPC700 should retire
+         roughly a million instructions a second; a rate far below that means
+         it is being starved, which shows up as the sound running slow and the
+         driver handshake taking seconds instead of frames. */
+      frank_apu_instr++;
 
       uint8_t opcode = *IAPU.PC;
 
