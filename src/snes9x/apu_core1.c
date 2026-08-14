@@ -43,6 +43,29 @@ void __not_in_flash_func(apu_core1_set_target_cycles)(int32_t target)
 void __not_in_flash_func(apu_core1_run_batch)(void)
 {
     if (!apu_core1_enabled) return;
+
+    /* Do nothing unless Core 0 is actually driving this path.
+     *
+     * It is not. APU_EXECUTE()/APU_EXECUTE1() only expand to the Core 1
+     * versions if APU_ON_CORE1 is already defined when spc700.h is parsed,
+     * and spc700.h includes apu_core1.h INSIDE that test - so in every
+     * translation unit the default, synchronous, Core 0 macros win.
+     * apu_core1_set_target_cycles is not even present in the linked image,
+     * and a sentinel written over apu_target_cycles survives indefinitely:
+     * nothing ever writes it.
+     *
+     * That makes everything below dead code - except that it was not inert.
+     * `APU.Cycles -= debt` is a non-atomic read-modify-write on state that
+     * Core 0 is updating inside APUExecute(), executed thousands of times a
+     * second from Core 1's loop. A stale write-back rewinds the APU's
+     * emulated clock, and CPU<->APU handshakes are exactly what that breaks:
+     * the 65816 sits at $83:BE74 waiting for a port value the SPC700 is
+     * running too early or too late to produce, with the picture frozen and
+     * every other counter healthy.
+     *
+     * Writing IAPU.APUExecuting from here is the same hazard in miniature. */
+    if (apu_target_cycles == 0) return;
+
     /* Always keep SPC700 running — SLEEP/STOP are treated as NOPs */
     IAPU.APUExecuting = true;
 
