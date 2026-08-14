@@ -473,7 +473,18 @@ typedef struct __attribute__((packed)) {
  * handshake timeout. Three bounds it to ~1.2 ms, and the FIFO in
  * sound_backend_link.c spreads a bigger backlog over several frames
  * instead of demanding it all at once. */
-#define LINK_SAMPLES_PER_CHUNK  534u
+/* Sized for the PAL worst case, because the buffers on both sides are
+ * dimensioned from this constant and a PAL frame carries MORE audio than an
+ * NTSC one: 32040/50 = 641 mono samples against 32040/60 = 534.
+ *
+ * The runtime count is chosen per region in sound_backend_link.c - sending
+ * 534 for a PAL game feeds 26,700 samples a second into a 32,040 Hz output,
+ * and the result is audio that plays 16.7% slow. main.c's local audio path
+ * always got this right (AUDIO_FRAME_SAMPLES_PAL); only the link path was
+ * hardcoded to NTSC. */
+#define LINK_SAMPLES_PER_CHUNK_NTSC 534u
+#define LINK_SAMPLES_PER_CHUNK_PAL  641u
+#define LINK_SAMPLES_PER_CHUNK  LINK_SAMPLES_PER_CHUNK_PAL
 #define LINK_MAX_CHUNKS         3u
 
 /* The master's ring has to hold its queued backlog *and* the reply that

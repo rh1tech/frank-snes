@@ -745,8 +745,6 @@ typedef struct {
     /* Was the $2118/$2119 write-SEQUENCE hash, which stopped existing when
        VRAM started travelling as content. Reused for what replaced it. */
     uint32_t cap_pages_sent;
-    /* Where the PREVIOUS boot hard-faulted, if it did. See fault_record.c. */
-    uint32_t fault_pc, fault_count;
     uint32_t m_vram_hash, m_cgram_hash, m_oam_hash;
     uint32_t s_vram_hash, s_cgram_hash, s_oam_hash;
     /* HDMI health. Counting interrupts alone once "proved" the generator
@@ -1505,7 +1503,6 @@ extern void graphics_hdmi_irq_release_this_core(void);
 
 /* Forward: CPACR is banked per core, so core 1 must enable its own. */
 static inline void cpacr_ensure(void);
-extern volatile uint32_t frank_boot_stage_c1;
 
 void __time_critical_func(render_core)(void) {
     /* Before anything else on this core, and for the same reason main does
@@ -1513,7 +1510,6 @@ void __time_critical_func(render_core)(void) {
        RP2350, and a core that reaches here with CPACR unset takes a NOCP
        UsageFault and locks up - taking the display with it. */
     cpacr_ensure();
-    frank_boot_stage_c1 = 1;
 
     // Pre-generate test tone - 440Hz square wave
     for (int i = 0; i < 256; i++) {
@@ -2726,9 +2722,6 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
                       frank_telemetry.cap_vram_rec = frank_cap_vram_rec; }
                     { extern volatile uint32_t frank_cap_pages_sent;
                       frank_telemetry.cap_pages_sent = frank_cap_pages_sent; }
-                    { extern volatile uint32_t frank_fault_pc, frank_fault_count;
-                      frank_telemetry.fault_pc    = frank_fault_pc;
-                      frank_telemetry.fault_count = frank_fault_count; }
 
                     { extern volatile uint32_t frank_hdmi_irqs,
                                                frank_hdmi_gap_max,
@@ -3106,14 +3099,6 @@ static bool __time_critical_func(emulation_loop)(void) {  /* returns true if use
 // Main Entry Point
 //=============================================================================
 
-/* Boot progress, in RAM, readable over SWD.
- *
- * printf is the thing that kept appearing in the fault stack, so the boot
- * cannot be traced with printf. These are plain stores to a known address:
- * reset the chip, wait, read the word. */
-volatile uint32_t frank_boot_stage;
-volatile uint32_t frank_boot_stage_c1;
-
 /* CP0 (the GPIO coprocessor) plus CP10/CP11 (VFP). */
 #define CPACR_NEEDED 0x00F00000u
 
@@ -3149,7 +3134,6 @@ int main(void) {
      * it. */
     runtime_init_per_core_enable_coprocessors();
     cpacr_ensure();
-    frank_boot_stage = 1;
 
     // Overclock support
 #if CPU_CLOCK_MHZ > 252
@@ -3164,16 +3148,13 @@ int main(void) {
         set_sys_clock_khz(252 * 1000, true);
     }
     
-    frank_boot_stage = 2;
     stdio_init_all();
-    frank_boot_stage = 3;
 
     /* Before anything else can overwrite it: if the last boot ended in a hard
        fault, say where. See src/fault_record.c - a lockup on this board looks
        like a frozen picture, because core 1 keeps scanning out the last frame. */
     { extern void frank_fault_report_previous(void);
       frank_fault_report_previous(); }
-    frank_boot_stage = 31;
 #if LIB_PICO_STDIO_USB
     // Give the host a moment to open the CDC port — long enough that
     // most of the boot log lands in the console when a terminal is
@@ -3183,16 +3164,10 @@ int main(void) {
 #endif
     
     LOG("\n\n");
-    frank_boot_stage = 32;
     LOG("========================================\n");
-    frank_boot_stage = 33;
     LOG("   frank-snes - SNES for RP2350\n");
     LOG("========================================\n");
-    frank_boot_stage = 34;
-    { uint32_t mhz = clock_get_hz(clk_sys) / 1000000u;
-      frank_boot_stage = 0x340 | (mhz & 0xf);
-      LOG("System Clock: %lu MHz\n", (unsigned long) mhz);
-      frank_boot_stage = 35; }
+    LOG("System Clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
     
     // Initialize LED.  C2's LD1 is a WS2812B on GPIO46, not a plain
     // level-driven LED, so the boot indicator is skipped there rather
@@ -3245,14 +3220,11 @@ int main(void) {
 
     // Launch Core 1 (Audio + APU)
     LOG("Starting render core (Audio)...\n");
-    frank_boot_stage = 4;
     multicore_launch_core1(render_core);
-    frank_boot_stage = 5;
 
 #ifndef FRANK_SNES_HDMI_ALT
     /* Hand the scanline interrupt to core 1 - see the note there. */
     while (!g_hdmi_irq_core1_ready) tight_loop_contents();
-    frank_boot_stage = 6;
     graphics_hdmi_irq_release_this_core();
     __dmb();
     g_hdmi_irq_released = true;
@@ -3267,7 +3239,6 @@ int main(void) {
     LOG("[Core0] Render core started (HDMI + Audio on Core 1)\n");
 
     // Mount SD card (AFTER HDMI so we can show an error screen on failure).
-    frank_boot_stage = 7;
     LOG("Mounting SD card...\n");
     /* Retried, because a single attempt makes every warm reset fatal.
        rom_selector_show_sd_error is a while(1), so a card that needs a moment
@@ -3284,7 +3255,6 @@ int main(void) {
     /* Readable over SWD: 0x700 | FRESULT. 3 = FR_NOT_READY (disk_initialize
        failed, i.e. no card answered), 13 = FR_NO_FILESYSTEM (card fine, FAT
        not found). The two need completely different fixes. */
-    frank_boot_stage = 0x700u | ((uint32_t) res & 0xffu);
     if (res != FR_OK) {
         LOG("Failed to mount SD card: %d\n", res);
         // Show a visible error screen and blink the LED while halted.

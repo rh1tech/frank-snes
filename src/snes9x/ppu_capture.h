@@ -45,18 +45,6 @@
  * diverged on most frames. Sending the bytes removes the entire class: there
  * is nothing to reproduce, and a page that differs is simply resent. */
 #define PPUCAP_VPAGE 0x08
-/* Master-side diagnostics, carried to the slave so they can be READ.
- *
- * The master has no console and no USB - SWD is its only channel, and when
- * that drops (see the notes on picotool and on the probe) the chip becomes
- * completely unobservable while still running. The slave has a working USB
- * console, and the master already sends it a stream every frame, so the
- * cheapest reliable telemetry path is to put a record in that stream.
- *
- * Payload: PB:PC of the 65816, then the count of consecutive frames whose
- * captured stream was byte-identical - which is what a frozen GAME looks
- * like from outside, as opposed to a frozen CPU. */
-#define PPUCAP_DBG   0x09   /* pc24, stall_frames32 */
 #define PPUCAP_PAGE_BITS  9u
 #define PPUCAP_PAGE_BYTES (1u << PPUCAP_PAGE_BITS)          /* 512 */
 #define PPUCAP_PAGES      (0x10000u / PPUCAP_PAGE_BYTES)    /* 128 */
@@ -90,9 +78,6 @@ extern volatile uint32_t frank_cap_resyncs;
    each write - that would cost more than the thing measured. */
 extern volatile uint32_t frank_cap_bytes;
 extern volatile uint32_t frank_cap_overflow;
-/* How many consecutive frames the captured stream has been byte-identical.
-   Zero while anything is changing. */
-extern volatile uint32_t frank_cap_stall_frames;
 extern volatile uint32_t frank_cap_on;
 /* Checksum of the stream ppucap_take() last handed to the link, over exactly
    frank_cap_bytes. The slave returns the same sum over what it received; the

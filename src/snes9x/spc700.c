@@ -10,14 +10,6 @@
 #include "cpuexec.h"
 #include "apu.h"
 
-/* How many times the SPC700 has stepped over a STOP opcode. Non-zero means
-   its PC desynchronised - see the 0xFF handler. */
-volatile uint32_t frank_apu_stop_hits;
-volatile uint32_t frank_apu_instr;
-/* The 64 SPC700 PCs leading up to the first desync, and the PC it died on.
-   Read over SWD - this chip has no console. */
-volatile uint16_t frank_apu_stop_trace[64];
-volatile uint32_t frank_apu_stop_pc;
 
 static uint8_t S9xAPUGetByteZ(uint8_t Address)
 {
@@ -418,14 +410,6 @@ void APUExecute(void/*int32_t target_cycles*/)
       uint16_t _trace_pc = (uint16_t)(IAPU.PC - IAPU.RAM);
       pc_trace[pc_trace_idx % PC_TRACE_SIZE] = _trace_pc;
       pc_trace_idx++;
-#ifdef FRANK_APU_DIAG
-      /* Retired-instruction count, read over SWD. Diagnostic only: this is a
-         volatile store on the hottest path in the emulator - roughly 264,000
-         a second - and it costs frames. It answered its question (the APU is
-         NOT starved during a stall) and is off by default now.
-         Build with -DFRANK_APU_DIAG=1 to bring it back. */
-      frank_apu_instr++;
-#endif
 
       uint8_t opcode = *IAPU.PC;
 
@@ -1907,20 +1891,6 @@ void APUExecute(void/*int32_t target_cycles*/)
           * SLEEP (0xEF) is deliberately NOT changed: drivers legitimately
           * park in SLEEP waiting for a timer, and advancing past it would
           * send them through garbage. */
-         /* Snapshot the PC history at the FIRST desync, before stepping
-            over it. The ring is only 512 entries and the SPC700 retires a
-            quarter of a million instructions a second, so by the time anyone
-            reads it over SWD the evidence is long gone unless it is frozen
-            here. This is the sequence that leads into the bad fetch. */
-         if (frank_apu_stop_hits == 0) {
-            uint32_t n = pc_trace_idx < 64u ? pc_trace_idx : 64u;
-            uint32_t k;
-            for (k = 0; k < n; k++)
-               frank_apu_stop_trace[63u - k] =
-                  pc_trace[(pc_trace_idx - 1u - k) % PC_TRACE_SIZE];
-            frank_apu_stop_pc = _trace_pc;
-         }
-         frank_apu_stop_hits++;
          spc_dump_trace("STOP", _trace_pc);
          IAPU.PC++;
          break;

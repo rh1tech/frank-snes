@@ -641,7 +641,11 @@ static void push_config(void)
     cfg.sound_enabled     = 1;
     cfg.mono              = want_mono ? 1 : 0;
     cfg.playback_rate     = playback_rate;
-    cfg.samples_per_frame = LINK_SAMPLES_PER_CHUNK;
+    /* Per region, not the buffer-sizing constant. A PAL frame is 1/50 s and
+       carries 641 samples at 32040 Hz; sending the NTSC 534 makes the slave
+       produce 26,700 samples a second for a 32,040 Hz output, i.e. audio that
+       plays 16.7% slow. That is audible and was reported as such. */
+    cfg.samples_per_frame = playback_rate / (Settings.PAL ? 50u : 60u);
     /* Must match apu_dsp.c's APU_DSP_LINES_PER_FRAME * H_Max, and must
      * match what link_dsp_now() stamps events with. */
     cfg.frame_span        = link_frame_span();

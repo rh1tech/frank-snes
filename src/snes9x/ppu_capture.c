@@ -17,7 +17,6 @@
    register mirror - and re-emits it as write records. */
 #include "memmap.h"
 #include "ppu.h"
-#include "cpuexec.h"
 #include "ppu_capture.h"
 
 #ifdef FRANK_SNES_PPU_CAPTURE
@@ -471,54 +470,9 @@ static void ppucap_emit_resync(void)
    resync_phase = 0;
 }
 
-volatile uint32_t frank_cap_stall_frames;
-volatile uint32_t frank_dbg_apu_reads;   /* APU port reads THIS frame */
-static uint32_t ppucap_frame_sum;        /* sum of the frame's REAL records */
-volatile uint32_t frank_dbg_apu_last;    /* (port&3)<<8 | last value read */
-
 void ppucap_endframe(void)
 {
    uint8_t r[2];
-
-   /* Sum the frame's real records HERE - before the diagnostics record and the
-      end-of-frame marker are appended.
-      
-      Doing it afterwards and trying to subtract a fixed number of trailing
-      bytes is what broke this: the diagnostics record carries counters that
-      change every frame, so once it grew from 9 bytes to 14 the stale
-      subtraction left part of it inside the sum, no two frames ever compared
-      equal, and the freeze detector read 0 through a freeze that was plainly
-      visible on the screen. */
-   ppucap_frame_sum = ppucap_sum(ppucap_buf, ppucap_len);
-
-   /* A diagnostics record, emitted before the end-of-frame marker so it is
-      always present even on a frame that draws nothing. See PPUCAP_DBG. */
-   {
-      extern SICPU ICPU;
-      uint32_t pc = ((uint32_t) ICPU.Registers.PB << 16) |
-                     (uint32_t) ICPU.Registers.PC;
-      /* Length-prefixed so this can grow without desyncing the slave: the
-         replay skips whatever it does not understand. */
-      uint8_t d[14];
-      uint32_t ar = frank_dbg_apu_reads;
-      d[0]  = PPUCAP_DBG;
-      d[1]  = 12;                       /* payload bytes that follow */
-      d[2]  = (uint8_t)  pc;
-      d[3]  = (uint8_t) (pc >> 8);
-      d[4]  = (uint8_t) (pc >> 16);
-      d[5]  = (uint8_t)  frank_cap_stall_frames;
-      d[6]  = (uint8_t) (frank_cap_stall_frames >> 8);
-      d[7]  = (uint8_t) (frank_cap_stall_frames >> 16);
-      d[8]  = (uint8_t) (frank_cap_stall_frames >> 24);
-      d[9]  = (uint8_t)  ar;
-      d[10] = (uint8_t) (ar >> 8);
-      d[11] = (uint8_t) (ar >> 16);
-      d[12] = (uint8_t)  frank_dbg_apu_last;
-      d[13] = (uint8_t) (frank_dbg_apu_last >> 8);
-      ppucap_put(d, 14);
-      frank_dbg_apu_reads = 0;          /* per frame, not cumulative */
-   }
-
    r[0] = PPUCAP_ENDF;
    r[1] = 0;
    ppucap_put(r, 2);
@@ -543,26 +497,6 @@ void ppucap_endframe(void)
       }
       frank_cap_vram_hash = all;
    }
-
-   /* Is the GAME frozen?
-    *
-    * A locked-up 65816 and a game stuck in a wait loop look identical from
-    * the outside - frames keep being produced either way - but the stream
-    * they produce differs: a stuck game emits the SAME bytes every frame.
-    * Summed over the frame excluding the diagnostics record itself, which
-    * carries the counter and would otherwise never compare equal.
-    *
-    * Measured during the real freeze: len=1212 sum=3d5ac615, unchanged for
-    * as long as it was left. */
-   { static uint32_t prev_sum; static uint32_t prev_len;
-     uint32_t n = ppucap_frame_sum;   /* taken before DBG/ENDF were appended */
-     uint32_t h = n;
-     if (ppucap_len && h == prev_sum && ppucap_len == prev_len) {
-        if (frank_cap_stall_frames < 0xffffffffu) frank_cap_stall_frames++;
-     } else {
-        frank_cap_stall_frames = 0;
-     }
-     prev_sum = h; prev_len = ppucap_len; }
 
    /* Publish and reset. The link transport will take the buffer here. */
    frank_cap_bytes = ppucap_len;   /* what is actually IN the buffer */
